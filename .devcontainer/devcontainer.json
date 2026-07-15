@@ -1,0 +1,33 @@
+{
+	"name": "multimodal-pdac",
+	"build": {
+        "dockerfile": "Dockerfile"
+    },
+
+	"remoteUser": "ubuntu",
+	"updateRemoteUserUID": true,
+
+    "runArgs": ["--gpus", "all", "--shm-size=8g"],
+
+	// Configure tool-specific properties.
+	"customizations": {
+        // Configure the vscode.
+        "vscode": {
+            // Install the vscode extension.
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-python.debugpy",
+                "ms-toolsai.jupyter",
+                "njpwerner.autodocstring"
+            ]
+        }
+        
+    },
+
+    // Mount the data directory in the container.
+    "mounts": [
+        "source=/home/ahmed/Data,target=/workspaces/multimodal-pdac/data,type=bind,consistency=cached",
+        "source=/home/ahmed/QP-projects,target=/workspaces/multimodal-pdac/qp-projects,type=bind,consistency=cached"
+    ]
+}

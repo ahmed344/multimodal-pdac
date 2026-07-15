@@ -1,0 +1,15 @@
+spatialdata[extra]
+squidpy[interactive]
+scanpy[leiden]
+scvi-tools
+plotly[express]
+openslide-python
+openslide-bin
+pyarrow
+seaborn
+scikit-learn
+scikit-image
+imagecodecs
+jupyter
+ipywidgets
+kneed
