@@ -51,12 +51,19 @@ The default results location is `data/PDAC/Results/dann/`. Analysis writes:
 
 - `latent_umap_batch.png`
 - `latent_umap_densities.png`
+- `latent_umap_densities_logit.png`
+- `latent_umap_ziln_Density_*.png` (one 2x2 Logit/1-pi/mu/sigma figure per target)
 - `peptide_similarity_heatmap.png`
 - `loss_curves.png`
-- `ziln_cd8_scatter.png`
+- `ziln_density_scatter.png`
+- `latent_umap.csv`
+- `latent_embeddings.csv`
+- `ziln_density_scatter.csv`
 - `peptide_families.csv`
 - `embedding_cosine_similarity.npy`
-- `latent_predictions.npz`
 
-The complete 5,808 × 5,808 cosine matrix is intentionally retained. The
-activity scan is exact when `activity_max_nonzeros` is null; smoke mode caps it.
+Sample-level outputs are CSV tables that include batch labels and targets.
+`latent_umap.csv` holds UMAP coordinates plus ZILN parameters; `latent_embeddings.csv`
+holds the full latent vectors. The complete 5,808 × 5,808 cosine matrix remains
+`.npy` because a dense square matrix is not practical as CSV. The activity scan is
+exact when `activity_max_nonzeros` is null; smoke mode caps it.

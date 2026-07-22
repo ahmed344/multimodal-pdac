@@ -242,11 +242,164 @@ def fit_latent_umap(latent: np.ndarray, config: Mapping[str, Any]) -> np.ndarray
     return reducer.fit_transform(latent)
 
 
-def _categorical_batch_colors(num_batches: int) -> np.ndarray:
-    """Build perceptually spaced colors for many categorical batch labels.
+def _batch_name_series(
+    batches: np.ndarray, batch_names: Sequence[str]
+) -> pd.Series:
+    """Map encoded batch IDs to display names.
 
-    Uses HUSL sampling so adjacent batch IDs stay visually separable when
-    ``num_batches`` exceeds qualitative maps such as ``tab20``.
+    Args:
+        batches (np.ndarray): Integer batch codes with shape ``[n_samples]``.
+        batch_names (Sequence[str]): Display names indexed by batch code.
+
+    Returns:
+        pd.Series: Batch name per sample, aligned with ``batches``.
+    """
+
+    names = np.asarray(batch_names, dtype=object)
+    codes = np.asarray(batches, dtype=np.int64)
+    return pd.Series(names[codes], name="batch")
+
+
+def build_latent_umap_frame(
+    extracted: Mapping[str, np.ndarray],
+    umap_coordinates: np.ndarray,
+    target_columns: Sequence[str],
+    batch_names: Sequence[str],
+    split: str,
+) -> pd.DataFrame:
+    """Build a sample-aligned table of UMAP coordinates, labels, and ZILN outputs.
+
+    Args:
+        extracted (Mapping[str, np.ndarray]): Arrays from ``extract_latent_predictions``.
+        umap_coordinates (np.ndarray): Two-dimensional UMAP coords ``[n_samples, 2]``.
+        target_columns (Sequence[str]): Ordered IHC density column names.
+        batch_names (Sequence[str]): Display names for encoded batch IDs.
+        split (str): Name of the analysis split written into the table.
+
+    Returns:
+        pd.DataFrame: One row per sample with identity, batch, UMAP, targets, and ZILN.
+    """
+
+    frame = pd.DataFrame(
+        {
+            "row_id": np.asarray(extracted["row_ids"], dtype=np.int64),
+            "split": split,
+            "batch_id": np.asarray(extracted["batches"], dtype=np.int64),
+            "batch": _batch_name_series(extracted["batches"], batch_names),
+            "umap_1": umap_coordinates[:, 0],
+            "umap_2": umap_coordinates[:, 1],
+        }
+    )
+    targets = np.asarray(extracted["targets"])
+    pi = np.asarray(extracted["pi"])
+    mu = np.asarray(extracted["mu"])
+    sigma = np.asarray(extracted["sigma"])
+    for index, column in enumerate(target_columns):
+        frame[column] = targets[:, index]
+        frame[f"pi_{column}"] = pi[:, index]
+        frame[f"mu_{column}"] = mu[:, index]
+        frame[f"sigma_{column}"] = sigma[:, index]
+    return frame
+
+
+def build_latent_embeddings_frame(
+    extracted: Mapping[str, np.ndarray],
+    batch_names: Sequence[str],
+    split: str,
+) -> pd.DataFrame:
+    """Build a sample-aligned table of full latent bottleneck vectors.
+
+    Args:
+        extracted (Mapping[str, np.ndarray]): Arrays from ``extract_latent_predictions``.
+        batch_names (Sequence[str]): Display names for encoded batch IDs.
+        split (str): Name of the analysis split written into the table.
+
+    Returns:
+        pd.DataFrame: One row per sample with identity, batch, and ``latent_*`` columns.
+    """
+
+    latent = np.asarray(extracted["latent"])
+    frame = pd.DataFrame(
+        {
+            "row_id": np.asarray(extracted["row_ids"], dtype=np.int64),
+            "split": split,
+            "batch_id": np.asarray(extracted["batches"], dtype=np.int64),
+            "batch": _batch_name_series(extracted["batches"], batch_names),
+        }
+    )
+    for dim in range(latent.shape[1]):
+        frame[f"latent_{dim}"] = latent[:, dim]
+    return frame
+
+
+def build_ziln_scatter_frame(
+    extracted: Mapping[str, np.ndarray],
+    target_columns: Sequence[str],
+    batch_names: Sequence[str],
+    split: str,
+    epsilon: float,
+) -> pd.DataFrame:
+    """Build a long-format table of positive-density ZILN scatter points.
+
+    Only rows with true density ``> 0`` are retained, matching the scatter plot.
+
+    Args:
+        extracted (Mapping[str, np.ndarray]): Arrays from ``extract_latent_predictions``.
+        target_columns (Sequence[str]): Ordered IHC density column names.
+        batch_names (Sequence[str]): Display names for encoded batch IDs.
+        split (str): Name of the scatter split written into the table.
+        epsilon (float): Boundary clamp applied before the true-value logit.
+
+    Returns:
+        pd.DataFrame: Long-format rows with true density, true logit, and predicted mu.
+    """
+
+    row_ids = np.asarray(extracted["row_ids"], dtype=np.int64)
+    batch_ids = np.asarray(extracted["batches"], dtype=np.int64)
+    batch_labels = _batch_name_series(batch_ids, batch_names).to_numpy()
+    targets = np.asarray(extracted["targets"])
+    mu = np.asarray(extracted["mu"])
+    parts: list[pd.DataFrame] = []
+    for index, column in enumerate(target_columns):
+        positive = targets[:, index] > 0.0
+        if not np.any(positive):
+            continue
+        truth = targets[positive, index]
+        parts.append(
+            pd.DataFrame(
+                {
+                    "row_id": row_ids[positive],
+                    "split": split,
+                    "batch_id": batch_ids[positive],
+                    "batch": batch_labels[positive],
+                    "target": column,
+                    "true_density": truth,
+                    "true_logit": _positive_logit_densities(truth, epsilon),
+                    "predicted_mu": mu[positive, index],
+                }
+            )
+        )
+    if not parts:
+        return pd.DataFrame(
+            columns=[
+                "row_id",
+                "split",
+                "batch_id",
+                "batch",
+                "target",
+                "true_density",
+                "true_logit",
+                "predicted_mu",
+            ]
+        )
+    return pd.concat(parts, ignore_index=True)
+
+
+def _categorical_batch_colors(num_batches: int) -> np.ndarray:
+    """Build high-contrast colors for many categorical batch labels.
+
+    Stacks matplotlib ``tab20`` / ``tab20b`` / ``tab20c`` (60 colors). When
+    ``num_batches`` exceeds that pool, appends HUSL samples for the remainder.
 
     Args:
         num_batches (int): Number of distinct batch categories to color.
@@ -256,7 +409,21 @@ def _categorical_batch_colors(num_batches: int) -> np.ndarray:
     """
 
     count = max(int(num_batches), 1)
-    rgb = np.asarray(sns.color_palette("husl", n_colors=count), dtype=np.float64)
+    base = np.vstack(
+        [
+            np.asarray(plt.cm.tab20.colors, dtype=np.float64),
+            np.asarray(plt.cm.tab20b.colors, dtype=np.float64),
+            np.asarray(plt.cm.tab20c.colors, dtype=np.float64),
+        ]
+    )
+    if count <= base.shape[0]:
+        rgb = base[:count]
+    else:
+        extra = np.asarray(
+            sns.color_palette("husl", n_colors=count - base.shape[0]),
+            dtype=np.float64,
+        )
+        rgb = np.vstack([base, extra])
     alpha = np.ones((count, 1), dtype=np.float64)
     return np.concatenate([rgb, alpha], axis=1)
 
@@ -444,6 +611,139 @@ def plot_latent_umap_densities(
     plt.close(figure)
 
 
+def plot_latent_umap_ziln_per_target(
+    coordinates: np.ndarray,
+    densities: np.ndarray,
+    pi: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    target_column: str,
+    output_path: Path,
+    config: Mapping[str, Any],
+    logit_epsilon: float,
+) -> None:
+    """Plot a 2x2 latent UMAP for one target: logit density, 1-pi, mu, and sigma.
+
+    All samples are drawn in every panel. For the logit panel, zero densities
+    are shown in light gray and excluded from color-limit / colorbar scaling so
+    they do not collapse the positive logit range. The existence panel colors by
+    ``1 - pi`` (probability of a non-zero density).
+
+    Args:
+        coordinates (np.ndarray): Precomputed UMAP coordinates ``[n_samples, 2]``.
+        densities (np.ndarray): True density values ``[n_samples]`` for ``target_column``.
+        pi (np.ndarray): Predicted structural-zero probabilities ``[n_samples]``.
+        mu (np.ndarray): Predicted logit-normal means ``[n_samples]``.
+        sigma (np.ndarray): Predicted logit-normal standard deviations ``[n_samples]``.
+        target_column (str): IHC density column name (e.g. ``Density_CD8``).
+        output_path (Path): Destination PNG path.
+        config (Mapping[str, Any]): Analysis plot settings.
+        logit_epsilon (float): Clamp applied before the positive-density logit.
+
+    Returns:
+        None: Figure is saved to disk.
+    """
+
+    densities = np.asarray(densities, dtype=np.float64).reshape(-1)
+    pi = np.asarray(pi, dtype=np.float64).reshape(-1)
+    mu = np.asarray(mu, dtype=np.float64).reshape(-1)
+    sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)
+    n_samples = coordinates.shape[0]
+    for name, values in (
+        ("densities", densities),
+        ("pi", pi),
+        ("mu", mu),
+        ("sigma", sigma),
+    ):
+        if values.shape[0] != n_samples:
+            raise ValueError(
+                f"{name} length {values.shape[0]} does not match "
+                f"{n_samples} UMAP coordinates."
+            )
+
+    ncols = 2
+    nrows = 2
+    figure, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(12 * ncols, 6 * nrows),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    point_size = float(config["point_size"]) * 0.35
+    cmap = str(config["density_cmap"])
+    lower_percentile = float(config["density_vmin_percentile"])
+    upper_percentile = float(config["density_vmax_percentile"])
+    zero_color = "#d0d0d0"
+
+    logit_label = f"Logit_{target_column}"
+    positive = densities > 0.0
+    zero = ~positive
+    axis = axes[0][0]
+    if np.any(zero):
+        axis.scatter(
+            coordinates[zero, 0],
+            coordinates[zero, 1],
+            c=zero_color,
+            s=point_size,
+            rasterized=True,
+        )
+    positive_logits = (
+        _positive_logit_densities(densities[positive], logit_epsilon)
+        if np.any(positive)
+        else np.asarray([], dtype=np.float64)
+    )
+    vmin, vmax = _robust_color_limits(
+        positive_logits, lower_percentile, upper_percentile
+    )
+    scatter = None
+    if np.any(positive):
+        scatter = axis.scatter(
+            coordinates[positive, 0],
+            coordinates[positive, 1],
+            c=positive_logits,
+            s=point_size,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            rasterized=True,
+        )
+    axis.set_title(f"Latent UMAP by {logit_label}")
+    axis.set_xlabel("UMAP 1")
+    axis.set_ylabel("UMAP 2")
+    axis.set_xticks([])
+    axis.set_yticks([])
+    if scatter is not None:
+        figure.colorbar(scatter, ax=axis, label=logit_label)
+
+    parameter_panels = (
+        (axes[0][1], 1.0 - pi, f"1-pi_{target_column}"),
+        (axes[1][0], mu, f"mu_{target_column}"),
+        (axes[1][1], sigma, f"sigma_{target_column}"),
+    )
+    for axis, values, label in parameter_panels:
+        vmin, vmax = _robust_color_limits(values, lower_percentile, upper_percentile)
+        scatter = axis.scatter(
+            coordinates[:, 0],
+            coordinates[:, 1],
+            c=values,
+            s=point_size,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            rasterized=True,
+        )
+        axis.set_title(f"Latent UMAP by {label}")
+        axis.set_xlabel("UMAP 1")
+        axis.set_ylabel("UMAP 2")
+        axis.set_xticks([])
+        axis.set_yticks([])
+        figure.colorbar(scatter, ax=axis, label=label)
+
+    figure.savefig(output_path, dpi=int(config["figure_dpi"]))
+    plt.close(figure)
+
+
 def plot_similarity_heatmap(
     similarity: np.ndarray,
     activity: np.ndarray,
@@ -532,18 +832,23 @@ def plot_loss_curves(
     plt.close(figure)
 
 
-def plot_ziln_cd8_scatter(
+def plot_ziln_density_scatter(
     predicted_mu: np.ndarray,
-    true_cd8: np.ndarray,
+    true_targets: np.ndarray,
+    target_columns: Sequence[str],
     epsilon: float,
     output_path: Path,
     config: Mapping[str, Any],
 ) -> None:
-    """Plot predicted CD8 mu against positive true logit CD8 density.
+    """Plot predicted mu against positive true logit density for each target.
 
     Args:
-        predicted_mu (np.ndarray): Predicted CD8 logit-normal means.
-        true_cd8 (np.ndarray): Raw bounded CD8 targets.
+        predicted_mu (np.ndarray): Predicted logit-normal means with shape
+            ``[n_samples, n_targets]``.
+        true_targets (np.ndarray): Raw bounded density targets with shape
+            ``[n_samples, n_targets]``.
+        target_columns (Sequence[str]): Ordered density column names matching
+            ``predicted_mu`` and ``true_targets``.
         epsilon (float): Boundary clamp before true-value logits.
         output_path (Path): Destination PNG path.
         config (Mapping[str, Any]): Plot settings.
@@ -552,30 +857,57 @@ def plot_ziln_cd8_scatter(
         None: Figure is saved to disk.
     """
 
-    positive = true_cd8 > 0.0
-    truth = np.log(
-        np.clip(true_cd8[positive], epsilon, 1.0 - epsilon)
-        / (1.0 - np.clip(true_cd8[positive], epsilon, 1.0 - epsilon))
+    num_targets = len(target_columns)
+    if predicted_mu.shape[1] != num_targets or true_targets.shape[1] != num_targets:
+        raise ValueError(
+            f"Prediction/target widths ({predicted_mu.shape[1]}, "
+            f"{true_targets.shape[1]}) do not match {num_targets} target columns."
+        )
+    ncols = min(2, num_targets)
+    nrows = int(np.ceil(num_targets / ncols))
+    figure, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(12 * ncols, 6 * nrows),
+        constrained_layout=True,
+        squeeze=False,
     )
-    predictions = predicted_mu[positive]
-    figure, axis = plt.subplots(figsize=(7, 7), constrained_layout=True)
-    axis.scatter(
-        truth,
-        predictions,
-        s=float(config["point_size"]),
-        alpha=0.25,
-        rasterized=True,
-    )
-    lower = float(min(truth.min(), predictions.min()))
-    upper = float(max(truth.max(), predictions.max()))
-    axis.plot([lower, upper], [lower, upper], linestyle="--", color="black", linewidth=1)
-    correlation = np.corrcoef(truth, predictions)[0, 1] if truth.size > 1 else np.nan
-    axis.set(
-        title=f"Positive CD8 ZILN validation (Pearson r={correlation:.3f})",
-        xlabel="True logit(CD8 density)",
-        ylabel="Predicted mu_CD8",
-    )
-    axis.grid(alpha=0.25)
+    point_size = float(config["point_size"])
+    for index, column in enumerate(target_columns):
+        row, col = divmod(index, ncols)
+        axis = axes[row][col]
+        positive = true_targets[:, index] > 0.0
+        truth = _positive_logit_densities(true_targets[positive, index], epsilon)
+        predictions = predicted_mu[positive, index]
+        axis.scatter(
+            truth,
+            predictions,
+            s=point_size,
+            alpha=0.25,
+            rasterized=True,
+        )
+        if truth.size > 0 and predictions.size > 0:
+            lower = float(min(truth.min(), predictions.min()))
+            upper = float(max(truth.max(), predictions.max()))
+            axis.plot(
+                [lower, upper],
+                [lower, upper],
+                linestyle="--",
+                color="black",
+                linewidth=1,
+            )
+        correlation = (
+            np.corrcoef(truth, predictions)[0, 1] if truth.size > 1 else np.nan
+        )
+        axis.set(
+            title=f"Positive {column} ZILN (Pearson r={correlation:.3f})",
+            xlabel=f"True logit({column})",
+            ylabel=f"Predicted mu ({column})",
+        )
+        axis.grid(alpha=0.25)
+    for index in range(num_targets, nrows * ncols):
+        row, col = divmod(index, ncols)
+        axes[row][col].axis("off")
     figure.savefig(output_path, dpi=int(config["figure_dpi"]))
     plt.close(figure)
 
@@ -606,16 +938,26 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     extracted = extract_latent_predictions(model, bundle.loaders[split], device)
     output_dir = Path(config["analysis"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(output_dir / "latent_predictions.npz", **extracted)
 
     target_columns = list(config["data"]["target_columns"])
-    cd8_index = target_columns.index("Density_CD8")
+    batch_names = bundle.metadata.batch_names
     umap_coordinates = fit_latent_umap(extracted["latent"], config["analysis"])
-    np.save(output_dir / "umap_coordinates.npy", umap_coordinates)
+    build_latent_umap_frame(
+        extracted,
+        umap_coordinates,
+        target_columns,
+        batch_names,
+        split,
+    ).to_csv(output_dir / "latent_umap.csv", index=False)
+    build_latent_embeddings_frame(
+        extracted,
+        batch_names,
+        split,
+    ).to_csv(output_dir / "latent_embeddings.csv", index=False)
     plot_latent_umap_batch(
         umap_coordinates,
         extracted["batches"],
-        bundle.metadata.batch_names,
+        batch_names,
         output_dir / "latent_umap_batch.png",
         config["analysis"],
     )
@@ -626,25 +968,46 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         output_dir / "latent_umap_densities.png",
         config["analysis"],
     )
+    logit_epsilon = float(config["loss"]["logit_epsilon"])
     plot_latent_umap_densities(
         umap_coordinates,
         extracted["targets"],
         target_columns,
         output_dir / "latent_umap_densities_logit.png",
         config["analysis"],
-        logit_epsilon=float(config["loss"]["logit_epsilon"]),
+        logit_epsilon=logit_epsilon,
     )
+    for index, column in enumerate(target_columns):
+        plot_latent_umap_ziln_per_target(
+            umap_coordinates,
+            extracted["targets"][:, index],
+            extracted["pi"][:, index],
+            extracted["mu"][:, index],
+            extracted["sigma"][:, index],
+            column,
+            output_dir / f"latent_umap_ziln_{column}.png",
+            config["analysis"],
+            logit_epsilon,
+        )
     scatter_split = str(config["analysis"]["ziln_scatter_split"])
     scatter_data = (
         extracted
         if scatter_split == split
         else extract_latent_predictions(model, bundle.loaders[scatter_split], device)
     )
-    plot_ziln_cd8_scatter(
-        scatter_data["mu"][:, cd8_index],
-        scatter_data["targets"][:, cd8_index],
-        float(config["loss"]["logit_epsilon"]),
-        output_dir / "ziln_cd8_scatter.png",
+    build_ziln_scatter_frame(
+        scatter_data,
+        target_columns,
+        batch_names,
+        scatter_split,
+        logit_epsilon,
+    ).to_csv(output_dir / "ziln_density_scatter.csv", index=False)
+    plot_ziln_density_scatter(
+        scatter_data["mu"],
+        scatter_data["targets"],
+        target_columns,
+        logit_epsilon,
+        output_dir / "ziln_density_scatter.png",
         config["analysis"],
     )
 
