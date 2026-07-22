@@ -15,13 +15,13 @@ data:
 
 model:
   num_peaks: 5808  # Number of aligned m/z bins.
-  embedding_dim: 64  # Width of each learned peak embedding.
-  peak_hidden_dims: [256, 256]  # Hidden widths of the per-peak MLP.
-  peak_output_dim: 256  # Per-peak representation width before mean pooling.
-  aggregation_hidden_dims: [256, 128]  # Hidden widths after permutation-invariant pooling.
-  latent_dim: 64  # Shared biology-predictive, batch-invariant latent width.
-  biology_hidden_dims: [128, 64]  # Hidden widths of the ZILN biology predictor.
-  discriminator_hidden_dims: [64, 32]  # Hidden widths of the batch discriminator.
+  embedding_dim: 128  # Width of each learned peak embedding.
+  peak_hidden_dims: [512, 512]  # Hidden widths of the per-peak MLP.
+  peak_output_dim: 512  # Per-peak representation width before mean pooling.
+  aggregation_hidden_dims: [512, 512]  # Hidden widths after permutation-invariant pooling.
+  latent_dim: 256  # Shared biology-predictive, batch-invariant latent width.
+  biology_hidden_dims: [256, 128]  # Hidden widths of the ZILN biology predictor.
+  discriminator_hidden_dims: [256, 128]  # Hidden widths of the batch discriminator.
   activation: gelu  # MLP activation: relu, gelu, silu, or leaky_relu.
   dropout: 0.10  # Dropout probability in all hidden MLP layers.
   use_layer_norm: true  # Apply LayerNorm after hidden linear layers.
@@ -32,7 +32,7 @@ loss:
   target_weights: [16.0, 4.0, 2.0, 1.0]  # Relative weights in target_columns order.
   logit_epsilon: 0.000001  # Clamp for positive targets before the logit transform.
   include_normal_constant: false  # Keep false to reproduce the PDF loss exactly.
-  biology_weight: 1.0  # Multiplier for the complete four-target ZILN loss.
+  biology_weight: 5.0  # Multiplier for the complete four-target ZILN loss.
   batch_weight: 1.0  # Multiplier for discriminator cross-entropy.
   balance_batch_classes: true  # Use inverse-frequency discriminator class weights.
 
@@ -46,14 +46,14 @@ training:
   prefetch_factor: 4  # Batches prefetched by each worker.
   pin_memory: true  # Pin host tensors when CUDA is available.
   learning_rate: 0.01  # AdamW learning rate.
-  weight_decay: 0.000001  # AdamW decoupled weight decay.
+  weight_decay: 0.00001  # AdamW decoupled weight decay.
   beta1: 0.9  # AdamW first-moment coefficient.
   beta2: 0.999  # AdamW second-moment coefficient.
   gradient_clip_norm: 5.0  # Maximum global gradient norm; null disables clipping.
-  grl_max_lambda: 0.5  # Maximum encoder-bound gradient reversal strength.
+  grl_max_lambda: 0.25  # Maximum encoder-bound gradient reversal strength.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
   grl_gamma: 10.0  # Steepness of the DANN logistic GRL schedule.
-  early_stopping_patience: 10  # Epochs without validation biology improvement before stopping.
+  early_stopping_patience: 50  # Epochs without validation biology improvement before stopping.
   early_stopping_min_delta: 0.0001  # Required validation biology improvement.
   checkpoint_every: 1  # Save a latest checkpoint every this many epochs.
   resume_checkpoint: null  # Optional checkpoint path from which to resume.
@@ -68,7 +68,7 @@ training:
 analysis:
   checkpoint: null  # Checkpoint to analyze; null selects output_dir/best.pt.
   split: test  # Data split used for latent and prediction plots.
-  ziln_scatter_split: validation  # Held-out split used for the requested CD8 validation scatter.
+  ziln_scatter_split: validation  # Held-out split used for the ZILN density validation scatter.
   max_samples: 100000  # Stratified cap for latent extraction and UMAP.
   batch_size: 512  # Sparse pixels per inference step.
   num_workers: 4  # DataLoader workers used during inference.
