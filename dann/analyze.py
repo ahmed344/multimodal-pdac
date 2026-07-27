@@ -89,7 +89,7 @@ def load_model(
     config: Mapping[str, Any],
     bundle: DataBundle,
     device: torch.device,
-) -> AdversarialLatentFusion:
+) -> tuple[AdversarialLatentFusion, int]:
     """Reconstruct a trained model from a checkpoint.
 
     Args:
@@ -99,7 +99,8 @@ def load_model(
         device (torch.device): Inference device.
 
     Returns:
-        AdversarialLatentFusion: Evaluation-mode trained model.
+        tuple[AdversarialLatentFusion, int]: Evaluation-mode trained model and the
+        checkpoint's one-based training epoch.
     """
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -110,7 +111,7 @@ def load_model(
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
-    return model
+    return model, int(checkpoint["epoch"]) + 1
 
 
 def extract_latent_predictions(
@@ -796,20 +797,35 @@ def plot_similarity_heatmap(
 
 
 def plot_loss_curves(
-    history_path: Path, output_path: Path, figure_dpi: int
+    history_path: Path,
+    output_path: Path,
+    figure_dpi: int,
+    best_epoch: int | float | None = None,
 ) -> None:
     """Plot train/validation objective components and batch accuracy.
+
+    A dashed red vertical line marks the best-model epoch selected by minimum
+    validation biology loss when ``best_epoch`` is omitted.
 
     Args:
         history_path (Path): Training history CSV.
         output_path (Path): Destination PNG path.
         figure_dpi (int): Saved figure resolution.
+        best_epoch (int | float | None): One-based epoch of the chosen best
+            checkpoint. When ``None``, uses the epoch with the lowest
+            ``validation_biology_loss`` in ``history_path``.
 
     Returns:
         None: Figure is saved to disk.
     """
 
     history = pd.read_csv(history_path)
+    if best_epoch is None:
+        best_epoch = float(
+            history.loc[history["validation_biology_loss"].idxmin(), "epoch"]
+        )
+    else:
+        best_epoch = float(best_epoch)
     panels = [
         ("total_loss", "Total objective"),
         ("biology_loss", "ZILN biology"),
@@ -823,6 +839,13 @@ def plot_loss_curves(
         axis.plot(history["epoch"], history[f"train_{metric}"], label="Train")
         axis.plot(
             history["epoch"], history[f"validation_{metric}"], label="Validation"
+        )
+        axis.axvline(
+            best_epoch,
+            color="red",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Best model (epoch {int(best_epoch)})",
         )
         axis.set_title(title)
         axis.set_xlabel("Epoch")
@@ -933,11 +956,15 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         if configured_checkpoint
         else Path(config["training"]["output_dir"]) / "best.pt"
     )
-    model = load_model(checkpoint_path, config, bundle, device)
+    model, checkpoint_epoch = load_model(checkpoint_path, config, bundle, device)
     split = str(config["analysis"]["split"])
     extracted = extract_latent_predictions(model, bundle.loaders[split], device)
     output_dir = Path(config["analysis"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    umap_dir = output_dir / "umap"
+    umap_dir.mkdir(parents=True, exist_ok=True)
+    model_dir = Path(config["training"]["output_dir"])
+    model_dir.mkdir(parents=True, exist_ok=True)
 
     target_columns = list(config["data"]["target_columns"])
     batch_names = bundle.metadata.batch_names
@@ -948,7 +975,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         target_columns,
         batch_names,
         split,
-    ).to_csv(output_dir / "latent_umap.csv", index=False)
+    ).to_csv(umap_dir / "latent_umap.csv", index=False)
     build_latent_embeddings_frame(
         extracted,
         batch_names,
@@ -958,14 +985,14 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         umap_coordinates,
         extracted["batches"],
         batch_names,
-        output_dir / "latent_umap_batch.png",
+        umap_dir / "latent_umap_batch.png",
         config["analysis"],
     )
     plot_latent_umap_densities(
         umap_coordinates,
         extracted["targets"],
         target_columns,
-        output_dir / "latent_umap_densities.png",
+        umap_dir / "latent_umap_densities.png",
         config["analysis"],
     )
     logit_epsilon = float(config["loss"]["logit_epsilon"])
@@ -973,7 +1000,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         umap_coordinates,
         extracted["targets"],
         target_columns,
-        output_dir / "latent_umap_densities_logit.png",
+        umap_dir / "latent_umap_densities_logit.png",
         config["analysis"],
         logit_epsilon=logit_epsilon,
     )
@@ -985,7 +1012,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             extracted["mu"][:, index],
             extracted["sigma"][:, index],
             column,
-            output_dir / f"latent_umap_ziln_{column}.png",
+            umap_dir / f"latent_umap_ziln_{column}.png",
             config["analysis"],
             logit_epsilon,
         )
@@ -1047,11 +1074,22 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         }
     )
     family_table.to_csv(output_dir / "peptide_families.csv", index=False)
-    history_path = Path(config["training"]["output_dir"]) / "history.csv"
+    history_path = model_dir / "history.csv"
+    best_checkpoint_path = model_dir / "best.pt"
+    if checkpoint_path.resolve() == best_checkpoint_path.resolve():
+        best_epoch = checkpoint_epoch
+    elif best_checkpoint_path.is_file():
+        best_payload = torch.load(
+            best_checkpoint_path, map_location="cpu", weights_only=False
+        )
+        best_epoch = int(best_payload["epoch"]) + 1
+    else:
+        best_epoch = None
     plot_loss_curves(
         history_path,
-        output_dir / "loss_curves.png",
+        model_dir / "loss_curves.png",
         int(config["analysis"]["figure_dpi"]),
+        best_epoch=best_epoch,
     )
     for dataset in bundle.datasets.values():
         dataset.close()
