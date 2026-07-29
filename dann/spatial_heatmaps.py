@@ -178,6 +178,7 @@ def plot_density_heatmap(
         f"mean_{density}",
         f"prob_of_presence_{density}",
         f"sigma_{density}",
+        f"alpha_{density}",
         batch_column,
         "x",
         "y",
@@ -190,9 +191,9 @@ def plot_density_heatmap(
 
     n_batches = len(batches)
     fig, axes = plt.subplots(
-        figsize=(25, 4 * n_batches),
+        figsize=(30, 4 * n_batches),
         nrows=n_batches,
-        ncols=5,
+        ncols=6,
         tight_layout=True,
         squeeze=False,
     )
@@ -233,20 +234,29 @@ def plot_density_heatmap(
         im3 = axes[i, 3].imshow(heatmap_data, cmap="jet", origin="upper")
         fig.colorbar(im3, ax=axes[i, 3])
 
+        heatmap_data = adata.obs.loc[batch_mask].pivot(
+            index="y",
+            columns="x",
+            values=f"alpha_{density}",
+        )
+        im4 = axes[i, 4].imshow(heatmap_data, cmap="jet", origin="upper")
+        fig.colorbar(im4, ax=axes[i, 4])
+
         sc.pl.spatial(
             adata[batch_mask],
             library_id=batch,
             img_key="HES",
             frameon=False,
             show=False,
-            ax=axes[i, 4],
+            ax=axes[i, 5],
         )
 
     axes[0, 0].set_title(f"logit_{density}", fontsize=12)
     axes[0, 1].set_title(f"mean_{density}", fontsize=12)
     axes[0, 2].set_title(f"prob_of_presence_{density}", fontsize=12)
     axes[0, 3].set_title(f"sigma_{density}", fontsize=12)
-    axes[0, 4].set_title("HES", fontsize=12)
+    axes[0, 4].set_title(f"alpha_{density}", fontsize=12)
+    axes[0, 5].set_title("HES", fontsize=12)
 
     for ax in axes.flatten():
         ax.set_aspect("equal")
@@ -254,7 +264,7 @@ def plot_density_heatmap(
         ax.set_yticks([])
         ax.set_facecolor("gray")
 
-    for ax in axes[:, 4]:
+    for ax in axes[:, 5]:
         ax.invert_yaxis()
         ax.invert_xaxis()
 

@@ -28,6 +28,10 @@ DEFAULT_OUTPUT = Path(
     "/workspaces/multimodal-pdac/data/PDAC/Results/dann/analysis/spatial/"
     "spatial_inference.parquet"
 )
+DEFAULT_LATENT_OUTPUT = Path(
+    "/workspaces/multimodal-pdac/data/PDAC/Results/dann/analysis/spatial/"
+    "spatial_latent.parquet"
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -44,6 +48,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--latent-output",
+        type=Path,
+        default=DEFAULT_LATENT_OUTPUT,
+        help="Destination Parquet for ordered full latent vectors.",
+    )
     parser.add_argument(
         "--device",
         default=None,
@@ -461,13 +471,13 @@ def validate_input_schema(
 
 
 def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
-    """Build deterministic output names for every target triplet.
+    """Build deterministic output names for every target parameter set.
 
     Args:
         target_columns (Sequence[str]): Ordered density target names.
 
     Returns:
-        list[str]: Per-target mean, presence-probability, and sigma columns.
+        list[str]: Per-target mean, presence-probability, sigma, and alpha columns.
     """
 
     names: list[str] = []
@@ -477,9 +487,25 @@ def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
                 f"mean_{target}",
                 f"prob_of_presence_{target}",
                 f"sigma_{target}",
+                f"alpha_{target}",
             ]
         )
     return names
+
+
+def latent_column_names(latent_dim: int) -> list[str]:
+    """Build deterministic column names for a latent representation.
+
+    Args:
+        latent_dim (int): Number of latent dimensions.
+
+    Returns:
+        list[str]: Ordered names from ``latent_0`` through ``latent_{D-1}``.
+    """
+
+    if int(latent_dim) <= 0:
+        raise ValueError("latent_dim must be positive.")
+    return [f"latent_{index}" for index in range(int(latent_dim))]
 
 
 def output_schema(target_columns: Sequence[str]) -> pa.Schema:
@@ -503,12 +529,34 @@ def output_schema(target_columns: Sequence[str]) -> pa.Schema:
     return pa.schema(fields)
 
 
+def latent_output_schema(latent_dim: int) -> pa.Schema:
+    """Construct the stable Parquet schema for full latent vectors.
+
+    Args:
+        latent_dim (int): Number of latent dimensions.
+
+    Returns:
+        pa.Schema: Row identity and float32 latent fields.
+    """
+
+    fields = [
+        pa.field("row_position", pa.int64(), nullable=False),
+        pa.field("obs_name", pa.string(), nullable=False),
+    ]
+    fields.extend(
+        pa.field(name, pa.float32(), nullable=False)
+        for name in latent_column_names(latent_dim)
+    )
+    return pa.schema(fields)
+
+
 def build_output_table(
     row_positions: np.ndarray,
     obs_names: np.ndarray,
     mu: np.ndarray,
     pi: np.ndarray,
     sigma: np.ndarray,
+    alpha: np.ndarray,
     target_columns: Sequence[str],
 ) -> pa.Table:
     """Build one typed output table from a model inference batch.
@@ -519,6 +567,7 @@ def build_output_table(
         mu (np.ndarray): Native ZILN means on the positive logit-density scale.
         pi (np.ndarray): Structural-zero probabilities.
         sigma (np.ndarray): Positive-branch ZILN standard deviations.
+        alpha (np.ndarray): Positive-branch ZILN skewness parameters.
         target_columns (Sequence[str]): Ordered density target names.
 
     Returns:
@@ -526,10 +575,11 @@ def build_output_table(
     """
 
     expected_shape = (row_positions.size, len(target_columns))
-    if mu.shape != expected_shape or pi.shape != expected_shape or sigma.shape != expected_shape:
+    shapes = (mu.shape, pi.shape, sigma.shape, alpha.shape)
+    if any(shape != expected_shape for shape in shapes):
         raise ValueError(
             f"Prediction arrays must all have shape {expected_shape}; observed "
-            f"{mu.shape}, {pi.shape}, and {sigma.shape}."
+            f"{mu.shape}, {pi.shape}, {sigma.shape}, and {alpha.shape}."
         )
     if obs_names.size != row_positions.size:
         raise ValueError("Observation names and row positions must have equal length.")
@@ -549,9 +599,50 @@ def build_output_table(
                     np.asarray(sigma[:, index], dtype=np.float32),
                     type=pa.float32(),
                 ),
+                pa.array(
+                    np.asarray(alpha[:, index], dtype=np.float32),
+                    type=pa.float32(),
+                ),
             ]
         )
     return pa.Table.from_arrays(arrays, schema=output_schema(target_columns))
+
+
+def build_latent_output_table(
+    row_positions: np.ndarray,
+    obs_names: np.ndarray,
+    latent: np.ndarray,
+) -> pa.Table:
+    """Build one typed latent-output table from an inference batch.
+
+    Args:
+        row_positions (np.ndarray): Global zero-based AnnData row positions.
+        obs_names (np.ndarray): Original possibly duplicated observation names.
+        latent (np.ndarray): Full latent matrix with shape ``[rows, latent_dim]``.
+
+    Returns:
+        pa.Table: Typed Parquet-ready identity and latent values.
+    """
+
+    latent = np.asarray(latent)
+    if latent.ndim != 2:
+        raise ValueError(f"Latent array must be two-dimensional; observed {latent.shape}.")
+    if latent.shape[0] != row_positions.size:
+        raise ValueError(
+            f"Latent row count {latent.shape[0]} does not match "
+            f"{row_positions.size} row positions."
+        )
+    if obs_names.size != row_positions.size:
+        raise ValueError("Observation names and row positions must have equal length.")
+    arrays: list[pa.Array] = [
+        pa.array(np.asarray(row_positions, dtype=np.int64), type=pa.int64()),
+        pa.array(np.asarray(obs_names, dtype=str), type=pa.string()),
+    ]
+    arrays.extend(
+        pa.array(np.asarray(latent[:, index], dtype=np.float32), type=pa.float32())
+        for index in range(latent.shape[1])
+    )
+    return pa.Table.from_arrays(arrays, schema=latent_output_schema(latent.shape[1]))
 
 
 def load_checkpoint_model(
@@ -641,6 +732,7 @@ def run_inference(
     num_workers_override: int | None = None,
     max_rows: int | None = None,
     overwrite: bool = False,
+    latent_output_path: Path = DEFAULT_LATENT_OUTPUT,
 ) -> Path:
     """Run all-row sparse tissue inference and atomically write Parquet.
 
@@ -653,6 +745,7 @@ def run_inference(
         num_workers_override (int | None): Optional DataLoader-worker override.
         max_rows (int | None): Optional leading-row cap for smoke testing.
         overwrite (bool): Whether to replace an existing output after success.
+        latent_output_path (Path): Destination Parquet path for full latent vectors.
 
     Returns:
         Path: Validated Parquet output path.
@@ -661,8 +754,12 @@ def run_inference(
     input_path = Path(input_path)
     checkpoint_path = Path(checkpoint_path)
     output_path = Path(output_path)
-    if output_path.exists() and not overwrite:
-        raise FileExistsError(f"Output already exists: {output_path}")
+    latent_output_path = Path(latent_output_path)
+    if output_path.resolve() == latent_output_path.resolve():
+        raise ValueError("Prediction and latent output paths must be different.")
+    for candidate in (output_path, latent_output_path):
+        if candidate.exists() and not overwrite:
+            raise FileExistsError(f"Output already exists: {candidate}")
     model, config, target_columns, device, checkpoint_epoch = load_checkpoint_model(
         checkpoint_path, device_override
     )
@@ -707,13 +804,24 @@ def run_inference(
         prefetch_factor=int(training_config["prefetch_factor"]),
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    latent_output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    if temporary_path.exists():
-        temporary_path.unlink()
-    schema = output_schema(target_columns)
-    writer = pq.ParquetWriter(
+    latent_temporary_path = latent_output_path.with_suffix(
+        latent_output_path.suffix + ".tmp"
+    )
+    for candidate in (temporary_path, latent_temporary_path):
+        if candidate.exists():
+            candidate.unlink()
+    prediction_writer = pq.ParquetWriter(
         temporary_path,
-        schema,
+        output_schema(target_columns),
+        compression="zstd",
+        use_dictionary=["obs_name"],
+    )
+    latent_dim = int(config["model"]["latent_dim"])
+    latent_writer = pq.ParquetWriter(
+        latent_temporary_path,
+        latent_output_schema(latent_dim),
         compression="zstd",
         use_dictionary=["obs_name"],
     )
@@ -738,15 +846,27 @@ def run_inference(
                 }
                 latent = model.encode(model_batch)
                 predictions = model.biology_predictor(latent)
+                obs_names = name_reader.read(
+                    processed, processed + row_positions.size
+                )
                 table = build_output_table(
                     row_positions=row_positions,
-                    obs_names=name_reader.read(processed, processed + row_positions.size),
+                    obs_names=obs_names,
                     mu=predictions["mu"].cpu().numpy(),
                     pi=predictions["pi"].cpu().numpy(),
                     sigma=predictions["sigma"].cpu().numpy(),
+                    alpha=predictions["alpha"].cpu().numpy(),
                     target_columns=target_columns,
                 )
-                writer.write_table(table, row_group_size=row_positions.size)
+                latent_table = build_latent_output_table(
+                    row_positions=row_positions,
+                    obs_names=obs_names,
+                    latent=latent.cpu().numpy(),
+                )
+                prediction_writer.write_table(table, row_group_size=row_positions.size)
+                latent_writer.write_table(
+                    latent_table, row_group_size=row_positions.size
+                )
                 processed += row_positions.size
                 if batch_number % 25 == 0 or processed == selected_rows:
                     print(
@@ -758,21 +878,31 @@ def run_inference(
             raise RuntimeError(
                 f"Inference wrote {processed} rows but expected {selected_rows}."
             )
-        writer.close()
+        prediction_writer.close()
+        latent_writer.close()
+        validate_output(
+            output_path=temporary_path,
+            input_path=input_path,
+            target_columns=target_columns,
+            expected_rows=selected_rows,
+        )
+        validate_latent_output(
+            output_path=latent_temporary_path,
+            input_path=input_path,
+            latent_dim=latent_dim,
+            expected_rows=selected_rows,
+        )
         os.replace(temporary_path, output_path)
+        os.replace(latent_temporary_path, latent_output_path)
     except BaseException:
-        writer.close()
-        if temporary_path.exists():
-            temporary_path.unlink()
+        prediction_writer.close()
+        latent_writer.close()
+        for candidate in (temporary_path, latent_temporary_path):
+            if candidate.exists():
+                candidate.unlink()
         raise
     finally:
         dataset.close()
-    validate_output(
-        output_path=output_path,
-        input_path=input_path,
-        target_columns=target_columns,
-        expected_rows=selected_rows,
-    )
     return output_path
 
 
@@ -850,6 +980,83 @@ def validate_output(
     }
 
 
+def validate_latent_output(
+    output_path: Path,
+    input_path: Path,
+    latent_dim: int,
+    expected_rows: int,
+    batch_size: int = 8_192,
+) -> dict[str, Any]:
+    """Validate identity, order, dtypes, and finiteness in a latent Parquet export.
+
+    Args:
+        output_path (Path): Full-latent Parquet path.
+        input_path (Path): Source tissue AnnData path.
+        latent_dim (int): Expected number of latent dimensions.
+        expected_rows (int): Required output row count.
+        batch_size (int): Rows checked per validation batch.
+
+    Returns:
+        dict[str, Any]: Validated row count, latent dimension, and global value range.
+    """
+
+    parquet = pq.ParquetFile(output_path)
+    expected_schema = latent_output_schema(latent_dim)
+    if not parquet.schema_arrow.equals(expected_schema):
+        raise TypeError(
+            f"Unexpected latent Parquet schema:\n{parquet.schema_arrow}\n"
+            f"Expected:\n{expected_schema}"
+        )
+    if parquet.metadata.num_rows != int(expected_rows):
+        raise ValueError(
+            f"Latent output has {parquet.metadata.num_rows} rows; "
+            f"expected {expected_rows}."
+        )
+    columns = latent_column_names(latent_dim)
+    minimum = np.inf
+    maximum = -np.inf
+    checked = 0
+    with ObservationNameReader(input_path) as name_reader:
+        for batch in parquet.iter_batches(batch_size=batch_size):
+            size = batch.num_rows
+            positions = batch.column("row_position").to_numpy(zero_copy_only=False)
+            expected = np.arange(checked, checked + size, dtype=np.int64)
+            if not np.array_equal(positions, expected):
+                raise ValueError(
+                    "Latent Parquet row_position is not contiguous and ordered."
+                )
+            observed_names = np.asarray(
+                batch.column("obs_name").to_pylist(), dtype=str
+            )
+            expected_names = name_reader.read(checked, checked + size)
+            if not np.array_equal(observed_names, expected_names):
+                raise ValueError(
+                    "Latent Parquet obs_name order differs from source AnnData."
+                )
+            for name in columns:
+                values = batch.column(name).to_numpy(zero_copy_only=False)
+                if not np.isfinite(values).all():
+                    raise ValueError(
+                        f"Latent column {name!r} contains non-finite values."
+                    )
+                minimum = min(minimum, float(values.min()))
+                maximum = max(maximum, float(values.max()))
+            checked += size
+    if checked != expected_rows:
+        raise ValueError(f"Validated {checked} latent rows; expected {expected_rows}.")
+    print(
+        f"Validated {checked:,} ordered rows and {latent_dim} float32 latent "
+        f"columns in {output_path}.",
+        flush=True,
+    )
+    return {
+        "rows": checked,
+        "latent_dim": int(latent_dim),
+        "minimum": minimum,
+        "maximum": maximum,
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Load options and execute full spatial inference.
 
@@ -865,6 +1072,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_path=args.input,
         checkpoint_path=args.checkpoint,
         output_path=args.output,
+        latent_output_path=args.latent_output,
         device_override=args.device,
         batch_size_override=args.batch_size,
         num_workers_override=args.num_workers,
@@ -872,6 +1080,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         overwrite=args.overwrite,
     )
     print(f"Spatial inference written to {output}", flush=True)
+    print(f"Spatial latent vectors written to {args.latent_output}", flush=True)
     return 0
 
 

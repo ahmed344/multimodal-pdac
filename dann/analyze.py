@@ -475,16 +475,15 @@ def plot_latent_umap_batch(
     axis.set_ylabel("UMAP 2")
     axis.set_xticks([])
     axis.set_yticks([])
-    legend_columns = max(1, int(np.ceil(num_batches / 20)))
     axis.legend(
         handles=handles,
         title="Batch",
         loc="center left",
         bbox_to_anchor=(1.02, 0.5),
-        fontsize=7,
+        fontsize=9,
         markerscale=4.0,
         frameon=False,
-        ncol=legend_columns,
+        ncol=1,
     )
     figure.savefig(output_path, dpi=int(config["figure_dpi"]))
     plt.close(figure)
@@ -621,17 +620,21 @@ def plot_latent_umap_ziln_per_target(
     pi: np.ndarray,
     mu: np.ndarray,
     sigma: np.ndarray,
+    alpha: np.ndarray,
+    batches: np.ndarray,
+    batch_names: Sequence[str],
     target_column: str,
     output_path: Path,
     config: Mapping[str, Any],
     logit_epsilon: float,
 ) -> None:
-    """Plot a 2x2 latent UMAP for one target: logit density, 1-pi, mu, and sigma.
+    """Plot a 2x3 latent UMAP for one target's density, parameters, and batches.
 
     All samples are drawn in every panel. For the logit panel, zero densities
     are shown in light gray and excluded from color-limit / colorbar scaling so
     they do not collapse the positive logit range. The existence panel colors by
-    ``1 - pi`` (probability of a non-zero density).
+    ``1 - pi`` (probability of a non-zero density). The categorical batch panel
+    intentionally omits a legend because the standalone batch UMAP provides it.
 
     Args:
         coordinates (np.ndarray): Precomputed UMAP coordinates ``[n_samples, 2]``.
@@ -639,6 +642,9 @@ def plot_latent_umap_ziln_per_target(
         pi (np.ndarray): Predicted structural-zero probabilities ``[n_samples]``.
         mu (np.ndarray): Predicted logit-normal means ``[n_samples]``.
         sigma (np.ndarray): Predicted logit-normal standard deviations ``[n_samples]``.
+        alpha (np.ndarray): Predicted skewness parameters ``[n_samples]``.
+        batches (np.ndarray): Encoded integer batch labels ``[n_samples]``.
+        batch_names (Sequence[str]): Display names for encoded batches.
         target_column (str): IHC density column name (e.g. ``Density_CD8``).
         output_path (Path): Destination PNG path.
         config (Mapping[str, Any]): Analysis plot settings.
@@ -652,12 +658,16 @@ def plot_latent_umap_ziln_per_target(
     pi = np.asarray(pi, dtype=np.float64).reshape(-1)
     mu = np.asarray(mu, dtype=np.float64).reshape(-1)
     sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)
+    alpha = np.asarray(alpha, dtype=np.float64).reshape(-1)
+    batches = np.asarray(batches, dtype=np.int64).reshape(-1)
     n_samples = coordinates.shape[0]
     for name, values in (
         ("densities", densities),
         ("pi", pi),
         ("mu", mu),
         ("sigma", sigma),
+        ("alpha", alpha),
+        ("batches", batches),
     ):
         if values.shape[0] != n_samples:
             raise ValueError(
@@ -665,7 +675,7 @@ def plot_latent_umap_ziln_per_target(
                 f"{n_samples} UMAP coordinates."
             )
 
-    ncols = 2
+    ncols = 3
     nrows = 2
     figure, axes = plt.subplots(
         nrows,
@@ -722,8 +732,9 @@ def plot_latent_umap_ziln_per_target(
 
     parameter_panels = (
         (axes[0][1], 1.0 - pi, f"1-pi_{target_column}"),
-        (axes[1][0], mu, f"mu_{target_column}"),
-        (axes[1][1], sigma, f"sigma_{target_column}"),
+        (axes[0][2], mu, f"mu_{target_column}"),
+        (axes[1][0], sigma, f"sigma_{target_column}"),
+        (axes[1][1], alpha, f"alpha_{target_column}"),
     )
     for axis, values, label in parameter_panels:
         vmin, vmax = _robust_color_limits(values, lower_percentile, upper_percentile)
@@ -743,6 +754,25 @@ def plot_latent_umap_ziln_per_target(
         axis.set_xticks([])
         axis.set_yticks([])
         figure.colorbar(scatter, ax=axis, label=label)
+
+    batch_axis = axes[1][2]
+    batch_colors = _categorical_batch_colors(len(batch_names))
+    for batch_id in range(len(batch_names)):
+        mask = batches == batch_id
+        if not np.any(mask):
+            continue
+        batch_axis.scatter(
+            coordinates[mask, 0],
+            coordinates[mask, 1],
+            c=[batch_colors[batch_id]],
+            s=point_size,
+            rasterized=True,
+        )
+    batch_axis.set_title("Latent UMAP by batch")
+    batch_axis.set_xlabel("UMAP 1")
+    batch_axis.set_ylabel("UMAP 2")
+    batch_axis.set_xticks([])
+    batch_axis.set_yticks([])
 
     figure.savefig(output_path, dpi=int(config["figure_dpi"]))
     plt.close(figure)
@@ -1014,6 +1044,9 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             extracted["pi"][:, index],
             extracted["mu"][:, index],
             extracted["sigma"][:, index],
+            extracted["alpha"][:, index],
+            extracted["batches"],
+            batch_names,
             column,
             umap_dir / f"latent_umap_ziln_{column}.png",
             config["analysis"],
