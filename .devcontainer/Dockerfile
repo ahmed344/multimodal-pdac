@@ -1,6 +1,6 @@
 FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
 
-RUN apt-get update && apt-get install -y git
+RUN apt-get update && apt-get install -y git curl
 
 # Switch to the existing non-root user (UID 1000)
 USER 1000

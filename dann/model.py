@@ -80,6 +80,7 @@ class IntensityWeightedPeakEncoder(nn.Module):
         activation: str = "gelu",
         dropout: float = 0.0,
         use_layer_norm: bool = True,
+        inference_peak_chunk_size: int = 262_144,
     ) -> None:
         """Initialize the learnable peak dictionary and Deep Sets MLPs.
 
@@ -93,6 +94,8 @@ class IntensityWeightedPeakEncoder(nn.Module):
             activation (str): Hidden activation name.
             dropout (float): Hidden dropout probability.
             use_layer_norm (bool): Apply hidden LayerNorm.
+            inference_peak_chunk_size (int): Maximum active peaks passed through
+                the per-peak MLP at once when gradients are disabled.
 
         Returns:
             None: Module parameters are initialized.
@@ -101,6 +104,9 @@ class IntensityWeightedPeakEncoder(nn.Module):
         super().__init__()
         self.num_peaks = int(num_peaks)
         self.embedding_dim = int(embedding_dim)
+        self.inference_peak_chunk_size = int(inference_peak_chunk_size)
+        if self.inference_peak_chunk_size <= 0:
+            raise ValueError("inference_peak_chunk_size must be positive.")
         self.embedding = nn.Embedding(self.num_peaks, self.embedding_dim)
         self.peak_mlp = build_mlp(
             self.embedding_dim,
@@ -144,17 +150,39 @@ class IntensityWeightedPeakEncoder(nn.Module):
             pooled = self.embedding.weight.new_zeros(
                 (batch_size, self.peak_mlp[-1].out_features)
             )
-        else:
+        elif (
+            torch.is_grad_enabled()
+            or peak_indices.numel() <= self.inference_peak_chunk_size
+        ):
             weighted_embeddings = self.embedding(peak_indices) * intensities.unsqueeze(-1)
             peak_features = self.peak_mlp(weighted_embeddings)
             pooled = peak_features.new_zeros((batch_size, peak_features.shape[-1]))
             pooled.index_add_(0, sample_indices, peak_features)
-            pooled = pooled / peak_counts.clamp_min(1).to(pooled.dtype).unsqueeze(-1)
+        else:
+            pooled = self.embedding.weight.new_zeros(
+                (batch_size, self.peak_mlp[-1].out_features)
+            )
+            for start in range(0, peak_indices.numel(), self.inference_peak_chunk_size):
+                stop = min(
+                    start + self.inference_peak_chunk_size,
+                    peak_indices.numel(),
+                )
+                weighted_embeddings = self.embedding(peak_indices[start:stop])
+                weighted_embeddings = (
+                    weighted_embeddings * intensities[start:stop].unsqueeze(-1)
+                )
+                peak_features = self.peak_mlp(weighted_embeddings)
+                pooled.index_add_(
+                    0,
+                    sample_indices[start:stop],
+                    peak_features,
+                )
+        pooled = pooled / peak_counts.clamp_min(1).to(pooled.dtype).unsqueeze(-1)
         return self.aggregation_mlp(pooled)
 
 
 class BiologyPredictor(nn.Module):
-    """Predict four zero-inflated logit-normal parameter triplets."""
+    """Predict four zero-inflated skew-logit-normal parameter quadruplets."""
 
     def __init__(
         self,
@@ -187,11 +215,17 @@ class BiologyPredictor(nn.Module):
         self.network = build_mlp(
             latent_dim,
             hidden_dims,
-            self.num_targets * 3,
+            self.num_targets * 4,
             activation,
             dropout,
             use_layer_norm,
         )
+        # Zero-init the alpha (skew) output slice so training starts identical
+        # to the prior Gaussian-only model and learns skew only as needed.
+        final_layer = self.network[-1]
+        with torch.no_grad():
+            final_layer.weight[3::4].zero_()
+            final_layer.bias[3::4].zero_()
 
     def forward(self, latent: torch.Tensor) -> dict[str, torch.Tensor]:
         """Map latent vectors to stable ZILN parameters.
@@ -200,18 +234,20 @@ class BiologyPredictor(nn.Module):
             latent (torch.Tensor): Shared latent matrix.
 
         Returns:
-            dict[str, torch.Tensor]: ``pi_logits``, ``pi``, ``mu``, and ``sigma``.
+            dict[str, torch.Tensor]: ``pi_logits``, ``pi``, ``mu``, ``sigma``, and ``alpha``.
         """
 
-        raw = self.network(latent).reshape(-1, self.num_targets, 3)
+        raw = self.network(latent).reshape(-1, self.num_targets, 4)
         pi_logits = raw[..., 0]
         mu = raw[..., 1]
         sigma = F.softplus(raw[..., 2]) + self.sigma_min
+        alpha = raw[..., 3]
         return {
             "pi_logits": pi_logits,
             "pi": torch.sigmoid(pi_logits),
             "mu": mu,
             "sigma": sigma,
+            "alpha": alpha,
         }
 
 
@@ -372,6 +408,9 @@ class AdversarialLatentFusion(nn.Module):
             peak_output_dim=int(values["peak_output_dim"]),
             aggregation_hidden_dims=values["aggregation_hidden_dims"],
             latent_dim=int(values["latent_dim"]),
+            inference_peak_chunk_size=int(
+                values.get("inference_peak_chunk_size", 262_144)
+            ),
             **common,
         )
         biology_predictor = BiologyPredictor(

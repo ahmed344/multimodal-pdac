@@ -226,3 +226,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Agentic files
+.cursor/
+.cursorrules
+CLAUDE.md

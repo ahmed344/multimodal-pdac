@@ -223,6 +223,7 @@ def run_epoch(
                 outputs["pi_logits"],
                 outputs["mu"],
                 outputs["sigma"],
+                outputs["alpha"],
                 batch["targets"],
             )
             discriminator = F.cross_entropy(

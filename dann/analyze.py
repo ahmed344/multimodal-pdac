@@ -135,6 +135,7 @@ def extract_latent_predictions(
         "pi": [],
         "mu": [],
         "sigma": [],
+        "alpha": [],
         "targets": [],
         "batches": [],
         "row_ids": [],
@@ -143,7 +144,7 @@ def extract_latent_predictions(
         for cpu_batch in loader:
             batch = move_batch_to_device(cpu_batch, device)
             predictions = model(batch, grl_strength=0.0)
-            for key in ("latent", "pi", "mu", "sigma"):
+            for key in ("latent", "pi", "mu", "sigma", "alpha"):
                 outputs[key].append(predictions[key].cpu().numpy())
             for key in ("targets", "batches", "row_ids"):
                 outputs[key].append(batch[key].cpu().numpy())
@@ -295,11 +296,13 @@ def build_latent_umap_frame(
     pi = np.asarray(extracted["pi"])
     mu = np.asarray(extracted["mu"])
     sigma = np.asarray(extracted["sigma"])
+    alpha = np.asarray(extracted["alpha"])
     for index, column in enumerate(target_columns):
         frame[column] = targets[:, index]
         frame[f"pi_{column}"] = pi[:, index]
         frame[f"mu_{column}"] = mu[:, index]
         frame[f"sigma_{column}"] = sigma[:, index]
+        frame[f"alpha_{column}"] = alpha[:, index]
     return frame
 
 
