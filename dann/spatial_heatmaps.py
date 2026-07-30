@@ -41,6 +41,26 @@ DEFAULT_DENSITIES = (
 IDENTITY_COLUMNS = ("row_position", "obs_name")
 
 
+def _symmetric_zero_imshow_limits(heatmap_data: pd.DataFrame) -> tuple[float, float]:
+    """Compute symmetric ``(-limit, limit)`` color limits centered at zero.
+
+    Args:
+        heatmap_data (pd.DataFrame): Pivoted spatial values (may contain NaNs).
+
+    Returns:
+        tuple[float, float]: Inclusive ``(vmin, vmax)`` with ``vmax == -vmin``.
+    """
+
+    values = np.asarray(heatmap_data.to_numpy(), dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return -1.0, 1.0
+    limit = float(np.nanmax(np.abs(finite)))
+    if not np.isfinite(limit) or limit <= 0.0:
+        limit = 1e-6
+    return -limit, limit
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse spatial heatmap command-line arguments.
 
@@ -191,7 +211,7 @@ def plot_density_heatmap(
 
     n_batches = len(batches)
     fig, axes = plt.subplots(
-        figsize=(30, 4 * n_batches),
+        figsize=(36, 4 * n_batches),
         nrows=n_batches,
         ncols=6,
         tight_layout=True,
@@ -239,7 +259,14 @@ def plot_density_heatmap(
             columns="x",
             values=f"alpha_{density}",
         )
-        im4 = axes[i, 4].imshow(heatmap_data, cmap="jet", origin="upper")
+        vmin, vmax = _symmetric_zero_imshow_limits(heatmap_data)
+        im4 = axes[i, 4].imshow(
+            heatmap_data,
+            cmap="coolwarm",
+            origin="upper",
+            vmin=vmin,
+            vmax=vmax,
+        )
         fig.colorbar(im4, ax=axes[i, 4])
 
         sc.pl.spatial(

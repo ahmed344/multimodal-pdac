@@ -18,6 +18,7 @@ import seaborn as sns
 import torch
 import umap
 from matplotlib import pyplot as plt
+from matplotlib.axes import Axes
 from scipy.cluster import hierarchy
 from scipy.spatial import distance
 
@@ -432,6 +433,26 @@ def _categorical_batch_colors(num_batches: int) -> np.ndarray:
     return np.concatenate([rgb, alpha], axis=1)
 
 
+def _style_umap_axis(axis: Axes, title: str) -> None:
+    """Apply shared UMAP panel styling: title only, no axes or spines.
+
+        Args:
+        axis (Axes): Matplotlib axes to style.
+        title (str): Panel title text.
+
+    Returns:
+        None: ``axis`` is mutated in place.
+    """
+
+    axis.set_title(title, fontsize=14)
+    axis.set_xlabel("")
+    axis.set_ylabel("")
+    axis.set_xticks([])
+    axis.set_yticks([])
+    for spine in axis.spines.values():
+        spine.set_visible(False)
+
+
 def plot_latent_umap_batch(
     coordinates: np.ndarray,
     batches: np.ndarray,
@@ -470,14 +491,9 @@ def plot_latent_umap_batch(
             rasterized=True,
         )
         handles.append(handle)
-    axis.set_title(f"Latent UMAP by batch ({num_batches} batches)")
-    axis.set_xlabel("UMAP 1")
-    axis.set_ylabel("UMAP 2")
-    axis.set_xticks([])
-    axis.set_yticks([])
+    _style_umap_axis(axis, f"Latent UMAP by batch ({num_batches} batches)")
     axis.legend(
         handles=handles,
-        title="Batch",
         loc="center left",
         bbox_to_anchor=(1.02, 0.5),
         fontsize=9,
@@ -531,6 +547,25 @@ def _robust_color_limits(
         pad = max(abs(center) * 1e-3, span * 0.5, 1e-6)
         return center - pad, center + pad
     return lower, upper
+
+
+def _symmetric_zero_color_limits(
+    values: np.ndarray, lower_percentile: float, upper_percentile: float
+) -> tuple[float, float]:
+    """Return symmetric ``(-limit, limit)`` bounds so colormap center is 0.
+
+    Args:
+        values (np.ndarray): Finite values used to color points.
+        lower_percentile (float): Lower percentile in ``[0, 100]``.
+        upper_percentile (float): Upper percentile in ``[0, 100]``.
+
+    Returns:
+        tuple[float, float]: Inclusive ``(vmin, vmax)`` with ``vmax == -vmin``.
+    """
+
+    lower, upper = _robust_color_limits(values, lower_percentile, upper_percentile)
+    limit = max(abs(lower), abs(upper), 1e-6)
+    return -limit, limit
 
 
 def plot_latent_umap_densities(
@@ -600,13 +635,9 @@ def plot_latent_umap_densities(
             rasterized=True,
         )
         scale_label = f"logit({column})" if use_logit else column
-        axis.set_title(f"Latent UMAP by {scale_label}")
-        axis.set_xlabel("UMAP 1")
-        axis.set_ylabel("UMAP 2")
-        axis.set_xticks([])
-        axis.set_yticks([])
+        _style_umap_axis(axis, f"Latent UMAP by {scale_label}")
         if values.size > 0:
-            figure.colorbar(scatter, ax=axis, label=scale_label)
+            figure.colorbar(scatter, ax=axis)
     for index in range(num_targets, nrows * ncols):
         row, col = divmod(index, ncols)
         axes[row][col].axis("off")
@@ -722,38 +753,47 @@ def plot_latent_umap_ziln_per_target(
             vmax=vmax,
             rasterized=True,
         )
-    axis.set_title(f"Latent UMAP by {logit_label}")
-    axis.set_xlabel("UMAP 1")
-    axis.set_ylabel("UMAP 2")
-    axis.set_xticks([])
-    axis.set_yticks([])
     if scatter is not None:
-        figure.colorbar(scatter, ax=axis, label=logit_label)
+        figure.colorbar(scatter, ax=axis)
+    _style_umap_axis(axis, f"Latent UMAP by {logit_label}")
 
     parameter_panels = (
-        (axes[0][1], 1.0 - pi, f"1-pi_{target_column}"),
-        (axes[0][2], mu, f"mu_{target_column}"),
-        (axes[1][0], sigma, f"sigma_{target_column}"),
-        (axes[1][1], alpha, f"alpha_{target_column}"),
+        (axes[0][1], 1.0 - pi, f"1-pi_{target_column}", cmap),
+        (axes[0][2], mu, f"mu_{target_column}", cmap),
+        (axes[1][0], sigma, f"sigma_{target_column}", cmap),
     )
-    for axis, values, label in parameter_panels:
+    for axis, values, label, panel_cmap in parameter_panels:
         vmin, vmax = _robust_color_limits(values, lower_percentile, upper_percentile)
         scatter = axis.scatter(
             coordinates[:, 0],
             coordinates[:, 1],
             c=values,
             s=point_size,
-            cmap=cmap,
+            cmap=panel_cmap,
             vmin=vmin,
             vmax=vmax,
             rasterized=True,
         )
-        axis.set_title(f"Latent UMAP by {label}")
-        axis.set_xlabel("UMAP 1")
-        axis.set_ylabel("UMAP 2")
-        axis.set_xticks([])
-        axis.set_yticks([])
-        figure.colorbar(scatter, ax=axis, label=label)
+        _style_umap_axis(axis, f"Latent UMAP by {label}")
+        figure.colorbar(scatter, ax=axis)
+
+    alpha_axis = axes[1][1]
+    alpha_label = f"alpha_{target_column}"
+    vmin, vmax = _symmetric_zero_color_limits(
+        alpha, lower_percentile, upper_percentile
+    )
+    scatter = alpha_axis.scatter(
+        coordinates[:, 0],
+        coordinates[:, 1],
+        c=alpha,
+        s=point_size,
+        cmap="coolwarm",
+        vmin=vmin,
+        vmax=vmax,
+        rasterized=True,
+    )
+    _style_umap_axis(alpha_axis, f"Latent UMAP by {alpha_label}")
+    figure.colorbar(scatter, ax=alpha_axis)
 
     batch_axis = axes[1][2]
     batch_colors = _categorical_batch_colors(len(batch_names))
@@ -768,11 +808,7 @@ def plot_latent_umap_ziln_per_target(
             s=point_size,
             rasterized=True,
         )
-    batch_axis.set_title("Latent UMAP by batch")
-    batch_axis.set_xlabel("UMAP 1")
-    batch_axis.set_ylabel("UMAP 2")
-    batch_axis.set_xticks([])
-    batch_axis.set_yticks([])
+    _style_umap_axis(batch_axis, "Latent UMAP by batch")
 
     figure.savefig(output_path, dpi=int(config["figure_dpi"]))
     plt.close(figure)
