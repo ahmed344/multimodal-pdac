@@ -22,6 +22,8 @@ from matplotlib.axes import Axes
 from scipy.cluster import hierarchy
 from scipy.spatial import distance
 
+from dann import ziln
+from dann.calibration import run_calibration
 from dann.config import apply_smoke_overrides, load_config, resolve_device, seed_everything
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.model import AdversarialLatentFusion
@@ -347,6 +349,8 @@ def build_ziln_scatter_frame(
     """Build a long-format table of positive-density ZILN scatter points.
 
     Only rows with true density ``> 0`` are retained, matching the scatter plot.
+    All four predicted parameters are stored, not just ``mu``, so the table is
+    self-sufficient for later recalibration without repeating model inference.
 
     Args:
         extracted (Mapping[str, np.ndarray]): Arrays from ``extract_latent_predictions``.
@@ -356,20 +360,40 @@ def build_ziln_scatter_frame(
         epsilon (float): Boundary clamp applied before the true-value logit.
 
     Returns:
-        pd.DataFrame: Long-format rows with true density, true logit, and predicted mu.
+        pd.DataFrame: Long-format rows with true density, true logit, and predictions.
     """
 
+    columns = [
+        "row_id",
+        "split",
+        "batch_id",
+        "batch",
+        "target",
+        "true_density",
+        "true_logit",
+        "predicted_mu",
+        "predicted_pi",
+        "predicted_sigma",
+        "predicted_alpha",
+        "predicted_logit_mean",
+    ]
     row_ids = np.asarray(extracted["row_ids"], dtype=np.int64)
     batch_ids = np.asarray(extracted["batches"], dtype=np.int64)
     batch_labels = _batch_name_series(batch_ids, batch_names).to_numpy()
     targets = np.asarray(extracted["targets"])
     mu = np.asarray(extracted["mu"])
+    pi = np.asarray(extracted["pi"])
+    sigma = np.asarray(extracted["sigma"])
+    alpha = np.asarray(extracted["alpha"])
     parts: list[pd.DataFrame] = []
     for index, column in enumerate(target_columns):
         positive = targets[:, index] > 0.0
         if not np.any(positive):
             continue
         truth = targets[positive, index]
+        mu_positive = mu[positive, index]
+        sigma_positive = sigma[positive, index]
+        alpha_positive = alpha[positive, index]
         parts.append(
             pd.DataFrame(
                 {
@@ -380,23 +404,18 @@ def build_ziln_scatter_frame(
                     "target": column,
                     "true_density": truth,
                     "true_logit": _positive_logit_densities(truth, epsilon),
-                    "predicted_mu": mu[positive, index],
+                    "predicted_mu": mu_positive,
+                    "predicted_pi": pi[positive, index],
+                    "predicted_sigma": sigma_positive,
+                    "predicted_alpha": alpha_positive,
+                    "predicted_logit_mean": ziln.positive_logit_mean(
+                        mu_positive, sigma_positive, alpha_positive
+                    ),
                 }
             )
         )
     if not parts:
-        return pd.DataFrame(
-            columns=[
-                "row_id",
-                "split",
-                "batch_id",
-                "batch",
-                "target",
-                "true_density",
-                "true_logit",
-                "predicted_mu",
-            ]
-        )
+        return pd.DataFrame(columns=columns)
     return pd.concat(parts, ignore_index=True)
 
 
@@ -814,6 +833,166 @@ def plot_latent_umap_ziln_per_target(
     plt.close(figure)
 
 
+def plot_latent_umap_ziln_corrected_per_target(
+    coordinates: np.ndarray,
+    densities: np.ndarray,
+    pi: np.ndarray,
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    alpha: np.ndarray,
+    batches: np.ndarray,
+    batch_names: Sequence[str],
+    target_column: str,
+    output_path: Path,
+    config: Mapping[str, Any],
+    logit_epsilon: float,
+) -> None:
+    """Plot a 2x3 latent UMAP of corrected ZILN summaries for one target.
+
+    The companion to ``plot_latent_umap_ziln_per_target``, which shows the raw
+    parameters. Here the parameters are converted into quantities that read as
+    predictions: the skew-corrected mean ``E[Z | y > 0]``, the positive-branch
+    median, the residual against observed truth, and the width of the central
+    90% predictive interval.
+
+    Every panel is masked to observed ``density > 0``. That is not a stylistic
+    choice: ``logit(0)`` is undefined, so all logit-scale summaries are
+    necessarily conditional on the positive branch, and ``pi`` is reported by
+    the raw-parameter figure instead.
+
+    Args:
+        coordinates (np.ndarray): Precomputed UMAP coordinates ``[n_samples, 2]``.
+        densities (np.ndarray): True density values ``[n_samples]`` for ``target_column``.
+        pi (np.ndarray): Predicted structural-zero probabilities ``[n_samples]``.
+        mu (np.ndarray): Predicted positive-branch locations ``[n_samples]``.
+        sigma (np.ndarray): Predicted positive-branch scales ``[n_samples]``.
+        alpha (np.ndarray): Predicted skewness parameters ``[n_samples]``.
+        batches (np.ndarray): Encoded integer batch labels ``[n_samples]``.
+        batch_names (Sequence[str]): Display names for encoded batches.
+        target_column (str): IHC density column name (e.g. ``Density_CD8``).
+        output_path (Path): Destination PNG path.
+        config (Mapping[str, Any]): Analysis plot settings.
+        logit_epsilon (float): Clamp applied before the positive-density logit.
+
+    Returns:
+        None: Figure is saved to disk.
+    """
+
+    densities = np.asarray(densities, dtype=np.float64).reshape(-1)
+    pi = np.asarray(pi, dtype=np.float64).reshape(-1)
+    mu = np.asarray(mu, dtype=np.float64).reshape(-1)
+    sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)
+    alpha = np.asarray(alpha, dtype=np.float64).reshape(-1)
+    batches = np.asarray(batches, dtype=np.int64).reshape(-1)
+    n_samples = coordinates.shape[0]
+    for name, values in (
+        ("densities", densities),
+        ("pi", pi),
+        ("mu", mu),
+        ("sigma", sigma),
+        ("alpha", alpha),
+        ("batches", batches),
+    ):
+        if values.shape[0] != n_samples:
+            raise ValueError(
+                f"{name} length {values.shape[0]} does not match "
+                f"{n_samples} UMAP coordinates."
+            )
+
+    ncols = 3
+    nrows = 2
+    figure, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(12 * ncols, 6 * nrows),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    point_size = float(config["point_size"]) * 0.35
+    cmap = str(config["density_cmap"])
+    lower_percentile = float(config["density_vmin_percentile"])
+    upper_percentile = float(config["density_vmax_percentile"])
+
+    positive = densities > 0.0
+    positive_coordinates = coordinates[positive]
+    truth = _positive_logit_densities(densities[positive], logit_epsilon)
+    mu_positive = mu[positive]
+    sigma_positive = sigma[positive]
+    alpha_positive = alpha[positive]
+    logit_mean = ziln.positive_logit_mean(mu_positive, sigma_positive, alpha_positive)
+    logit_median = ziln.positive_logit_quantile(
+        mu_positive, sigma_positive, alpha_positive, 0.50
+    )
+    interval_width = ziln.positive_logit_quantile(
+        mu_positive, sigma_positive, alpha_positive, 0.95
+    ) - ziln.positive_logit_quantile(
+        mu_positive, sigma_positive, alpha_positive, 0.05
+    )
+    residual = logit_mean - truth
+
+    sequential_panels = (
+        (axes[0][0], truth, f"Logit_{target_column} (observed)"),
+        (axes[0][1], logit_mean, f"logit_mean_{target_column}"),
+        (axes[0][2], logit_median, f"logit_median_{target_column}"),
+        (axes[1][1], interval_width, f"logit_q95-q05_{target_column}"),
+    )
+    for axis, values, label in sequential_panels:
+        if values.size == 0:
+            _style_umap_axis(axis, f"Latent UMAP by {label}")
+            continue
+        vmin, vmax = _robust_color_limits(values, lower_percentile, upper_percentile)
+        scatter = axis.scatter(
+            positive_coordinates[:, 0],
+            positive_coordinates[:, 1],
+            c=values,
+            s=point_size,
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+            rasterized=True,
+        )
+        _style_umap_axis(axis, f"Latent UMAP by {label}")
+        figure.colorbar(scatter, ax=axis)
+
+    residual_axis = axes[1][0]
+    residual_label = f"residual_{target_column}"
+    if residual.size > 0:
+        vmin, vmax = _symmetric_zero_color_limits(
+            residual, lower_percentile, upper_percentile
+        )
+        scatter = residual_axis.scatter(
+            positive_coordinates[:, 0],
+            positive_coordinates[:, 1],
+            c=residual,
+            s=point_size,
+            cmap="coolwarm",
+            vmin=vmin,
+            vmax=vmax,
+            rasterized=True,
+        )
+        figure.colorbar(scatter, ax=residual_axis)
+    _style_umap_axis(residual_axis, f"Latent UMAP by {residual_label}")
+
+    batch_axis = axes[1][2]
+    batch_colors = _categorical_batch_colors(len(batch_names))
+    positive_batches = batches[positive]
+    for batch_id in range(len(batch_names)):
+        mask = positive_batches == batch_id
+        if not np.any(mask):
+            continue
+        batch_axis.scatter(
+            positive_coordinates[mask, 0],
+            positive_coordinates[mask, 1],
+            c=[batch_colors[batch_id]],
+            s=point_size,
+            rasterized=True,
+        )
+    _style_umap_axis(batch_axis, "Latent UMAP by batch (positives)")
+
+    figure.savefig(output_path, dpi=int(config["figure_dpi"]))
+    plt.close(figure)
+
+
 def plot_similarity_heatmap(
     similarity: np.ndarray,
     activity: np.ndarray,
@@ -1088,6 +1267,29 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             config["analysis"],
             logit_epsilon,
         )
+        plot_latent_umap_ziln_corrected_per_target(
+            umap_coordinates,
+            extracted["targets"][:, index],
+            extracted["pi"][:, index],
+            extracted["mu"][:, index],
+            extracted["sigma"][:, index],
+            extracted["alpha"][:, index],
+            extracted["batches"],
+            batch_names,
+            column,
+            umap_dir / f"latent_umap_ziln_corrected_{column}.png",
+            config["analysis"],
+            logit_epsilon,
+        )
+    run_calibration(
+        extracted=extracted,
+        target_columns=target_columns,
+        batch_names=batch_names,
+        split=split,
+        output_dir=output_dir / "calibration",
+        config=config["analysis"],
+        epsilon=logit_epsilon,
+    )
     scatter_split = str(config["analysis"]["ziln_scatter_split"])
     scatter_data = (
         extracted

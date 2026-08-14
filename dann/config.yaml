@@ -87,4 +87,7 @@ analysis:
   density_cmap: jet  # Continuous colormap for density-colored UMAP panels.
   density_vmin_percentile: 1.0  # Lower percentile used for density UMAP color limits.
   density_vmax_percentile: 99.0  # Upper percentile used for density UMAP color limits.
-  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/dann/analysis  # Analysis tables and figures; UMAP exports go under umap/.
+  calibration_coverage_levels: [0.50, 0.90]  # Central predictive interval levels scored against observed positives.
+  calibration_pit_bins: 50  # Histogram bins in the probability-integral-transform panels.
+  exceedance_thresholds: []  # Density thresholds t for optional P(y > t) spatial columns; empty disables them.
+  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/dann/analysis  # Analysis tables and figures; UMAP exports go under umap/, calibration under calibration/.

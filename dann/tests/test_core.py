@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-from scipy import sparse
+from scipy import sparse, stats
 
 from dann.analyze import embedding_cosine_families
 from dann.data_loader import (
@@ -127,6 +127,7 @@ def test_intensity_weighted_encoder_matches_pdf_mean() -> None:
         latent_dim=2,
         dropout=0.0,
         use_layer_norm=False,
+        inference_peak_chunk_size=2,
     )
     with torch.no_grad():
         encoder.embedding.weight.copy_(
@@ -144,6 +145,14 @@ def test_intensity_weighted_encoder_matches_pdf_mean() -> None:
     )
     expected = torch.tensor([[3.0, 2.0], [0.0, 3.0]])
     torch.testing.assert_close(encoded, expected)
+    with torch.inference_mode():
+        chunked_encoded = encoder(
+            peak_indices=torch.tensor([0, 2, 1]),
+            intensities=torch.tensor([2.0, 4.0, 3.0]),
+            sample_indices=torch.tensor([0, 0, 1]),
+            peak_counts=torch.tensor([2, 1]),
+        )
+    torch.testing.assert_close(chunked_encoded, expected)
 
 
 def test_gradient_reversal_changes_only_gradient_sign_and_scale() -> None:
@@ -164,7 +173,7 @@ def test_gradient_reversal_changes_only_gradient_sign_and_scale() -> None:
 
 
 def test_ziln_branches_match_formula_and_handle_one() -> None:
-    """Verify hurdle math, positive Gaussian math, and finite exact-one handling.
+    """Verify hurdle math, positive Gaussian math at alpha=0, and exact-one handling.
 
     Args:
         None.
@@ -177,8 +186,9 @@ def test_ziln_branches_match_formula_and_handle_one() -> None:
     pi_logits = torch.zeros((3, 1), requires_grad=True)
     mu = torch.zeros((3, 1), requires_grad=True)
     sigma = torch.ones((3, 1), requires_grad=True)
+    alpha = torch.zeros((3, 1), requires_grad=True)
     targets = torch.tensor([[0.0], [0.5], [1.0]])
-    result = criterion(pi_logits, mu, sigma, targets)
+    result = criterion(pi_logits, mu, sigma, alpha, targets)
     transformed_one = torch.logit(torch.tensor(1.0 - 1e-4))
     expected_hurdle = torch.tensor(np.log(2.0), dtype=torch.float32)
     expected_positive = transformed_one.square() / 6.0
@@ -188,12 +198,39 @@ def test_ziln_branches_match_formula_and_handle_one() -> None:
     result.total.backward()
     assert all(
         tensor.grad is not None and torch.isfinite(tensor.grad).all()
-        for tensor in (pi_logits, mu, sigma)
+        for tensor in (pi_logits, mu, sigma, alpha)
     )
 
 
+def test_ziln_positive_branch_matches_scipy_skewnorm() -> None:
+    """Verify the positive branch is an exact skew-normal negative log likelihood.
+
+    Args:
+        None.
+
+    Returns:
+        None: Assertions compare against ``scipy.stats.skewnorm`` for several
+        shape parameters, including the alpha=0 Gaussian reduction.
+    """
+
+    criterion = ZILNLoss([1.0], logit_epsilon=1e-4, reduction="sum", include_normal_constant=True)
+    x = np.array([-1.5, -0.3, 0.0, 0.4, 2.0], dtype=np.float64)
+    mu_value, sigma_value = 0.2, 1.3
+    targets = torch.from_numpy(1.0 / (1.0 + np.exp(-x))).reshape(-1, 1).to(torch.float32)
+    pi_logits = torch.zeros_like(targets)
+    mu = torch.full_like(targets, mu_value)
+    sigma = torch.full_like(targets, sigma_value)
+    for alpha_value in (0.0, 1.7, -3.0):
+        alpha = torch.full_like(targets, alpha_value)
+        result = criterion(pi_logits, mu, sigma, alpha, targets)
+        expected = -stats.skewnorm.logpdf(x, a=alpha_value, loc=mu_value, scale=sigma_value).sum()
+        torch.testing.assert_close(
+            float(result.positive), float(expected), rtol=1e-4, atol=1e-4
+        )
+
+
 def test_model_output_shapes() -> None:
-    """Verify complete model emits four ZILN triplets and batch logits.
+    """Verify complete model emits four ZILN quadruplets and batch logits.
 
     Args:
         None.
@@ -230,8 +267,10 @@ def test_model_output_shapes() -> None:
     assert outputs["pi_logits"].shape == (2, 4)
     assert outputs["mu"].shape == (2, 4)
     assert outputs["sigma"].shape == (2, 4)
+    assert outputs["alpha"].shape == (2, 4)
     assert outputs["batch_logits"].shape == (2, 3)
     assert torch.all(outputs["sigma"] > 0.0)
+    torch.testing.assert_close(outputs["alpha"], torch.zeros_like(outputs["alpha"]))
 
 
 def test_stratified_splits_and_embedding_families() -> None:

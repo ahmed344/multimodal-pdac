@@ -83,6 +83,7 @@ under `model/` and analysis under `analysis/` (UMAP exports in `analysis/umap/`)
 - `latent_umap_densities.png`
 - `latent_umap_densities_logit.png`
 - `latent_umap_ziln_Density_*.png` (one 2x3 Logit/1-pi/mu/sigma/alpha/batch figure per target)
+- `latent_umap_ziln_corrected_Density_*.png` (one 2x3 Logit/logit_mean/logit_median/residual/interval-width/batch figure per target, masked to observed positives)
 - `latent_umap.csv`
 
 `analysis/` (non-UMAP):
@@ -94,11 +95,46 @@ under `model/` and analysis under `analysis/` (UMAP exports in `analysis/umap/`)
 - `peptide_families.csv`
 - `embedding_cosine_similarity.npy`
 
+`analysis/calibration/`:
+
+- `calibration_metrics.csv`, `calibration_metrics_by_batch.csv`
+- `calibration_pit.png` (PIT histogram and uniform QQ per target)
+- `calibration_scatter_corrected.png` (skew-corrected counterpart of `ziln_density_scatter.png`)
+- `calibration_hurdle_reliability.png`, `calibration_interval_coverage.png`
+
 `analysis/spatial/`:
 
-- `spatial_inference.parquet` (ordered mean/presence/sigma/alpha predictions)
+- `spatial_inference.parquet` (ordered mu/presence/sigma/alpha plus the derived
+  logit_mean/logit_sd/logit_median/logit_q05/logit_q95 summaries)
 - `spatial_latent.parquet` (ordered full latent vectors)
-- `spatial_heatmap_Density_*.png` (one 6-column per-batch figure per target)
+- `spatial_heatmap_Density_*.png` (one 6-column per-batch raw-parameter figure per target)
+- `spatial_heatmap_corrected_Density_*.png` (one 6-column per-batch corrected-summary figure per target)
+
+## Predictions versus parameters
+
+The biology head emits a *distribution*, not a value: `pi` is the probability of a
+structural zero, and `(mu, sigma, alpha)` parametrize a skew-normal on the logit
+scale. `mu` is the positive branch's **location**, not its mean — the skew-normal
+mean is `mu + sigma * delta * sqrt(2/pi)` with `delta = alpha / sqrt(1 + alpha^2)`.
+On this dataset the model learns strongly negative `alpha`, so the gap is large
+(about 2 logit units for `Density_Tumor`); treating `mu` as a prediction carries a
+systematic bias that the corrected mean does not.
+
+`dann/ziln.py` holds the conversions (mean, standard deviation, quantiles, PIT,
+exceedance probability). All of them are conditional on the positive branch and on
+the logit scale, because `logit(0)` is undefined — `prob_of_presence` carries the
+hurdle separately. The density-scale expectation `E[y] = (1 - pi) * E[expit(Z)]`
+has no closed form and is deliberately not implemented; it needs Monte Carlo or
+Gauss-Hermite quadrature per pixel.
+
+`dann/calibration.py` scores whether those distributions are trustworthy: PIT
+uniformity and interval coverage for the positive branch, Brier/AUC/reliability for
+the hurdle, each globally and per batch. It runs inside `python -m dann.analyze`
+and also standalone from a saved table:
+
+```bash
+python -m dann.calibration --config dann/config.yaml
+```
 
 Sample-level outputs are CSV tables that include batch labels and targets.
 `latent_umap.csv` holds UMAP coordinates plus ZILN parameters; `latent_embeddings.csv`

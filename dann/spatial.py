@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from dann import ziln
 from dann.config import resolve_device, seed_everything
 from dann.model import AdversarialLatentFusion
 
@@ -473,21 +474,31 @@ def validate_input_schema(
 def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
     """Build deterministic output names for every target parameter set.
 
+    The first four columns per target are the raw head outputs; ``mu_`` is the
+    positive-branch *location* on the logit scale, not a mean. The remaining
+    five are the derived summaries from :mod:`dann.ziln`, all conditional on the
+    positive branch and all on the logit scale.
+
     Args:
         target_columns (Sequence[str]): Ordered density target names.
 
     Returns:
-        list[str]: Per-target mean, presence-probability, sigma, and alpha columns.
+        list[str]: Per-target raw parameter and derived summary column names.
     """
 
     names: list[str] = []
     for target in target_columns:
         names.extend(
             [
-                f"mean_{target}",
+                f"mu_{target}",
                 f"prob_of_presence_{target}",
                 f"sigma_{target}",
                 f"alpha_{target}",
+                f"logit_mean_{target}",
+                f"logit_sd_{target}",
+                f"logit_median_{target}",
+                f"logit_q05_{target}",
+                f"logit_q95_{target}",
             ]
         )
     return names
@@ -561,10 +572,16 @@ def build_output_table(
 ) -> pa.Table:
     """Build one typed output table from a model inference batch.
 
+    Alongside the four raw head parameters, this derives the logit-scale
+    summaries that are actually readable as predictions: the skew-corrected mean
+    ``E[Z | y > 0]``, its standard deviation, and the median and central 90%
+    interval of the positive branch. All are conditional on the positive branch,
+    because ``logit(0)`` is undefined; ``prob_of_presence`` carries the hurdle.
+
     Args:
         row_positions (np.ndarray): Global zero-based AnnData row positions.
         obs_names (np.ndarray): Original possibly duplicated observation names.
-        mu (np.ndarray): Native ZILN means on the positive logit-density scale.
+        mu (np.ndarray): Positive-branch locations on the logit-density scale.
         pi (np.ndarray): Structural-zero probabilities.
         sigma (np.ndarray): Positive-branch ZILN standard deviations.
         alpha (np.ndarray): Positive-branch ZILN skewness parameters.
@@ -588,22 +605,29 @@ def build_output_table(
         pa.array(np.asarray(obs_names, dtype=str), type=pa.string()),
     ]
     for index in range(len(target_columns)):
+        mu_column = np.asarray(mu[:, index], dtype=np.float64)
+        sigma_column = np.asarray(sigma[:, index], dtype=np.float64)
+        alpha_column = np.asarray(alpha[:, index], dtype=np.float64)
+        derived = (
+            ziln.positive_logit_mean(mu_column, sigma_column, alpha_column),
+            ziln.positive_logit_sd(sigma_column, alpha_column),
+            ziln.positive_logit_quantile(mu_column, sigma_column, alpha_column, 0.50),
+            ziln.positive_logit_quantile(mu_column, sigma_column, alpha_column, 0.05),
+            ziln.positive_logit_quantile(mu_column, sigma_column, alpha_column, 0.95),
+        )
         arrays.extend(
             [
-                pa.array(np.asarray(mu[:, index], dtype=np.float32), type=pa.float32()),
+                pa.array(mu_column.astype(np.float32), type=pa.float32()),
                 pa.array(
                     np.asarray(1.0 - pi[:, index], dtype=np.float32),
                     type=pa.float32(),
                 ),
-                pa.array(
-                    np.asarray(sigma[:, index], dtype=np.float32),
-                    type=pa.float32(),
-                ),
-                pa.array(
-                    np.asarray(alpha[:, index], dtype=np.float32),
-                    type=pa.float32(),
-                ),
+                pa.array(sigma_column.astype(np.float32), type=pa.float32()),
+                pa.array(alpha_column.astype(np.float32), type=pa.float32()),
             ]
+        )
+        arrays.extend(
+            pa.array(values.astype(np.float32), type=pa.float32()) for values in derived
         )
     return pa.Table.from_arrays(arrays, schema=output_schema(target_columns))
 
@@ -960,10 +984,27 @@ def validate_output(
                     (values < 0.0) | (values > 1.0)
                 ):
                     raise ValueError(f"Probability column {name!r} lies outside [0, 1].")
-                if name.startswith("sigma_") and np.any(values <= 0.0):
-                    raise ValueError(f"Sigma column {name!r} is not strictly positive.")
+                if (
+                    name.startswith("sigma_") or name.startswith("logit_sd_")
+                ) and np.any(values < 0.0):
+                    raise ValueError(f"Scale column {name!r} is negative.")
                 minima[name] = min(minima[name], float(values.min()))
                 maxima[name] = max(maxima[name], float(values.max()))
+            for target in target_columns:
+                lower = batch.column(f"logit_q05_{target}").to_numpy(
+                    zero_copy_only=False
+                )
+                median = batch.column(f"logit_median_{target}").to_numpy(
+                    zero_copy_only=False
+                )
+                upper = batch.column(f"logit_q95_{target}").to_numpy(
+                    zero_copy_only=False
+                )
+                if np.any(lower > median) or np.any(median > upper):
+                    raise ValueError(
+                        f"Quantile columns for {target!r} are not ordered "
+                        "q05 <= median <= q95."
+                    )
             checked += size
     if checked != expected_rows:
         raise ValueError(f"Validated {checked} rows; expected {expected_rows}.")
