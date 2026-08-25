@@ -5,6 +5,9 @@ qp-projects/
 # Notebooks
 *.ipynb
 
+# markdown
+markdowns/
+
 # pdf
 *.pdf
 
@@ -230,4 +233,6 @@ __marimo__/
 # Agentic files
 .cursor/
 .cursorrules
+.claude/
 CLAUDE.md
+

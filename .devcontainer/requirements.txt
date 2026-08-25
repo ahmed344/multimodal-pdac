@@ -6,6 +6,8 @@ plotly[express]
 openslide-python
 openslide-bin
 pyarrow
+pytest
+pyyaml
 seaborn
 scikit-learn
 scikit-image

@@ -19,7 +19,8 @@
                 "ms-python.vscode-pylance",
                 "ms-python.debugpy",
                 "ms-toolsai.jupyter",
-                "njpwerner.autodocstring"
+                "shd101wyy.markdown-preview-enhanced",
+                "mechatroner.rainbow-csv"
             ]
         }
         
