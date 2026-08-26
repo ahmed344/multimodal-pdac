@@ -1,0 +1,87 @@
+"""Standalone sparse data preparation for the IHC multivariate-normal model."""
+
+from .config import (
+    EXPECTED_TARGETS,
+    apply_smoke_overrides,
+    load_config,
+    resolve_device,
+    seed_everything,
+    validate_config,
+)
+from .data_loader import (
+    AnnDataMetadata,
+    CategoryMapping,
+    DataBundle,
+    SparseAnnDataDataset,
+    create_data_bundle,
+    create_inference_dataset,
+    load_anndata_metadata,
+    sparse_collate,
+    stratified_cap_indices,
+    within_slide_split_indices,
+)
+from .scaling import SparseFeatureScaler, fit_sparse_feature_scaler, matrix_group_path
+from .losses import (
+    ConditionalGaussianOutput,
+    MVNHurdleLoss,
+    MVNHurdleLossOutput,
+    conditional_gaussian_cd8,
+    masked_mvn_nll,
+)
+from .model import (
+    GlobalCorrelation,
+    IHCMultivariateModel,
+    IntensityWeightedPeakEncoder,
+    MultivariateHurdleHead,
+    NonCenteredRandomIntercepts,
+)
+from .targets import (
+    TARGET_COLUMNS,
+    TargetArrays,
+    TargetStandardizer,
+    build_target_arrays,
+    density_to_counts,
+    extratumoral_counts,
+    haldane_anscombe_coordinates,
+    target_denominators,
+)
+
+__all__ = [
+    "EXPECTED_TARGETS",
+    "TARGET_COLUMNS",
+    "AnnDataMetadata",
+    "CategoryMapping",
+    "ConditionalGaussianOutput",
+    "DataBundle",
+    "GlobalCorrelation",
+    "IHCMultivariateModel",
+    "IntensityWeightedPeakEncoder",
+    "MVNHurdleLoss",
+    "MVNHurdleLossOutput",
+    "MultivariateHurdleHead",
+    "NonCenteredRandomIntercepts",
+    "SparseAnnDataDataset",
+    "SparseFeatureScaler",
+    "TargetArrays",
+    "TargetStandardizer",
+    "apply_smoke_overrides",
+    "build_target_arrays",
+    "create_data_bundle",
+    "create_inference_dataset",
+    "conditional_gaussian_cd8",
+    "density_to_counts",
+    "extratumoral_counts",
+    "fit_sparse_feature_scaler",
+    "haldane_anscombe_coordinates",
+    "load_anndata_metadata",
+    "load_config",
+    "matrix_group_path",
+    "masked_mvn_nll",
+    "resolve_device",
+    "seed_everything",
+    "sparse_collate",
+    "stratified_cap_indices",
+    "target_denominators",
+    "validate_config",
+    "within_slide_split_indices",
+]

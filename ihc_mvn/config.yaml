@@ -1,0 +1,159 @@
+# Standalone configuration for the IHC multivariate-normal pipeline.
+# This package deliberately owns its data preparation and does not import DANN code.
+
+data:
+  # Training/validation/test source. The MSI matrix is read lazily from HDF5.
+  path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled.h5ad
+
+  # Tissue-wide source reserved for later inference. It may contain unseen slides;
+  # those slides use the fitted global feature scales rather than fitting new scales.
+  inference_path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled_tissue.h5ad
+
+  # AnnData sparse matrix location. "layers/counts" is translated directly to the
+  # HDF5 group /layers/counts and must be CSR encoded.
+  matrix_key: layers/counts
+
+  # "batch" is the slide identity used for within-slide splitting and scaling.
+  batch_column: batch
+
+  # Patient identity is encoded independently and carried by every sample.
+  patient_column: patient
+
+  # Target order is semantically important: tumor defines the residual
+  # extratumoral count used by the other three target denominators.
+  target_columns:
+    - Density_Tumor
+    - Density_Stroma
+    - Density_Collagen
+    - Density_CD8
+
+  # Split pixels independently within every slide. This is intentionally not a
+  # patient-held-out or slide-held-out evaluation.
+  split_strategy: random_within_slide
+  train_fraction: 0.80
+  validation_fraction: 0.10
+  test_fraction: 0.10
+
+  # Optional per-split caps are applied after splitting while approximately
+  # preserving slide proportions. null (or a non-positive integer) means no cap.
+  max_train_samples: null
+  max_validation_samples: null
+  max_test_samples: null
+
+preprocessing:
+  # Sparse stored counts are transformed only at their nonzero entries. Implicit
+  # zeros stay zero because log1p(0) = 0.
+  transform: log1p
+
+  # Each transformed feature is divided by its training standard deviation for
+  # its slide, without subtracting a mean. Variance includes implicit zeros.
+  center: false
+
+  # Threshold below which a slide-specific standard deviation uses the global
+  # training scale. A globally constant/unseen feature receives scale 1.0,
+  # matching sparse StandardScaler behavior and avoiding amplified inference values.
+  scale_floor: 0.000001
+
+  # Number of selected CSR rows handled in one fitting loop block. This limits
+  # temporary index arrays; the 43 x 5808 statistics remain resident in memory.
+  fit_row_chunk_size: 4096
+
+targets:
+  # Densities are interpreted as proportions over this many pixels:
+  # k_j = round(total_count * y_j).
+  total_count: 36100
+
+  # Haldane-Anscombe adds this pseudocount to both sides of every odds ratio,
+  # making coordinates finite at zero and at the target-specific denominator.
+  haldane_correction: 0.5
+
+  # Standardization is fitted separately per coordinate using positive training
+  # counts only. This floor prevents division by zero for a constant coordinate.
+  standard_deviation_floor: 0.000001
+
+model:
+  # Number of aligned m/z bins. Training validates this against the H5AD matrix
+  # and records the observed value in the resolved configuration/checkpoint.
+  num_peaks: 5808
+
+  # Sparse intensity-weighted Deep Sets encoder. Only active peaks are embedded;
+  # per-peak features are mean pooled before the aggregation network.
+  embedding_dim: 128
+  peak_hidden_dims: [256, 256]
+  peak_output_dim: 256
+  aggregation_hidden_dims: [256]
+  latent_dim: 16
+  head_hidden_dims: [128, 64]
+  activation: gelu
+  dropout: 0.10
+  use_layer_norm: true
+  inference_peak_chunk_size: 262144
+
+  # Marginal Gaussian scales are softplus outputs plus this positive floor.
+  # One learned global correlation matrix combines them as Sigma_i = D_i R D_i.
+  sigma_min: 0.10
+  correlation_diagonal_floor: 0.0001
+
+  random_effects:
+    # Patient and slide intercepts use non-centered Gaussian parameterizations,
+    # separately for hurdle logits and Gaussian locations.
+    initial_scale: 0.05
+    scale_floor: 0.000001
+    scale_prior_std: 1.0
+
+loss:
+  # Proper joint likelihood: no manual per-target weights and no skew parameter.
+  # The hierarchical prior NLL is divided by the number of training pixels.
+  prior_weight: 1.0
+
+training:
+  # Controls splitting, capping, DataLoader shuffling, NumPy, and PyTorch.
+  seed: 20260719
+
+  # "auto" selects CUDA when available, otherwise CPU. Explicit cpu, cuda, and
+  # cuda:<index> values are also accepted and validated.
+  device: auto
+
+  # Ask PyTorch for deterministic kernels where available. warn_only is used so
+  # unsupported deterministic operations report rather than abort.
+  deterministic_algorithms: true
+
+  # Sparse pixels per loader batch.
+  batch_size: 1024
+  validation_batch_size: 4096
+  test_batch_size: 4096
+
+  # AdamW and stopping settings. Validation total hurdle-MVN NLL chooses best.pt.
+  epochs: 1000
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  beta1: 0.9
+  beta2: 0.999
+  gradient_clip_norm: 5.0
+  early_stopping_patience: 50
+  early_stopping_min_delta: 0.0001
+  resume_checkpoint: null
+
+  # Every worker opens its own read-only HDF5 handle lazily.
+  num_workers: 8
+  prefetch_factor: 2
+  pin_memory: true
+
+  # Real-data smoke overrides. They are applied after ordinary validation and
+  # preserve the same split/scaler semantics on the selected capped rows.
+  smoke_train_samples: 2048
+  smoke_validation_samples: 512
+  smoke_test_samples: 512
+  smoke_num_workers: 0
+  smoke_epochs: 1
+
+output:
+  # All checkpoints, fitted preprocessing state, and later analyses belong below
+  # this independent package directory.
+  directory: /workspaces/multimodal-pdac/data/PDAC/Results/ihc_mvn
+
+inference:
+  # Frozen-checkpoint inference never refits feature or target standardization.
+  batch_size: 4096
+  num_workers: 4
+  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/ihc_mvn/inference
