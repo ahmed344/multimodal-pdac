@@ -886,6 +886,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         config["training"]["epochs"] = 1
     best_path = train_model(config)
     print(f"Best checkpoint: {best_path}", flush=True)
+    from .workflow import run_post_training_workflow
+
+    outputs = run_post_training_workflow(config, best_path)
+    for name, path in outputs.items():
+        print(f"Post-training {name}: {path}", flush=True)
     return 0
 
 

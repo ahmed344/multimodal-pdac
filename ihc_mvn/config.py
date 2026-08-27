@@ -55,6 +55,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
         "training",
         "output",
         "inference",
+        "analysis",
+        "spatial_visualization",
+        "post_training",
     }
     missing_sections = required_sections.difference(config)
     if missing_sections:
@@ -68,6 +71,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
     training = config["training"]
     output = config["output"]
     inference = config["inference"]
+    analysis = config["analysis"]
+    spatial_visualization = config["spatial_visualization"]
+    post_training = config["post_training"]
     for section_name, section in (
         ("data", data),
         ("preprocessing", preprocessing),
@@ -77,6 +83,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
         ("training", training),
         ("output", output),
         ("inference", inference),
+        ("analysis", analysis),
+        ("spatial_visualization", spatial_visualization),
+        ("post_training", post_training),
     ):
         if not isinstance(section, Mapping):
             raise TypeError(f"Configuration section {section_name!r} must be a mapping.")
@@ -158,7 +167,62 @@ def validate_config(config: Mapping[str, Any]) -> None:
         "training",
     )
     _require_keys(output, {"directory"}, "output")
-    _require_keys(inference, {"batch_size", "num_workers", "output_dir"}, "inference")
+    _require_keys(
+        inference,
+        {"batch_size", "num_workers", "output_dir", "max_rows", "smoke_max_rows"},
+        "inference",
+    )
+    _require_keys(
+        analysis,
+        {
+            "checkpoint",
+            "split",
+            "max_samples",
+            "batch_size",
+            "num_workers",
+            "umap_neighbors",
+            "umap_min_dist",
+            "umap_metric",
+            "umap_random_state",
+            "activity_chunk_size",
+            "activity_max_nonzeros",
+            "heatmap_top_peaks",
+            "family_count",
+            "clustering_linkage",
+            "calibration_bins",
+            "figure_dpi",
+            "point_size",
+            "density_cmap",
+            "output_dir",
+        },
+        "analysis",
+    )
+    _require_keys(
+        spatial_visualization,
+        {
+            "output_dir",
+            "x_column",
+            "y_column",
+            "batch_column",
+            "figure_dpi",
+            "cmap",
+            "residual_cmap",
+            "include_hes",
+        },
+        "spatial_visualization",
+    )
+    _require_keys(
+        post_training,
+        {
+            "enabled",
+            "run_analysis",
+            "run_inference",
+            "run_spatial_heatmaps",
+            "overwrite_inference",
+            "fail_on_error",
+        },
+        "post_training",
+    )
 
     if list(data["target_columns"]) != EXPECTED_TARGETS:
         raise ValueError(
@@ -266,6 +330,46 @@ def validate_config(config: Mapping[str, Any]) -> None:
         )
     if not Path(str(inference["output_dir"])).is_absolute():
         raise ValueError("inference.output_dir must be an absolute path.")
+    if inference["max_rows"] is not None and int(inference["max_rows"]) <= 0:
+        raise ValueError("inference.max_rows must be null or positive.")
+    if int(inference["smoke_max_rows"]) <= 0:
+        raise ValueError("inference.smoke_max_rows must be positive.")
+
+    if str(analysis["split"]) not in {"train", "validation", "test"}:
+        raise ValueError("analysis.split must be train, validation, or test.")
+    positive_analysis_keys = (
+        "max_samples",
+        "batch_size",
+        "umap_neighbors",
+        "activity_chunk_size",
+        "heatmap_top_peaks",
+        "family_count",
+        "calibration_bins",
+        "figure_dpi",
+    )
+    for key in positive_analysis_keys:
+        if int(analysis[key]) <= 0:
+            raise ValueError(f"analysis.{key} must be positive.")
+    if int(analysis["num_workers"]) < 0:
+        raise ValueError("analysis.num_workers cannot be negative.")
+    if float(analysis["umap_min_dist"]) < 0.0:
+        raise ValueError("analysis.umap_min_dist cannot be negative.")
+    if float(analysis["point_size"]) <= 0.0:
+        raise ValueError("analysis.point_size must be positive.")
+    if analysis["activity_max_nonzeros"] is not None and int(
+        analysis["activity_max_nonzeros"]
+    ) <= 0:
+        raise ValueError("analysis.activity_max_nonzeros must be null or positive.")
+    if not Path(str(analysis["output_dir"])).is_absolute():
+        raise ValueError("analysis.output_dir must be an absolute path.")
+
+    if int(spatial_visualization["figure_dpi"]) <= 0:
+        raise ValueError("spatial_visualization.figure_dpi must be positive.")
+    for key in ("x_column", "y_column", "batch_column", "cmap", "residual_cmap"):
+        if not str(spatial_visualization[key]):
+            raise ValueError(f"spatial_visualization.{key} cannot be empty.")
+    if not Path(str(spatial_visualization["output_dir"])).is_absolute():
+        raise ValueError("spatial_visualization.output_dir must be an absolute path.")
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -306,8 +410,28 @@ def apply_smoke_overrides(config: Mapping[str, Any]) -> dict[str, Any]:
     data["max_test_samples"] = int(training["smoke_test_samples"])
     training["num_workers"] = int(training["smoke_num_workers"])
     training["epochs"] = int(training["smoke_epochs"])
+    inference = updated["inference"]
+    inference["max_rows"] = int(inference["smoke_max_rows"])
+    analysis = updated["analysis"]
+    analysis["max_samples"] = min(int(analysis["max_samples"]), 512)
+    analysis["num_workers"] = 0
+    analysis["activity_max_nonzeros"] = min(
+        int(analysis["activity_max_nonzeros"])
+        if analysis["activity_max_nonzeros"] is not None
+        else 100_000,
+        100_000,
+    )
     updated["output"]["directory"] = str(
         Path(updated["output"]["directory"]) / "smoke"
+    )
+    updated["inference"]["output_dir"] = str(
+        Path(updated["inference"]["output_dir"]) / "smoke"
+    )
+    updated["analysis"]["output_dir"] = str(
+        Path(updated["analysis"]["output_dir"]) / "smoke"
+    )
+    updated["spatial_visualization"]["output_dir"] = str(
+        Path(updated["spatial_visualization"]["output_dir"]) / "smoke"
     )
     validate_config(updated)
     return updated

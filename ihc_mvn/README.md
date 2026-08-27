@@ -145,6 +145,22 @@ python -m ihc_mvn.infer \
   --overwrite
 ```
 
+Run held-out checkpoint analysis or spatial plotting independently:
+
+```bash
+python -m ihc_mvn.analyze --config ihc_mvn/config.yaml
+python -m ihc_mvn.spatial_heatmaps --config ihc_mvn/config.yaml
+```
+
+By default, the ordinary training CLI automatically runs held-out analysis,
+tissue-wide inference, and spatial visualization after `best.pt` has been
+selected and test metrics have been recorded. The `post_training` configuration
+section enables or disables the complete workflow and each individual stage.
+`fail_on_error: true` makes a failed post-training stage return a failing
+command status without deleting the already completed checkpoints or history.
+Smoke training applies caps to analysis, peak-activity scanning, and tissue
+inference as well as to the training splits.
+
 Pass `--input data/PDAC/Raw/adata_assembled.h5ad` to infer on the training
 AnnData instead. Run the fast synthetic contract tests with:
 
@@ -178,6 +194,27 @@ density-scale positive medians/intervals, the shared correlations and
 conditional-CD8 diagnostics. Row positions and possibly duplicated observation
 names remain aligned exactly with the source H5AD.
 
+Held-out analysis writes:
+
+- `training_curves.png` beside `history.csv`, marking the selected best epoch;
+- `analysis/umap/latent_umap.csv`, group UMAPs, one six-panel MVN UMAP per
+  target, and a conditional-CD8 excess UMAP;
+- `analysis/peptide_similarity_heatmap.png`,
+  `embedding_cosine_similarity.npy`, and `peptide_families.csv`;
+- learned and empirical target-correlation tables/heatmaps;
+- patient and slide random-intercept tables/heatmaps;
+- hurdle reliability, positive prediction, interval coverage, and
+  mask-specific Mahalanobis diagnostics.
+
+Spatial inference continues to write `inference/inference.parquet` and
+`inference/inference_latent.parquet`. Spatial visualization validates both
+artifacts against the tissue AnnData row positions and observation names,
+then writes one figure per target under `spatial/`. Panels distinguish
+MSI-only, patient-adjusted, and fully adjusted positive medians and include
+presence probability, uncertainty width, observed truth/residuals when
+available, and HES when present. A separate conditional-CD8 excess map is
+written when that diagnostic is finite.
+
 ## Known and unknown inference groups
 
 Known slides use frozen per-slide preprocessing and their learned slide random
@@ -187,9 +224,12 @@ patients use zero patient random effects. No inference data, whether labeled or
 unlabeled, may update feature scales, target standardization, category
 mappings, model weights, or random effects.
 
-## Scope
+## Visualization scope
 
-This package intentionally contains no skew-distribution head, HES input,
-spatial neighborhood or coordinate features, Fourier features, heatmap
-generation, plotting, or visualization pipeline. Those are outside the model
-and inference contract described here.
+The visualization pipeline is downstream of the fitted statistical model. It
+does not add HES, spatial coordinates, neighborhoods, or Fourier features as
+model inputs and does not refit frozen preprocessing. HES and coordinates are
+used only to render tissue predictions after inference. Existing compatible
+checkpoints and `history.csv` files can therefore be analyzed without
+retraining; spatial figures additionally require compatible inference
+Parquets.

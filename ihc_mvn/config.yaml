@@ -82,7 +82,7 @@ model:
   peak_hidden_dims: [256, 256]
   peak_output_dim: 256
   aggregation_hidden_dims: [256]
-  latent_dim: 16
+  latent_dim: 32
   head_hidden_dims: [128, 64]
   activation: gelu
   dropout: 0.10
@@ -157,3 +157,48 @@ inference:
   batch_size: 20480
   num_workers: 4
   output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/ihc_mvn/inference
+  max_rows: null
+  smoke_max_rows: 512
+
+analysis:
+  # Held-out checkpoint interpretation. The split indices and all transforms are
+  # restored from the checkpoint; no validation/test observations are refitted.
+  checkpoint: null
+  split: test
+  max_samples: 100000
+  batch_size: 4096
+  num_workers: 4
+  umap_neighbors: 30
+  umap_min_dist: 0.30
+  umap_metric: cosine
+  umap_random_state: 20260719
+  activity_chunk_size: 5000000
+  activity_max_nonzeros: null
+  heatmap_top_peaks: 200
+  family_count: 20
+  clustering_linkage: average
+  calibration_bins: 10
+  figure_dpi: 300
+  point_size: 1.0
+  density_cmap: jet
+  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/ihc_mvn/analysis
+
+spatial_visualization:
+  # Spatial figures consume the ordered Parquets produced by inference.
+  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/ihc_mvn/spatial
+  x_column: x
+  y_column: y
+  batch_column: batch
+  figure_dpi: 300
+  cmap: jet
+  residual_cmap: coolwarm
+  include_hes: true
+
+post_training:
+  # A successful training run can execute the complete deliverable pipeline.
+  enabled: true
+  run_analysis: true
+  run_inference: true
+  run_spatial_heatmaps: true
+  overwrite_inference: true
+  fail_on_error: true
