@@ -119,7 +119,7 @@ training:
   deterministic_algorithms: true
 
   # Sparse pixels per loader batch.
-  batch_size: 1024
+  batch_size: 2048
   validation_batch_size: 4096
   test_batch_size: 4096
 
@@ -154,6 +154,6 @@ output:
 
 inference:
   # Frozen-checkpoint inference never refits feature or target standardization.
-  batch_size: 4096
+  batch_size: 20480
   num_workers: 4
   output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/ihc_mvn/inference

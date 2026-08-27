@@ -6,7 +6,9 @@ import copy
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
 import pyarrow.parquet as pq
+import pytest
 import torch
 import yaml
 
@@ -74,19 +76,40 @@ def tiny_pipeline_config(input_path: Path, output_dir: Path) -> dict[str, Any]:
 def test_one_epoch_checkpoint_and_ordered_inference(
     tiny_h5ad: Path,
     tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Train once, restore frozen preprocessing, and stream ordered Parquets.
 
     Args:
         tiny_h5ad (Path): Synthetic labeled CSR AnnData fixture.
         tmp_path (Path): Pytest temporary directory.
+        capsys (pytest.CaptureFixture[str]): Captured training console output.
 
     Returns:
-        None: Assertions validate checkpoint and inference artifact contracts.
+        None: Assertions validate training history, output, and inference contracts.
     """
 
     output_dir = tmp_path / "model"
     checkpoint_path = train_model(tiny_pipeline_config(tiny_h5ad, output_dir))
+    training_output = capsys.readouterr().out
+    history = pd.read_csv(output_dir / "history.csv")
+    expected_metric_columns = {
+        "train_hurdle_loss",
+        "train_positive_loss",
+        "train_prior_loss",
+        "train_presence_balanced_accuracy_macro",
+        "train_positive_r2_macro",
+        "validation_presence_balanced_accuracy_tumor",
+        "validation_positive_r2_cd8",
+        "test_presence_balanced_accuracy_macro",
+        "test_positive_r2_macro",
+    }
+    assert len(history) == 1
+    assert expected_metric_columns <= set(history.columns)
+    assert "epoch=1/1 | t-loss:" in training_output
+    assert "metrics (train, validation) | balanced-accuracy:" in training_output
+    assert "validation by target | Tumor: acc=" in training_output
+    assert "test | t-loss:" in training_output
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     assert checkpoint["scaler_state"]["center"] is False
     assert checkpoint["scaler_state"]["transform"] == "log1p"

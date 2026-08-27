@@ -145,16 +145,18 @@ def build_model(config: Mapping[str, Any], bundle: DataBundle) -> IHCMultivariat
     )
 
 
-def _empty_metrics() -> dict[str, float]:
+def _empty_metrics(num_targets: int) -> dict[str, float | np.ndarray]:
     """Create sample-weighted epoch metric accumulators.
 
     Args:
-        None.
+        num_targets (int): Number of ordered prediction targets.
 
     Returns:
-        dict[str, float]: Zero-initialized loss sums and observation counts.
+        dict[str, float | np.ndarray]: Zero-initialized loss and fit statistics.
     """
 
+    if num_targets <= 0:
+        raise ValueError("num_targets must be positive.")
     return {
         "samples": 0.0,
         "total": 0.0,
@@ -163,23 +165,111 @@ def _empty_metrics() -> dict[str, float]:
         "prior": 0.0,
         "positive_pixels": 0.0,
         "positive_targets": 0.0,
+        "presence_true_positive": np.zeros(num_targets, dtype=np.float64),
+        "presence_true_negative": np.zeros(num_targets, dtype=np.float64),
+        "presence_positive": np.zeros(num_targets, dtype=np.float64),
+        "presence_negative": np.zeros(num_targets, dtype=np.float64),
+        "positive_count": np.zeros(num_targets, dtype=np.float64),
+        "positive_target_sum": np.zeros(num_targets, dtype=np.float64),
+        "positive_target_sum_squares": np.zeros(num_targets, dtype=np.float64),
+        "positive_residual_sum_squares": np.zeros(num_targets, dtype=np.float64),
     }
 
 
-def _finalize_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
+def _target_metric_suffix(target_name: str) -> str:
+    """Create a compact stable metric suffix from one density target name.
+
+    Args:
+        target_name (str): Configured target column name.
+
+    Returns:
+        str: Lowercase suffix with an optional ``Density_`` prefix removed.
+    """
+
+    prefix = "Density_"
+    short_name = target_name[len(prefix) :] if target_name.startswith(prefix) else target_name
+    return short_name.lower()
+
+
+def _update_fit_statistics(
+    metrics: dict[str, float | np.ndarray],
+    predictions: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+) -> None:
+    """Accumulate confusion counts and positive-target regression statistics.
+
+    Args:
+        metrics (dict[str, float | np.ndarray]): Mutable epoch accumulators.
+        predictions (Mapping[str, torch.Tensor]): Model outputs for one batch.
+        batch (Mapping[str, torch.Tensor]): Device-resident target tensors.
+
+    Returns:
+        None: ``metrics`` is updated in place.
+    """
+
+    logits = predictions["hurdle_logits_total"]
+    means = predictions["mean_total"]
+    targets = batch["targets"]
+    positive_mask = batch["target_densities"] > 0.0
+    predicted_positive = logits >= 0.0
+    negative_mask = ~positive_mask
+
+    updates = {
+        "presence_true_positive": (predicted_positive & positive_mask).sum(dim=0),
+        "presence_true_negative": ((~predicted_positive) & negative_mask).sum(dim=0),
+        "presence_positive": positive_mask.sum(dim=0),
+        "presence_negative": negative_mask.sum(dim=0),
+        "positive_count": positive_mask.sum(dim=0),
+        "positive_target_sum": torch.where(
+            positive_mask, targets, torch.zeros_like(targets)
+        ).sum(dim=0),
+        "positive_target_sum_squares": torch.where(
+            positive_mask, targets.square(), torch.zeros_like(targets)
+        ).sum(dim=0),
+        "positive_residual_sum_squares": torch.where(
+            positive_mask, (means - targets).square(), torch.zeros_like(targets)
+        ).sum(dim=0),
+    }
+    for key, value in updates.items():
+        accumulator = metrics[key]
+        if not isinstance(accumulator, np.ndarray):
+            raise TypeError(f"Metric accumulator {key!r} must be an array.")
+        accumulator += value.detach().to(dtype=torch.float64, device="cpu").numpy()
+
+
+def _finalize_metrics(
+    metrics: Mapping[str, float | np.ndarray],
+    target_names: Sequence[str],
+) -> dict[str, float]:
     """Convert raw sample-weighted accumulators to epoch metrics.
 
     Args:
-        metrics (Mapping[str, float]): Completed epoch accumulators.
+        metrics (Mapping[str, float | np.ndarray]): Completed epoch accumulators.
+        target_names (Sequence[str]): Ordered target names for metric keys.
 
     Returns:
-        dict[str, float]: Mean loss components and positive observation counts.
+        dict[str, float]: Mean losses, counts, balanced accuracies, and positive R².
     """
 
     samples = float(metrics["samples"])
     if samples <= 0.0:
         raise ValueError("Cannot finalize metrics for an empty loader.")
-    return {
+    array_keys = (
+        "presence_true_positive",
+        "presence_true_negative",
+        "presence_positive",
+        "presence_negative",
+        "positive_count",
+        "positive_target_sum",
+        "positive_target_sum_squares",
+        "positive_residual_sum_squares",
+    )
+    arrays = {key: np.asarray(metrics[key], dtype=np.float64) for key in array_keys}
+    target_count = len(target_names)
+    if target_count == 0 or any(value.shape != (target_count,) for value in arrays.values()):
+        raise ValueError("Target names must match the metric accumulator dimensions.")
+
+    result = {
         "total_loss": float(metrics["total"]) / samples,
         "hurdle_loss": float(metrics["hurdle"]) / samples,
         "positive_loss": float(metrics["positive"]) / samples,
@@ -188,6 +278,50 @@ def _finalize_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
         "positive_pixels": float(metrics["positive_pixels"]),
         "positive_targets": float(metrics["positive_targets"]),
     }
+    balanced_accuracies: list[float] = []
+    positive_r2_values: list[float] = []
+    for index, target_name in enumerate(target_names):
+        recalls = []
+        if arrays["presence_positive"][index] > 0.0:
+            recalls.append(
+                arrays["presence_true_positive"][index]
+                / arrays["presence_positive"][index]
+            )
+        if arrays["presence_negative"][index] > 0.0:
+            recalls.append(
+                arrays["presence_true_negative"][index]
+                / arrays["presence_negative"][index]
+            )
+        balanced_accuracy = float(np.mean(recalls)) if recalls else math.nan
+
+        positive_count = arrays["positive_count"][index]
+        target_sum = arrays["positive_target_sum"][index]
+        total_sum_squares = (
+            arrays["positive_target_sum_squares"][index]
+            - target_sum * target_sum / positive_count
+            if positive_count > 0.0
+            else 0.0
+        )
+        positive_r2 = (
+            1.0
+            - arrays["positive_residual_sum_squares"][index] / total_sum_squares
+            if positive_count >= 2.0
+            and total_sum_squares > np.finfo(np.float64).eps
+            else math.nan
+        )
+        suffix = _target_metric_suffix(target_name)
+        result[f"presence_balanced_accuracy_{suffix}"] = balanced_accuracy
+        result[f"positive_r2_{suffix}"] = float(positive_r2)
+        balanced_accuracies.append(balanced_accuracy)
+        positive_r2_values.append(float(positive_r2))
+
+    finite_balanced = [value for value in balanced_accuracies if math.isfinite(value)]
+    finite_r2 = [value for value in positive_r2_values if math.isfinite(value)]
+    result["presence_balanced_accuracy_macro"] = (
+        float(np.mean(finite_balanced)) if finite_balanced else math.nan
+    )
+    result["positive_r2_macro"] = float(np.mean(finite_r2)) if finite_r2 else math.nan
+    return result
 
 
 def validate_finite_outputs(predictions: Mapping[str, torch.Tensor]) -> None:
@@ -210,6 +344,7 @@ def run_epoch(
     loader: DataLoader[dict[str, torch.Tensor]],
     criterion: MVNHurdleLoss,
     device: torch.device,
+    target_names: Sequence[str],
     optimizer: torch.optim.Optimizer | None = None,
     gradient_clip_norm: float | None = None,
 ) -> dict[str, float]:
@@ -220,18 +355,19 @@ def run_epoch(
         loader (DataLoader[dict[str, torch.Tensor]]): Sparse labeled batch loader.
         criterion (MVNHurdleLoss): Hurdle and masked-Gaussian objective.
         device (torch.device): Runtime tensor device.
+        target_names (Sequence[str]): Ordered target names for fit metric keys.
         optimizer (torch.optim.Optimizer | None): Optimizer for training, or ``None``.
         gradient_clip_norm (float | None): Optional positive global gradient norm cap.
 
     Returns:
-        dict[str, float]: Sample-weighted loss metrics and positive counts.
+        dict[str, float]: Exact epoch loss, count, and predictive fit metrics.
     """
 
     training = optimizer is not None
     if gradient_clip_norm is not None and gradient_clip_norm <= 0.0:
         raise ValueError("gradient_clip_norm must be positive when provided.")
     model.train(training)
-    metrics = _empty_metrics()
+    metrics = _empty_metrics(len(target_names))
     with torch.set_grad_enabled(training):
         for step, cpu_batch in enumerate(loader, start=1):
             batch = move_batch_to_device(cpu_batch, device)
@@ -280,7 +416,8 @@ def run_epoch(
             metrics["prior"] += float(loss.prior.detach()) * batch_size
             metrics["positive_pixels"] += int(loss.positive_pixel_count.detach())
             metrics["positive_targets"] += int(loss.positive_target_count.detach())
-    return _finalize_metrics(metrics)
+            _update_fit_statistics(metrics, predictions, batch)
+    return _finalize_metrics(metrics, target_names)
 
 
 def checkpoint_payload(
@@ -476,6 +613,112 @@ def _write_history(path: Path, rows: Sequence[Mapping[str, float]]) -> None:
     temporary.replace(path)
 
 
+def _format_score(value: float) -> str:
+    """Format a higher-is-better diagnostic score for console output.
+
+    Args:
+        value (float): Finite score or an undefined non-finite value.
+
+    Returns:
+        str: Three-decimal score or ``nan``.
+    """
+
+    return f"{value:.3f}" if math.isfinite(value) else "nan"
+
+
+def _format_epoch_summary(
+    epoch: int,
+    epochs: int,
+    train_metrics: Mapping[str, float],
+    validation_metrics: Mapping[str, float],
+    target_names: Sequence[str],
+) -> str:
+    """Build a compact multiline train/validation epoch summary.
+
+    Args:
+        epoch (int): Completed one-based epoch number.
+        epochs (int): Configured maximum epoch count.
+        train_metrics (Mapping[str, float]): Finalized training metrics.
+        validation_metrics (Mapping[str, float]): Finalized validation metrics.
+        target_names (Sequence[str]): Ordered target names.
+
+    Returns:
+        str: Multiline loss, macro-fit, and per-target validation summary.
+    """
+
+    loss_parts = (
+        ("t-loss", "total_loss"),
+        ("hurdle", "hurdle_loss"),
+        ("positive", "positive_loss"),
+        ("prior", "prior_loss"),
+    )
+    loss_text = " | ".join(
+        f"{label}: {train_metrics[key]:.3e}, {validation_metrics[key]:.3e}"
+        for label, key in loss_parts
+    )
+    metric_text = (
+        "  metrics (train, validation)"
+        " | balanced-accuracy: "
+        f"{_format_score(train_metrics['presence_balanced_accuracy_macro'])}, "
+        f"{_format_score(validation_metrics['presence_balanced_accuracy_macro'])}"
+        " | positive-R2: "
+        f"{_format_score(train_metrics['positive_r2_macro'])}, "
+        f"{_format_score(validation_metrics['positive_r2_macro'])}"
+    )
+    target_parts = []
+    for target_name in target_names:
+        suffix = _target_metric_suffix(target_name)
+        display_name = target_name.removeprefix("Density_")
+        target_parts.append(
+            f"{display_name}: acc="
+            f"{_format_score(validation_metrics[f'presence_balanced_accuracy_{suffix}'])}, "
+            f"R2={_format_score(validation_metrics[f'positive_r2_{suffix}'])}"
+        )
+    return (
+        f"epoch={epoch}/{epochs} | {loss_text}\n"
+        f"{metric_text}\n"
+        f"  validation by target | {' | '.join(target_parts)}"
+    )
+
+
+def _format_test_summary(
+    test_metrics: Mapping[str, float],
+    best_validation: float,
+    target_names: Sequence[str],
+) -> str:
+    """Build a multiline held-out test summary.
+
+    Args:
+        test_metrics (Mapping[str, float]): Finalized held-out test metrics.
+        best_validation (float): Best validation total loss used for selection.
+        target_names (Sequence[str]): Ordered target names.
+
+    Returns:
+        str: Multiline test loss and predictive-fit summary.
+    """
+
+    target_parts = []
+    for target_name in target_names:
+        suffix = _target_metric_suffix(target_name)
+        display_name = target_name.removeprefix("Density_")
+        target_parts.append(
+            f"{display_name}: acc="
+            f"{_format_score(test_metrics[f'presence_balanced_accuracy_{suffix}'])}, "
+            f"R2={_format_score(test_metrics[f'positive_r2_{suffix}'])}"
+        )
+    return (
+        f"test | t-loss: {test_metrics['total_loss']:.3e}"
+        f" | hurdle: {test_metrics['hurdle_loss']:.3e}"
+        f" | positive: {test_metrics['positive_loss']:.3e}"
+        f" | prior: {test_metrics['prior_loss']:.3e}"
+        f" | best-validation: {best_validation:.3e}\n"
+        "  metrics | balanced-accuracy: "
+        f"{_format_score(test_metrics['presence_balanced_accuracy_macro'])}"
+        f" | positive-R2: {_format_score(test_metrics['positive_r2_macro'])}\n"
+        f"  test by target | {' | '.join(target_parts)}"
+    )
+
+
 def train_model(config: Mapping[str, Any]) -> Path:
     """Train, validate, test, and checkpoint the standalone IHC-MVN model.
 
@@ -541,6 +784,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
         raise ValueError("training.epochs must be positive.")
     clip_value = training.get("gradient_clip_norm", 5.0)
     gradient_clip_norm = None if clip_value is None else float(clip_value)
+    target_names = bundle.target_standardizer.target_names
     try:
         for epoch in range(start_epoch, epochs):
             train_metrics = run_epoch(
@@ -548,6 +792,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 bundle.loaders["train"],
                 criterion,
                 device,
+                target_names,
                 optimizer=optimizer,
                 gradient_clip_norm=gradient_clip_norm,
             )
@@ -556,6 +801,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 bundle.loaders["validation"],
                 criterion,
                 device,
+                target_names,
             )
             improved, should_stop = stopper.update(
                 validation_metrics["total_loss"]
@@ -586,9 +832,13 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 atomic_save_checkpoint(output_dir / "best.pt", payload)
             atomic_save_checkpoint(output_dir / "latest.pt", payload)
             print(
-                f"epoch={epoch + 1}/{epochs} "
-                f"train={train_metrics['total_loss']:.6f} "
-                f"validation={validation_metrics['total_loss']:.6f}",
+                _format_epoch_summary(
+                    epoch + 1,
+                    epochs,
+                    train_metrics,
+                    validation_metrics,
+                    target_names,
+                ),
                 flush=True,
             )
             if should_stop:
@@ -605,17 +855,14 @@ def train_model(config: Mapping[str, Any]) -> Path:
             bundle.loaders["test"],
             criterion,
             device,
+            target_names,
         )
         if history:
             history[-1].update(
                 {f"test_{key}": value for key, value in test_metrics.items()}
             )
             _write_history(history_path, history)
-        print(
-            f"test={test_metrics['total_loss']:.6f} "
-            f"best_validation={stopper.best:.6f}",
-            flush=True,
-        )
+        print(_format_test_summary(test_metrics, stopper.best, target_names), flush=True)
         return best_path
     finally:
         for dataset in bundle.datasets.values():
