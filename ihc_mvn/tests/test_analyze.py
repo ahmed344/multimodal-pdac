@@ -9,7 +9,11 @@ import pandas as pd
 import pytest
 
 from ihc_mvn import analyze
-from ihc_mvn.analyze import embedding_cosine_families, plot_training_curves
+from ihc_mvn.analyze import (
+    embedding_cosine_families,
+    plot_target_umaps,
+    plot_training_curves,
+)
 from ihc_mvn.tests.test_integration_contract import tiny_pipeline_config
 from ihc_mvn.train import train_model
 
@@ -130,3 +134,43 @@ def test_run_analysis_writes_representative_artifacts(
         model_dir / "training_curves.png",
     )
     assert all(path.is_file() and path.stat().st_size > 0 for path in expected)
+    umap_frame = pd.read_csv(output_dir / "umap" / "latent_umap.csv")
+    assert "observed_haldane_Density_Tumor" in umap_frame.columns
+    assert (output_dir / "umap" / "latent_umap_mvn_Density_Tumor.png").stat().st_size > 0
+
+
+def test_plot_target_umaps_colors_by_observed_haldane(tmp_path: Path) -> None:
+    """Verify the per-target UMAP figure reads Haldane coordinates.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+
+    Returns:
+        None: The expected nonempty PNG is produced.
+    """
+
+    target = "Density_Tumor"
+    row_count = 8
+    frame = pd.DataFrame(
+        {
+            "umap_1": np.linspace(0.0, 1.0, row_count),
+            "umap_2": np.linspace(1.0, 0.0, row_count),
+            f"observed_density_{target}": np.linspace(0.0, 0.8, row_count),
+            f"observed_haldane_{target}": np.linspace(-2.0, 1.5, row_count),
+            f"observed_standardized_{target}": np.linspace(-1.0, 1.0, row_count),
+            f"standardized_mean_total_{target}": np.linspace(-0.8, 0.9, row_count),
+            f"prob_presence_{target}": np.linspace(0.1, 0.9, row_count),
+            f"marginal_unstandardized_sigma_{target}": np.full(row_count, 0.2),
+            f"q05_density_{target}": np.linspace(0.0, 0.4, row_count),
+            f"q95_density_{target}": np.linspace(0.2, 0.9, row_count),
+        }
+    )
+    plot_target_umaps(
+        frame,
+        (target,),
+        tmp_path,
+        {"point_size": 4.0, "density_cmap": "viridis", "figure_dpi": 72},
+    )
+    output_path = tmp_path / f"latent_umap_mvn_{target}.png"
+    assert output_path.is_file()
+    assert output_path.stat().st_size > 0

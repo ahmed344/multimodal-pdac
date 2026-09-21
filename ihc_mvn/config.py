@@ -192,6 +192,9 @@ def validate_config(config: Mapping[str, Any]) -> None:
             "calibration_bins",
             "figure_dpi",
             "point_size",
+            "umap_point_size",
+            "umap_point_alpha",
+            "umap_figure_dpi",
             "density_cmap",
             "output_dir",
         },
@@ -346,6 +349,7 @@ def validate_config(config: Mapping[str, Any]) -> None:
         "family_count",
         "calibration_bins",
         "figure_dpi",
+        "umap_figure_dpi",
     )
     for key in positive_analysis_keys:
         if int(analysis[key]) <= 0:
@@ -356,6 +360,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
         raise ValueError("analysis.umap_min_dist cannot be negative.")
     if float(analysis["point_size"]) <= 0.0:
         raise ValueError("analysis.point_size must be positive.")
+    if float(analysis["umap_point_size"]) <= 0.0:
+        raise ValueError("analysis.umap_point_size must be positive.")
+    umap_alpha = float(analysis["umap_point_alpha"])
+    if not 0.0 < umap_alpha <= 1.0:
+        raise ValueError("analysis.umap_point_alpha must lie in (0, 1].")
     if analysis["activity_max_nonzeros"] is not None and int(
         analysis["activity_max_nonzeros"]
     ) <= 0:

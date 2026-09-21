@@ -15,6 +15,7 @@ from ihc_mvn.spatial_heatmaps import (
     plot_target_spatial_heatmap,
     validate_ordered_frame,
 )
+from ihc_mvn.targets import TARGET_COLUMNS, build_target_arrays
 
 
 def spatial_adata() -> ad.AnnData:
@@ -116,5 +117,13 @@ def test_spatial_derived_columns_and_plot(tmp_path: Path) -> None:
     )
 
     assert "interval_width_Density_Tumor" in created
+    assert "observed_haldane_Density_Tumor" in created
     assert np.allclose(adata.obs["interval_width_Density_Tumor"], 0.5)
+    padded = np.zeros((4, len(TARGET_COLUMNS)), dtype=np.float32)
+    padded[:, 0] = adata.obs["Density_Tumor"].to_numpy(dtype=np.float32)
+    expected_haldane = build_target_arrays(padded).coordinates[:, 0]
+    np.testing.assert_allclose(
+        adata.obs["observed_haldane_Density_Tumor"].to_numpy(dtype=np.float64),
+        expected_haldane,
+    )
     assert output_path.stat().st_size > 0

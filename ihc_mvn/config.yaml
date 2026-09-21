@@ -180,6 +180,10 @@ analysis:
   calibration_bins: 10
   figure_dpi: 300
   point_size: 1.0
+  # UMAP markers are smaller and translucent so overplotting remains readable.
+  umap_point_size: 0.5
+  umap_point_alpha: 0.5
+  umap_figure_dpi: 600
   density_cmap: jet
   output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/ihc_mvn/analysis
 

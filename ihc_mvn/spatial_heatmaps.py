@@ -16,7 +16,7 @@ import pandas as pd
 from scipy.special import expit
 
 from .config import load_config
-from .targets import TARGET_COLUMNS
+from .targets import TARGET_COLUMNS, build_target_arrays
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -139,21 +139,83 @@ def attach_coordinates(
     return x_column, y_column
 
 
+def _observed_haldane_from_obs(
+    adata: ad.AnnData,
+    targets: Sequence[str],
+    total_count: int,
+    correction: float,
+) -> list[str]:
+    """Derive observed Haldane-Anscombe coordinates from density columns.
+
+    Missing target columns are filled with zero only to satisfy the four-column
+    count constructor. A residual-compartment target is written only when tumor
+    densities are present, and non-finite source rows are stored as NaN.
+
+    Args:
+        adata (ad.AnnData): Tissue AnnData that may contain density columns.
+        targets (Sequence[str]): Ordered modeled target names.
+        total_count (int): Pixel count ``N`` used to reconstruct integer counts.
+        correction (float): Haldane-Anscombe pseudocount.
+
+    Returns:
+        list[str]: Names of Haldane observation columns that were added.
+    """
+
+    created: list[str] = []
+    if adata.n_obs == 0:
+        return created
+    densities = np.zeros((adata.n_obs, len(TARGET_COLUMNS)), dtype=np.float32)
+    finite_mask = np.zeros((adata.n_obs, len(TARGET_COLUMNS)), dtype=bool)
+    for target_index, name in enumerate(TARGET_COLUMNS):
+        if name not in adata.obs:
+            continue
+        values = adata.obs[name].to_numpy(dtype=np.float32)
+        finite = np.isfinite(values)
+        finite_mask[:, target_index] = finite
+        densities[finite, target_index] = values[finite]
+    if not finite_mask.any():
+        return created
+    arrays = build_target_arrays(
+        densities, total_count=total_count, correction=correction
+    )
+    tumor_available = "Density_Tumor" in adata.obs
+    for target in targets:
+        if target not in TARGET_COLUMNS or target not in adata.obs:
+            continue
+        target_index = TARGET_COLUMNS.index(target)
+        if target_index > 0 and not tumor_available:
+            continue
+        values = arrays.coordinates[:, target_index].astype(np.float32)
+        values[~finite_mask[:, target_index]] = np.nan
+        if target_index > 0:
+            values[~finite_mask[:, 0]] = np.nan
+        column = f"observed_haldane_{target}"
+        adata.obs[column] = values
+        created.append(column)
+    return created
+
+
 def add_spatial_derived_columns(
     adata: ad.AnnData,
     targets: Sequence[str],
+    total_count: int = 36_100,
+    correction: float = 0.5,
 ) -> list[str]:
     """Create density summaries, uncertainty widths, and optional residuals.
 
     Args:
         adata (ad.AnnData): AnnData with attached inference columns.
         targets (Sequence[str]): Ordered modeled target names.
+        total_count (int): Pixel count ``N`` used to reconstruct integer counts.
+        correction (float): Haldane-Anscombe pseudocount.
 
     Returns:
         list[str]: Names of newly created observation columns.
     """
 
-    created: list[str] = []
+    created = _observed_haldane_from_obs(
+        adata, targets, total_count=total_count, correction=correction
+    )
     for target in targets:
         required = (
             f"haldane_mean_msi_{target}",
@@ -319,6 +381,16 @@ def plot_target_spatial_heatmap(
     panels: list[tuple[str, str, str, bool]] = []
     if target in adata.obs:
         panels.append((target, "Observed density", str(config["cmap"]), False))
+    observed_haldane = f"observed_haldane_{target}"
+    if observed_haldane in adata.obs:
+        panels.append(
+            (
+                observed_haldane,
+                "Observed Haldane–Anscombe log-odds",
+                str(config["cmap"]),
+                False,
+            )
+        )
     panels.extend(
         (
             (
@@ -515,7 +587,13 @@ def run_spatial_heatmaps(
         adata, str(settings["x_column"]), str(settings["y_column"])
     )
     targets = tuple(str(value) for value in config["data"]["target_columns"])
-    add_spatial_derived_columns(adata, targets)
+    target_config = config["targets"]
+    add_spatial_derived_columns(
+        adata,
+        targets,
+        total_count=int(target_config["total_count"]),
+        correction=float(target_config["haldane_correction"]),
+    )
     batch_column = str(settings["batch_column"])
     if batch_column not in adata.obs:
         raise KeyError(f"AnnData lacks configured batch column {batch_column!r}.")

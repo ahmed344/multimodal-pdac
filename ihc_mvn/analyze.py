@@ -198,6 +198,7 @@ def extract_analysis_data(
         "slide_code": [],
         "patient_code": [],
         "target_densities": [],
+        "target_coordinates": [],
         "targets": [],
         "target_positive_mask": [],
         "mahalanobis": [],
@@ -229,6 +230,9 @@ def extract_analysis_data(
                 collected["patient_code"].append(cpu_batch["patient_codes"].numpy())
                 collected["target_densities"].append(
                     cpu_batch["target_densities"].numpy()
+                )
+                collected["target_coordinates"].append(
+                    cpu_batch["target_coordinates"].numpy()
                 )
                 collected["targets"].append(cpu_batch["targets"].numpy())
                 mask = cpu_batch["target_positive_mask"].numpy().astype(bool)
@@ -329,9 +333,11 @@ def build_analysis_frame(
         }
     )
     densities = np.asarray(extracted["target_densities"])
+    haldane = np.asarray(extracted["target_coordinates"])
     standardized = np.asarray(extracted["targets"])
     for target_index, target in enumerate(target_columns):
         frame[f"observed_density_{target}"] = densities[:, target_index]
+        frame[f"observed_haldane_{target}"] = haldane[:, target_index]
         frame[f"observed_standardized_{target}"] = standardized[:, target_index]
     ignored = {
         "latent",
@@ -339,6 +345,7 @@ def build_analysis_frame(
         "slide_code",
         "patient_code",
         "target_densities",
+        "target_coordinates",
         "targets",
         "target_positive_mask",
         "mahalanobis",
@@ -382,6 +389,7 @@ def _umap_scatter(
     cmap: str,
     *,
     diverging: bool = False,
+    alpha: float = 0.5,
 ) -> None:
     """Draw one rasterized continuous UMAP panel.
 
@@ -393,6 +401,7 @@ def _umap_scatter(
         point_size (float): Marker size.
         cmap (str): Matplotlib colormap name.
         diverging (bool): Whether to center symmetric limits at zero.
+        alpha (float): Marker opacity in ``(0, 1]``.
 
     Returns:
         None: The axis is modified in place.
@@ -417,6 +426,7 @@ def _umap_scatter(
         cmap=cmap,
         vmin=vmin,
         vmax=vmax,
+        alpha=alpha,
         linewidths=0,
         rasterized=True,
     )
@@ -430,6 +440,8 @@ def plot_categorical_umaps(
     frame: pd.DataFrame,
     output_path: Path,
     point_size: float,
+    alpha: float = 0.5,
+    dpi: int = 600,
 ) -> None:
     """Plot latent UMAP colored by slide and patient.
 
@@ -437,6 +449,8 @@ def plot_categorical_umaps(
         frame (pd.DataFrame): Analysis frame containing UMAP/category columns.
         output_path (Path): Destination PNG path.
         point_size (float): Marker size.
+        alpha (float): Marker opacity in ``(0, 1]``.
+        dpi (int): Saved figure resolution.
 
     Returns:
         None: Figure is saved to disk.
@@ -451,6 +465,7 @@ def plot_categorical_umaps(
             c=codes,
             cmap="tab20",
             s=point_size,
+            alpha=alpha,
             linewidths=0,
             rasterized=True,
         )
@@ -466,7 +481,7 @@ def plot_categorical_umaps(
         axis.set_title(f"Latent UMAP by {column}")
         axis.set_xticks([])
         axis.set_yticks([])
-    figure.savefig(output_path)
+    figure.savefig(output_path, dpi=dpi)
     plt.close(figure)
 
 
@@ -478,6 +493,9 @@ def plot_target_umaps(
 ) -> None:
     """Write one MVN-aware UMAP figure per target.
 
+    The first panel colors points by observed Haldane-Anscombe log-odds rather
+    than raw density. Presence residuals still use ``density > 0``.
+
     Args:
         frame (pd.DataFrame): Analysis table with UMAP and prediction columns.
         target_columns (Sequence[str]): Ordered modeled target names.
@@ -488,21 +506,28 @@ def plot_target_umaps(
         None: Target figures are saved to disk.
     """
 
-    point_size = float(config["point_size"])
+    point_size = float(config.get("umap_point_size", config["point_size"]))
+    alpha = float(config.get("umap_point_alpha", 0.5))
+    dpi = int(config.get("umap_figure_dpi", config["figure_dpi"]))
     cmap = str(config["density_cmap"])
     for target in target_columns:
-        truth = frame[f"observed_density_{target}"].to_numpy()
+        density = frame[f"observed_density_{target}"].to_numpy()
         observed_standardized = frame[f"observed_standardized_{target}"].to_numpy()
         predicted = frame[f"standardized_mean_total_{target}"].to_numpy()
-        positive = truth > 0.0
-        residual = np.full(truth.shape, np.nan)
+        positive = density > 0.0
+        residual = np.full(density.shape, np.nan)
         residual[positive] = predicted[positive] - observed_standardized[positive]
         width = (
             frame[f"q95_density_{target}"].to_numpy()
             - frame[f"q05_density_{target}"].to_numpy()
         )
         panels = (
-            (truth, "Observed density", cmap, False),
+            (
+                frame[f"observed_haldane_{target}"].to_numpy(),
+                "Observed Haldane–Anscombe log-odds",
+                cmap,
+                False,
+            ),
             (
                 frame[f"prob_presence_{target}"].to_numpy(),
                 "Presence probability",
@@ -532,11 +557,12 @@ def plot_target_umaps(
                 point_size,
                 color_map,
                 diverging=diverging,
+                alpha=alpha,
             )
         figure.suptitle(f"{_short_target(target)} held-out MVN latent space")
         figure.savefig(
             output_dir / f"latent_umap_mvn_{target}.png",
-            dpi=int(config["figure_dpi"]),
+            dpi=dpi,
         )
         plt.close(figure)
 
@@ -1025,7 +1051,9 @@ def run_analysis(
     plot_categorical_umaps(
         frame,
         umap_dir / "latent_umap_groups.png",
-        float(config["analysis"]["point_size"]),
+        float(config["analysis"]["umap_point_size"]),
+        alpha=float(config["analysis"]["umap_point_alpha"]),
+        dpi=int(config["analysis"]["umap_figure_dpi"]),
     )
     plot_target_umaps(
         frame,
@@ -1042,13 +1070,14 @@ def run_analysis(
             frame[["umap_1", "umap_2"]].to_numpy(),
             frame["conditional_cd8_excess"].to_numpy(),
             "Conditional CD8 excess",
-            float(config["analysis"]["point_size"]),
+            float(config["analysis"]["umap_point_size"]),
             "coolwarm",
             diverging=True,
+            alpha=float(config["analysis"]["umap_point_alpha"]),
         )
         figure.savefig(
             umap_dir / "latent_umap_conditional_cd8_excess.png",
-            dpi=int(config["analysis"]["figure_dpi"]),
+            dpi=int(config["analysis"]["umap_figure_dpi"]),
         )
         plt.close(figure)
 
