@@ -19,8 +19,9 @@ data:
   # Patient identity is encoded independently and carried by every sample.
   patient_column: patient
 
-  # Target order is semantically important: tumor defines the residual
-  # extratumoral count used by the other three target denominators.
+  # Target order is semantically important: tumor defines the non-tumor count
+  # E = total_count - k_T, the fixed denominator of the other three targets.
+  # Their counts at or above E are right-censored in the positive likelihood.
   target_columns:
     - Density_Tumor
     - Density_Stroma
@@ -67,8 +68,9 @@ targets:
   # making coordinates finite at zero and at the target-specific denominator.
   haldane_correction: 0.5
 
-  # Standardization is fitted separately per coordinate using positive training
-  # counts only. This floor prevents division by zero for a constant coordinate.
+  # Standardization is fitted separately per coordinate using positive,
+  # uncensored training counts only. This floor prevents division by zero for a
+  # constant coordinate.
   standard_deviation_floor: 0.000001
 
 model:
@@ -82,8 +84,8 @@ model:
   peak_hidden_dims: [256, 256]
   peak_output_dim: 256
   aggregation_hidden_dims: [256]
-  latent_dim: 32
-  head_hidden_dims: [128, 64]
+  latent_dim: 128
+  head_hidden_dims: [256, 128]
   activation: gelu
   dropout: 0.10
   use_layer_norm: true
@@ -125,7 +127,7 @@ training:
 
   # AdamW and stopping settings. Validation total hurdle-MVN NLL chooses best.pt.
   epochs: 1000
-  learning_rate: 0.001
+  learning_rate: 0.01
   weight_decay: 0.00001
   beta1: 0.9
   beta2: 0.999

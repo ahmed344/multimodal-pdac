@@ -8,6 +8,9 @@ qp-projects/
 # markdown
 markdowns/
 
+# prompts
+prompts/
+
 # pdf
 *.pdf
 
@@ -234,5 +237,6 @@ __marimo__/
 .cursor/
 .cursorrules
 .claude/
+.codex/
 CLAUDE.md
-
+AGENTS.md

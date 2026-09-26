@@ -26,7 +26,7 @@ from .data_loader import (
 from .losses import conditional_gaussian_cd8
 from .model import IHCMultivariateModel
 from .scaling import SparseFeatureScaler, matrix_group_path
-from .targets import TargetStandardizer
+from .targets import TargetStandardizer, haldane_to_fraction
 
 
 DEFAULT_CHECKPOINT = Path(
@@ -508,15 +508,19 @@ def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
         "haldane_mean_total",
         "marginal_standardized_sigma",
         "marginal_unstandardized_sigma",
-        "positive_median_density",
-        "q05_density",
-        "q95_density",
+        "positive_q05_fraction",
+        "positive_q50_fraction",
+        "positive_q95_fraction",
+        "expected_fraction",
+        "expected_density",
+        "quantile_residual",
     )
     names = [
         f"{metric}_{target}"
         for target in target_columns
         for metric in per_target_metrics
     ]
+    names.append("nontumor_count")
     names.extend(correlation_column_names(target_columns))
     names.extend(random_effect_scale_column_names(target_columns))
     names.extend(
@@ -524,8 +528,41 @@ def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
             "conditional_cd8_standardized_mean",
             "conditional_cd8_standardized_variance",
             "conditional_cd8_excess",
+            "conditional_cd8_conditioning_count",
+            "conditional_cd8_quantile_residual",
         ]
     )
+    return names
+
+
+def nullable_prediction_columns(target_columns: Sequence[str]) -> set[str]:
+    """Return prediction columns that are NaN where targets are unobserved.
+
+    Args:
+        target_columns (Sequence[str]): Ordered modeled target names.
+
+    Returns:
+        set[str]: Columns allowed to contain NaN (never infinity).
+    """
+
+    names = {
+        "nontumor_count",
+        "conditional_cd8_excess",
+        "conditional_cd8_quantile_residual",
+    }
+    for index, target in enumerate(target_columns):
+        names.add(f"quantile_residual_{target}")
+        if index > 0:
+            names.update(
+                f"{metric}_{target}"
+                for metric in (
+                    "positive_q05_fraction",
+                    "positive_q50_fraction",
+                    "positive_q95_fraction",
+                    "expected_fraction",
+                    "expected_density",
+                )
+            )
     return names
 
 
@@ -678,14 +715,132 @@ def _sigmoid_numpy(values: np.ndarray) -> np.ndarray:
     return result
 
 
+GAUSS_HERMITE_NODES, GAUSS_HERMITE_WEIGHTS = np.polynomial.hermite_e.hermegauss(24)
+GAUSS_HERMITE_WEIGHTS = GAUSS_HERMITE_WEIGHTS / GAUSS_HERMITE_WEIGHTS.sum()
+
+
+def expected_positive_fraction(
+    locations: np.ndarray,
+    scales: np.ndarray,
+    denominators: np.ndarray,
+    correction: float,
+) -> np.ndarray:
+    """Integrate the positive-branch fraction over its Gaussian log odds.
+
+    Uses 24-node Gauss-Hermite quadrature of ``haldane_to_fraction`` under
+    ``N(location, scale^2)``. The mean is not the transformed median.
+
+    Args:
+        locations (np.ndarray): Unstandardized log-odds means ``[B]``.
+        scales (np.ndarray): Unstandardized log-odds standard deviations ``[B]``.
+        denominators (np.ndarray): Known denominators ``[B]``.
+        correction (float): Haldane-Anscombe pseudocount.
+
+    Returns:
+        np.ndarray: ``E[k / n | k > 0]`` per row ``[B]``.
+    """
+
+    nodes = (
+        np.asarray(locations, dtype=np.float64)[:, None]
+        + np.asarray(scales, dtype=np.float64)[:, None] * GAUSS_HERMITE_NODES[None, :]
+    )
+    fractions = haldane_to_fraction(
+        nodes, np.asarray(denominators, dtype=np.float64)[:, None], correction
+    )
+    return fractions @ GAUSS_HERMITE_WEIGHTS
+
+
+def hurdle_quantile_residuals(
+    probabilities: np.ndarray,
+    coordinates: np.ndarray,
+    means: np.ndarray,
+    scales: np.ndarray,
+    positive_mask: np.ndarray,
+    censored_mask: np.ndarray,
+) -> np.ndarray:
+    """Mid-quantile residuals of the hurdle Gaussian model.
+
+    ``U`` is the midpoint of the predictive CDF interval of the observation:
+    ``(1 - p) / 2`` for a zero, ``(1 - p) + p F(u)`` for an exact positive, and
+    ``(1 - p) + p (F(b) + 1) / 2`` for a positive censored above ``b``. The
+    residual is ``Phi^-1(U)``, approximately standard normal under a correct
+    model and defined for zero pixels too. Rows with non-finite coordinates
+    (no observed targets) return NaN.
+
+    Args:
+        probabilities (np.ndarray): Presence probabilities ``[B, T]``.
+        coordinates (np.ndarray): Observed standardized coordinates ``[B, T]``.
+        means (np.ndarray): Standardized positive-branch means ``[B, T]``.
+        scales (np.ndarray): Standardized positive-branch deviations ``[B, T]``.
+        positive_mask (np.ndarray): Boolean positive-count mask ``[B, T]``.
+        censored_mask (np.ndarray): Boolean censored mask ``[B, T]``.
+
+    Returns:
+        np.ndarray: Residuals ``[B, T]``.
+    """
+
+    probability = np.asarray(probabilities, dtype=np.float64)
+    values = np.asarray(coordinates, dtype=np.float64)
+    positive = np.asarray(positive_mask, dtype=bool)
+    censored = np.asarray(censored_mask, dtype=bool) & positive
+    cdf = torch.special.ndtr(
+        torch.from_numpy(np.nan_to_num((values - means) / scales))
+    ).numpy()
+    zero_mass = 1.0 - probability
+    within = np.where(censored, (cdf + 1.0) / 2.0, cdf)
+    uniform = np.where(positive, zero_mass + probability * within, zero_mass / 2.0)
+    epsilon = 1.0e-12
+    residual = torch.special.ndtri(
+        torch.from_numpy(np.clip(uniform, epsilon, 1.0 - epsilon))
+    ).numpy()
+    return np.where(np.isfinite(values), residual, np.nan)
+
+
+def _export_denominators(
+    batch: Mapping[str, torch.Tensor],
+    targets: Sequence[str],
+    total_count: int,
+) -> np.ndarray:
+    """Return per-row export denominators: ``N`` for tumor, observed ``E`` otherwise.
+
+    Args:
+        batch (Mapping[str, torch.Tensor]): Collated batch, optionally labeled.
+        targets (Sequence[str]): Ordered target names with tumor first.
+        total_count (int): Pixel count ``N``.
+
+    Returns:
+        np.ndarray: Float64 denominators ``[B, T]``; NaN where ``E`` is unobserved.
+    """
+
+    if targets[0] != "Density_Tumor":
+        raise ValueError("Export denominators require tumor as the first target.")
+    rows = int(batch["row_ids"].shape[0])
+    denominators = np.full((rows, len(targets)), np.nan, dtype=np.float64)
+    denominators[:, 0] = float(total_count)
+    nontumor = batch.get("extratumoral_count")
+    available = batch.get("target_available")
+    if nontumor is not None and available is not None:
+        values = nontumor.detach().cpu().numpy().astype(np.float64)
+        values[~available.detach().cpu().numpy().astype(bool)] = np.nan
+        denominators[:, 1:] = values[:, None]
+    return denominators
+
+
 def build_prediction_arrays(
     predictions: Mapping[str, torch.Tensor],
     batch: Mapping[str, torch.Tensor],
     target_standardizer: TargetStandardizer,
     target_columns: Sequence[str],
     model: IHCMultivariateModel,
+    total_count: int = 36_100,
+    correction: float = 0.5,
 ) -> dict[str, np.ndarray]:
     """Derive all exported prediction arrays from one model batch.
+
+    Fractions are relative to each target's denominator: the whole pixel ``N``
+    for tumor and the observed non-tumor count ``E = N - k_T`` otherwise.
+    Non-tumor fractions, densities, and residuals are NaN for rows without
+    observed targets or with ``E = 0``.
 
     Args:
         predictions (Mapping[str, torch.Tensor]): Hierarchical model outputs.
@@ -693,6 +848,8 @@ def build_prediction_arrays(
         target_standardizer (TargetStandardizer): Frozen target affine transform.
         target_columns (Sequence[str]): Ordered modeled target names.
         model (IHCMultivariateModel): Model supplying learned RE prior scales.
+        total_count (int): Pixel count ``N`` represented by a unit density.
+        correction (float): Haldane-Anscombe pseudocount used for the targets.
 
     Returns:
         dict[str, np.ndarray]: Float32 arrays keyed by output column name.
@@ -752,14 +909,37 @@ def build_prediction_arrays(
     coordinates = batch.get("targets")
     if coordinates is None:
         coordinates = torch.full_like(predictions["mean_total"], torch.nan)
+    positive_mask = batch.get("target_positive_mask")
+    censored_mask = batch.get("target_censored_mask")
+    if positive_mask is None or censored_mask is None:
+        positive_mask = torch.zeros_like(coordinates, dtype=torch.bool)
+        censored_mask = torch.zeros_like(positive_mask)
+    positive_mask = positive_mask.to(torch.bool)
+    censored_mask = censored_mask.to(torch.bool)
+    observed_mask = positive_mask & ~censored_mask
     conditional = conditional_gaussian_cd8(
         coordinates=coordinates,
         means=predictions["mean_total"],
         covariance=covariance,
+        conditioning_mask=observed_mask,
+        target_mask=observed_mask[:, 3],
+    )
+
+    denominators = _export_denominators(batch, targets, total_count)
+    probability_np = probabilities.detach().cpu().numpy().astype(np.float64)
+    coordinates_np = coordinates.detach().cpu().numpy().astype(np.float64)
+    positive_np = positive_mask.detach().cpu().numpy()
+    censored_np = censored_mask.detach().cpu().numpy()
+    residuals = hurdle_quantile_residuals(
+        probability_np,
+        coordinates_np,
+        means_np["standardized_mean_total"],
+        predictive_sigma,
+        positive_np,
+        censored_np,
     )
 
     arrays: dict[str, np.ndarray] = {}
-    probability_np = probabilities.detach().cpu().numpy()
     correlation_np = predictions["correlation"].detach().cpu().numpy()
     for target_index, target in enumerate(targets):
         arrays[f"prob_presence_{target}"] = probability_np[:, target_index]
@@ -773,17 +953,23 @@ def build_prediction_arrays(
         arrays[f"marginal_unstandardized_sigma_{target}"] = (
             unstandardized_sigma[:, target_index]
         )
-        arrays[f"positive_median_density_{target}"] = _sigmoid_numpy(
-            total_haldane[:, target_index]
+        location = total_haldane[:, target_index]
+        scale = unstandardized_sigma[:, target_index]
+        denominator = denominators[:, target_index]
+        for label, quantile in (("q05", NORMAL_Q05), ("q50", 0.0), ("q95", NORMAL_Q95)):
+            arrays[f"positive_{label}_fraction_{target}"] = haldane_to_fraction(
+                location + quantile * scale, denominator, correction
+            )
+        positive_mean = expected_positive_fraction(
+            location, scale, denominator, correction
         )
-        arrays[f"q05_density_{target}"] = _sigmoid_numpy(
-            total_haldane[:, target_index]
-            + NORMAL_Q05 * unstandardized_sigma[:, target_index]
+        expected_fraction = probability_np[:, target_index] * positive_mean
+        arrays[f"expected_fraction_{target}"] = expected_fraction
+        arrays[f"expected_density_{target}"] = (
+            expected_fraction * denominator / float(total_count)
         )
-        arrays[f"q95_density_{target}"] = _sigmoid_numpy(
-            total_haldane[:, target_index]
-            + NORMAL_Q95 * unstandardized_sigma[:, target_index]
-        )
+        arrays[f"quantile_residual_{target}"] = residuals[:, target_index]
+    arrays["nontumor_count"] = denominators[:, 1]
     for left in range(len(targets)):
         for right in range(left + 1, len(targets)):
             arrays[f"R_{targets[left]}_{targets[right]}"] = np.full(
@@ -799,13 +985,22 @@ def build_prediction_arrays(
                 values_np[target_index],
                 dtype=np.float32,
             )
-    arrays["conditional_cd8_standardized_mean"] = (
-        conditional.conditional_mean.detach().cpu().numpy()
-    )
-    arrays["conditional_cd8_standardized_variance"] = (
-        conditional.conditional_variance.detach().cpu().numpy()
-    )
+    conditional_mean = conditional.conditional_mean.detach().cpu().numpy()
+    conditional_variance = conditional.conditional_variance.detach().cpu().numpy()
+    arrays["conditional_cd8_standardized_mean"] = conditional_mean
+    arrays["conditional_cd8_standardized_variance"] = conditional_variance
     arrays["conditional_cd8_excess"] = conditional.excess.detach().cpu().numpy()
+    arrays["conditional_cd8_conditioning_count"] = (
+        conditional.conditioning_count.detach().cpu().numpy()
+    )
+    arrays["conditional_cd8_quantile_residual"] = hurdle_quantile_residuals(
+        probability_np[:, 3:4],
+        coordinates_np[:, 3:4],
+        conditional_mean.astype(np.float64)[:, None],
+        np.sqrt(conditional_variance.astype(np.float64))[:, None],
+        positive_np[:, 3:4],
+        censored_np[:, 3:4],
+    )[:, 0]
     return {
         name: np.asarray(values, dtype=np.float32)
         for name, values in arrays.items()
@@ -917,7 +1112,7 @@ def validate_output(
             f"expected {expected_rows}."
         )
     float_columns = prediction_column_names(target_columns)
-    nullable = {"conditional_cd8_excess"}
+    nullable = nullable_prediction_columns(target_columns)
     processed = 0
     with ObservationNameReader(input_path) as name_reader:
         for record_batch in parquet.iter_batches(batch_size=batch_size):
@@ -942,18 +1137,30 @@ def validate_output(
                     raise ValueError(f"Column {column!r} contains non-finite values.")
             for target in target_columns:
                 probability = table[f"prob_presence_{target}"].to_numpy()
-                lower = table[f"q05_density_{target}"].to_numpy()
-                median = table[f"positive_median_density_{target}"].to_numpy()
-                upper = table[f"q95_density_{target}"].to_numpy()
+                lower = table[f"positive_q05_fraction_{target}"].to_numpy(
+                    zero_copy_only=False
+                )
+                median = table[f"positive_q50_fraction_{target}"].to_numpy(
+                    zero_copy_only=False
+                )
+                upper = table[f"positive_q95_fraction_{target}"].to_numpy(
+                    zero_copy_only=False
+                )
+                expected = table[f"expected_fraction_{target}"].to_numpy(
+                    zero_copy_only=False
+                )
                 if np.any((probability < 0.0) | (probability > 1.0)):
                     raise ValueError(f"Presence probability for {target!r} is invalid.")
+                finite = np.isfinite(median)
                 if np.any(
-                    (lower < 0.0)
-                    | (lower > median)
-                    | (median > upper)
-                    | (upper > 1.0)
+                    (lower[finite] <= 0.0)
+                    | (lower[finite] > median[finite])
+                    | (median[finite] > upper[finite])
+                    | (upper[finite] > 1.0)
+                    | (expected[finite] < 0.0)
+                    | (expected[finite] > 1.0)
                 ):
-                    raise ValueError(f"Density quantiles for {target!r} are invalid.")
+                    raise ValueError(f"Fraction quantiles for {target!r} are invalid.")
             processed += len(rows)
     if processed != expected_rows:
         raise ValueError("Prediction validation did not scan the expected row count.")
@@ -1055,11 +1262,12 @@ def _default_paths(
         if output_override is not None
         else output_dir / "inference.parquet"
     )
-    latent_path = (
-        Path(latent_override)
-        if latent_override is not None
-        else output_dir / "inference_latent.parquet"
-    )
+    if latent_override is not None:
+        latent_path = Path(latent_override)
+    elif output_override is not None:
+        latent_path = output_path.with_name(f"{output_path.stem}_latent.parquet")
+    else:
+        latent_path = output_dir / "inference_latent.parquet"
     return input_path, output_path, latent_path
 
 
@@ -1126,6 +1334,9 @@ def run_inference(
     data_config = config.get("data", {})
     training_config = config.get("training", {})
     inference_config = config.get("inference", {})
+    target_config = config.get("targets", {})
+    total_count = int(target_config.get("total_count", 36_100))
+    correction = float(target_config.get("haldane_correction", 0.5))
     batch_size = int(
         batch_size_override
         if batch_size_override is not None
@@ -1214,6 +1425,8 @@ def run_inference(
                     target_standardizer,
                     target_columns,
                     model,
+                    total_count=total_count,
+                    correction=correction,
                 )
                 obs_names = name_reader.read(
                     processed, processed + row_positions.size

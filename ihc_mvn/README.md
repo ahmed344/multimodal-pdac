@@ -45,13 +45,25 @@ correlation matrix:
 `GlobalCorrelation` constructs a positive-definite covariance from a learned
 Cholesky factor and normalizes it to a correlation matrix. The positive loss
 is the exact marginal multivariate-normal negative log likelihood for whichever
-subset of the four targets is positive. There are 16 possible masks, including
-the all-zero mask, whose Gaussian contribution is exactly zero. The objective
+subset \(O\) of the four targets is positive and exactly observed. There are 16
+possible masks, including the all-zero mask, whose Gaussian contribution is
+exactly zero. A positive target that is right-censored at boundary \(b_j\)
+(see the target section) adds
+
+\[
+-\log\left[1-\Phi\left(\frac{b_j-\mu_{j\mid O}}{s_{j\mid O}}\right)\right],
+\]
+
+using its Gaussian conditional moments given \(O\). Several censored targets in
+one pixel use the product of these univariate terms, a composite approximation
+to the joint orthant probability. The objective
 adds binary cross entropy over all hurdle indicators and optional normalized
 priors for non-centered patient and slide random effects.
 
-The CD8 conditional diagnostic uses standard Gaussian conditioning on any
-available subset of tumor, stroma, and collagen. Its excess score is
+The CD8 conditional diagnostic uses standard Gaussian conditioning on the
+exactly observed positive subset of tumor, stroma, and collagen. Finite
+coordinates of zero-count targets are never conditioned on. Its excess score,
+defined only when CD8 itself is an exact positive observation, is
 
 \[
 z_{\mathrm{CD8}} =
@@ -94,24 +106,56 @@ Each density is converted to a count with
 k_j=\operatorname{round}(36100\,y_j).
 \]
 
-Tumor uses denominator \(n_T=36100\). The remaining targets use the residual
-extratumoral compartment while remaining valid when a component count exceeds
-that residual:
+Tumor uses denominator \(n_T=36100\). The remaining targets use the fixed
+non-tumor count as denominator, so their coordinates model the fraction
+\(\pi_j=k_j/E\) of non-tumor area:
 
 \[
-n_j=\max(36100-k_T,\;k_j),\qquad j\in\{S,C,CD8\}.
+n_j=E=36100-k_T,\qquad j\in\{S,C,CD8\}.
 \]
 
-The finite coordinate is
+This is a stick-breaking factorization \(p(k_T)\,p(k_j\mid k_T)\): given
+\(k_T\), the map from \(k_j\) to its coordinate is fixed and monotone. The
+finite coordinate is
 
 \[
-q_j=\log\frac{k_j+0.5}{n_j-k_j+0.5}.
+u_j=\log\frac{\min(k_j,n_j)+0.5}{n_j-\min(k_j,n_j)+0.5}.
 \]
+
+A positive count with \(k_j\ge E\) says the target covers at least all of the
+non-tumor area (common for collagen in tumor-rich pixels). It is flagged in
+`censored_mask`, its coordinate is the boundary \(\log((E+0.5)/0.5)\), and the
+positive likelihood treats it as right-censored there. The denominator never
+depends on the target's own outcome.
 
 Presence is defined from the uncorrected count, `k_j > 0`; the correction does
 not turn structural zeros into positives. Coordinate means and population
-standard deviations are fitted independently per target from positive
-training rows only, then frozen and persisted.
+standard deviations are fitted independently per target from positive,
+uncensored training rows only, then frozen and persisted.
+
+At inference, rows whose densities are not all finite are kept as unavailable
+(`target_available` is false) instead of dropping labels for the whole file.
+
+## Exported fractions, densities, and residuals
+
+With a known denominator \(n\), the Haldane map inverts exactly:
+\(k=(n+1)\,\sigma(u)-0.5\). Exports use \(n=36100\) for tumor and the observed
+non-tumor count `nontumor_count` otherwise; non-tumor quantities are NaN where
+that count is unobserved or zero. Positive counts are restricted to \([1,n]\).
+
+- `positive_q05/q50/q95_fraction_*`: quantiles of the positive-branch fraction
+  \(k/n\) (quantiles transform exactly through the monotone inverse).
+- `expected_fraction_*`: \(p_j\,\mathbb E[k/n\mid k>0]\), including the
+  hurdle's zero mass; the positive mean uses 24-node Gauss–Hermite quadrature.
+  For CD8 this is the expected CD8 fraction of non-tumor area.
+- `expected_density_*`: `expected_fraction_*` times \(n/36100\), the whole-pixel
+  density.
+- `quantile_residual_*`: the hurdle mid-quantile residual
+  \(\Phi^{-1}(U)\) with \(U=(1-p)/2\) for zeros, \((1-p)+pF(u)\) for exact
+  positives, and \((1-p)+p(F(b)+1)/2\) for censored positives. It is defined for
+  zero pixels too and is approximately standard normal under a correct model.
+- `conditional_cd8_quantile_residual`: the same residual for CD8 with the
+  conditional Gaussian given the observed positive context.
 
 ## Split interpretation and leakage
 
@@ -190,8 +234,9 @@ The configured output root is
 Inference writes an ordered prediction Parquet and a separate latent Parquet.
 The prediction artifact reports presence probabilities, MSI-only,
 patient-adjusted and fully adjusted Gaussian means, marginal uncertainty,
-density-scale positive medians/intervals, the shared correlations and
-conditional-CD8 diagnostics. Row positions and possibly duplicated observation
+positive-fraction quantiles, expected fractions and whole-pixel densities,
+hurdle quantile residuals, the observed `nontumor_count`, the shared
+correlations, and conditional-CD8 diagnostics. Row positions and possibly duplicated observation
 names remain aligned exactly with the source H5AD.
 
 Held-out analysis writes:
@@ -203,16 +248,19 @@ Held-out analysis writes:
   `embedding_cosine_similarity.npy`, and `peptide_families.csv`;
 - learned and empirical target-correlation tables/heatmaps;
 - patient and slide random-intercept tables/heatmaps;
-- hurdle reliability, positive prediction, interval coverage, and
-  mask-specific Mahalanobis diagnostics.
+- hurdle reliability, positive prediction, interval coverage on the fitted
+  coordinate, quantile-residual moments, censored counts, and mask-specific
+  Mahalanobis diagnostics (censored coordinates excluded).
 
 Spatial inference continues to write `inference/inference.parquet` and
-`inference/inference_latent.parquet`. Spatial visualization validates both
+`inference/inference_latent.parquet`. With `--output` but no
+`--latent-output`, the latent file is written beside the prediction file as
+`<stem>_latent.parquet`. Spatial visualization validates both
 artifacts against the tissue AnnData row positions and observation names,
 then writes one figure per target under `spatial/`. Panels distinguish
-MSI-only, patient-adjusted, and fully adjusted positive medians and include
-presence probability, uncertainty width, observed truth/residuals when
-available, and HES when present. A separate conditional-CD8 excess map is
+MSI-only, patient-adjusted, and fully adjusted positive-fraction medians and
+include presence probability, uncertainty width, expected fraction, the hurdle
+quantile residual when observed targets are available, and HES when present. A separate conditional-CD8 excess map is
 written when that diagnostic is finite.
 
 ## Known and unknown inference groups

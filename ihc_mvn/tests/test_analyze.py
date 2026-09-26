@@ -161,8 +161,9 @@ def test_plot_target_umaps_colors_by_observed_haldane(tmp_path: Path) -> None:
             f"standardized_mean_total_{target}": np.linspace(-0.8, 0.9, row_count),
             f"prob_presence_{target}": np.linspace(0.1, 0.9, row_count),
             f"marginal_unstandardized_sigma_{target}": np.full(row_count, 0.2),
-            f"q05_density_{target}": np.linspace(0.0, 0.4, row_count),
-            f"q95_density_{target}": np.linspace(0.2, 0.9, row_count),
+            f"positive_q05_fraction_{target}": np.linspace(0.01, 0.4, row_count),
+            f"positive_q95_fraction_{target}": np.linspace(0.2, 0.9, row_count),
+            f"quantile_residual_{target}": np.linspace(-1.5, 1.5, row_count),
         }
     )
     plot_target_umaps(

@@ -241,16 +241,16 @@ def load_anndata_metadata(
                 raise KeyError("Target columns must be either all present or all absent.")
             if all(present_targets):
                 densities = obs[list(target_names)].to_numpy(dtype=np.float32, copy=True)
-                if np.isfinite(densities).all():
-                    target_arrays = build_target_arrays(
-                        densities,
-                        total_count=total_count,
-                        correction=haldane_correction,
-                    )
-                elif require_targets:
+                if require_targets and not np.isfinite(densities).all():
                     raise ValueError(
                         "Required training targets contain non-finite values."
                     )
+                target_arrays = build_target_arrays(
+                    densities,
+                    total_count=total_count,
+                    correction=haldane_correction,
+                    allow_missing_rows=not require_targets,
+                )
 
         fitted_slide_mapping = slide_mapping or CategoryMapping.fit(
             obs[batch_column], batch_column
@@ -532,6 +532,8 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
                     "extratumoral_count": target_arrays.extratumoral_counts[row],
                     "target_denominators": target_arrays.denominators[row],
                     "target_positive_mask": target_arrays.positive_mask[row],
+                    "target_censored_mask": target_arrays.censored_mask[row],
+                    "target_available": target_arrays.available_mask[row],
                     "target_coordinates": coordinates.astype(np.float32),
                     "targets": self.target_standardizer.transform(coordinates),
                 }
@@ -622,6 +624,8 @@ def sparse_collate(samples: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tens
         "target_counts",
         "target_denominators",
         "target_positive_mask",
+        "target_censored_mask",
+        "target_available",
         "target_coordinates",
         "targets",
     )
@@ -753,7 +757,7 @@ def create_data_bundle(config: Mapping[str, Any]) -> DataBundle:
     )
     target_standardizer = TargetStandardizer.fit(
         coordinates=metadata.target_arrays.coordinates,
-        positive_mask=metadata.target_arrays.positive_mask,
+        positive_mask=metadata.target_arrays.observed_mask,
         train_indices=split_indices["train"],
         target_names=data_config["target_columns"],
         standard_deviation_floor=float(

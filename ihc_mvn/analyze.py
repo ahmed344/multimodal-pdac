@@ -201,6 +201,7 @@ def extract_analysis_data(
         "target_coordinates": [],
         "targets": [],
         "target_positive_mask": [],
+        "target_censored_mask": [],
         "mahalanobis": [],
         "mahalanobis_df": [],
     }
@@ -219,6 +220,8 @@ def extract_analysis_data(
                     target_standardizer,
                     target_columns,
                     model,
+                    total_count=int(stored_config["targets"]["total_count"]),
+                    correction=float(stored_config["targets"]["haldane_correction"]),
                 )
                 for key, value in arrays.items():
                     prediction_parts.setdefault(key, []).append(value)
@@ -235,8 +238,11 @@ def extract_analysis_data(
                     cpu_batch["target_coordinates"].numpy()
                 )
                 collected["targets"].append(cpu_batch["targets"].numpy())
-                mask = cpu_batch["target_positive_mask"].numpy().astype(bool)
-                collected["target_positive_mask"].append(mask)
+                positive = cpu_batch["target_positive_mask"].numpy().astype(bool)
+                censored = cpu_batch["target_censored_mask"].numpy().astype(bool)
+                collected["target_positive_mask"].append(positive)
+                collected["target_censored_mask"].append(censored)
+                mask = positive & ~censored
                 means = predictions["mean_total"].detach().cpu().numpy()
                 covariance = predictions["covariance"].detach().cpu().numpy()
                 standardized = cpu_batch["targets"].numpy()
@@ -335,8 +341,10 @@ def build_analysis_frame(
     densities = np.asarray(extracted["target_densities"])
     haldane = np.asarray(extracted["target_coordinates"])
     standardized = np.asarray(extracted["targets"])
+    censored = np.asarray(extracted["target_censored_mask"], dtype=bool)
     for target_index, target in enumerate(target_columns):
         frame[f"observed_density_{target}"] = densities[:, target_index]
+        frame[f"observed_censored_{target}"] = censored[:, target_index]
         frame[f"observed_haldane_{target}"] = haldane[:, target_index]
         frame[f"observed_standardized_{target}"] = standardized[:, target_index]
     ignored = {
@@ -348,16 +356,19 @@ def build_analysis_frame(
         "target_coordinates",
         "targets",
         "target_positive_mask",
+        "target_censored_mask",
         "mahalanobis",
         "mahalanobis_df",
         "slide_names",
         "patient_names",
         "target_columns",
     }
-    for name, values in extracted.items():
-        if name not in ignored and np.asarray(values).ndim == 1:
-            frame[name] = values
-    return frame
+    extra = {
+        name: values
+        for name, values in extracted.items()
+        if name not in ignored and np.asarray(values).ndim == 1
+    }
+    return pd.concat([frame, pd.DataFrame(extra, index=frame.index)], axis=1)
 
 
 def _robust_limits(values: np.ndarray) -> tuple[float, float]:
@@ -494,7 +505,8 @@ def plot_target_umaps(
     """Write one MVN-aware UMAP figure per target.
 
     The first panel colors points by observed Haldane-Anscombe log-odds rather
-    than raw density. Presence residuals still use ``density > 0``.
+    than raw density. The last panel is the hurdle mid-quantile residual, which
+    is defined for zero, censored, and exactly observed pixels alike.
 
     Args:
         frame (pd.DataFrame): Analysis table with UMAP and prediction columns.
@@ -511,15 +523,11 @@ def plot_target_umaps(
     dpi = int(config.get("umap_figure_dpi", config["figure_dpi"]))
     cmap = str(config["density_cmap"])
     for target in target_columns:
-        density = frame[f"observed_density_{target}"].to_numpy()
-        observed_standardized = frame[f"observed_standardized_{target}"].to_numpy()
         predicted = frame[f"standardized_mean_total_{target}"].to_numpy()
-        positive = density > 0.0
-        residual = np.full(density.shape, np.nan)
-        residual[positive] = predicted[positive] - observed_standardized[positive]
+        residual = frame[f"quantile_residual_{target}"].to_numpy()
         width = (
-            frame[f"q95_density_{target}"].to_numpy()
-            - frame[f"q05_density_{target}"].to_numpy()
+            frame[f"positive_q95_fraction_{target}"].to_numpy()
+            - frame[f"positive_q05_fraction_{target}"].to_numpy()
         )
         panels = (
             (
@@ -541,8 +549,8 @@ def plot_target_umaps(
                 "magma",
                 False,
             ),
-            (width, "90% density interval width", "magma", False),
-            (residual, "Standardized residual", "coolwarm", True),
+            (width, "90% positive-fraction interval width", "magma", False),
+            (residual, "Hurdle quantile residual", "coolwarm", True),
         )
         figure, axes = plt.subplots(2, 3, figsize=(17, 10), constrained_layout=True)
         coordinates = frame[["umap_1", "umap_2"]].to_numpy()
@@ -856,7 +864,9 @@ def export_mvn_diagnostics(
     residuals = np.asarray(extracted["targets"]) - np.column_stack(
         [frame[f"standardized_mean_total_{target}"] for target in targets]
     )
-    mask = np.asarray(extracted["target_positive_mask"], dtype=bool)
+    mask = np.asarray(extracted["target_positive_mask"], dtype=bool) & ~np.asarray(
+        extracted["target_censored_mask"], dtype=bool
+    )
     empirical = np.eye(len(targets), dtype=np.float64)
     for left in range(len(targets)):
         for right in range(left + 1, len(targets)):
@@ -914,13 +924,18 @@ def export_mvn_diagnostics(
             if np.unique(positive).size == 2
             else math.nan
         )
-        lower = frame[f"q05_density_{target}"].to_numpy()
-        upper = frame[f"q95_density_{target}"].to_numpy()
+        censored = np.asarray(extracted["target_censored_mask"])[:, target_index]
+        exact = positive & ~censored
+        standardized_error = (
+            np.asarray(extracted["targets"])[:, target_index]
+            - frame[f"standardized_mean_total_{target}"].to_numpy()
+        ) / frame[f"marginal_standardized_sigma_{target}"].to_numpy()
         coverage = (
-            float(np.mean((observed[positive] >= lower[positive]) & (observed[positive] <= upper[positive])))
-            if positive.any()
+            float(np.mean(np.abs(standardized_error[exact]) <= stats.norm.ppf(0.95)))
+            if exact.any()
             else math.nan
         )
+        quantile_residual = frame[f"quantile_residual_{target}"].to_numpy()
         calibration_rows.append(
             {
                 "target": target,
@@ -928,6 +943,9 @@ def export_mvn_diagnostics(
                 "presence_auc": auc,
                 "positive_interval_90_coverage": coverage,
                 "positive_count": int(positive.sum()),
+                "censored_count": int(censored.sum()),
+                "quantile_residual_mean": float(np.nanmean(quantile_residual)),
+                "quantile_residual_sd": float(np.nanstd(quantile_residual)),
             }
         )
         bins = np.linspace(0.0, 1.0, int(config["calibration_bins"]) + 1)
@@ -960,7 +978,9 @@ def export_mvn_diagnostics(
         zip(axes.flat, targets, strict=True)
     ):
         truth = np.asarray(extracted["targets"])[:, target_index]
-        positive = np.asarray(extracted["target_positive_mask"])[:, target_index]
+        positive = np.asarray(extracted["target_positive_mask"])[
+            :, target_index
+        ] & ~np.asarray(extracted["target_censored_mask"])[:, target_index]
         predicted = frame[f"standardized_mean_total_{target}"].to_numpy()
         axis.scatter(
             truth[positive],

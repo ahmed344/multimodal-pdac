@@ -23,7 +23,9 @@ from ihc_mvn.targets import (
     TARGET_COLUMNS,
     TargetStandardizer,
     build_target_arrays,
+    censored_target_mask,
     haldane_anscombe_coordinates,
+    haldane_to_fraction,
     target_denominators,
 )
 
@@ -214,14 +216,14 @@ def test_scaler_state_round_trip_and_frozen_known_unknown_inference(
     dataset.close()
 
 
-def test_haldane_denominators_cover_boundary_and_overfull_residual_cases() -> None:
-    """Check finite target coordinates at zero, full, and residual edge cases.
+def test_nontumor_denominators_censor_counts_at_or_above_residual() -> None:
+    """Check fixed non-tumor denominators, censoring, and boundary coordinates.
 
     Args:
         None.
 
     Returns:
-        None: Assertions verify denominator construction and corrected log odds.
+        None: Assertions verify denominators, masks, and corrected log odds.
     """
 
     counts = np.asarray(
@@ -236,19 +238,83 @@ def test_haldane_denominators_cover_boundary_and_overfull_residual_cases() -> No
     expected = np.asarray(
         [
             [36_100, 36_100, 36_100, 36_100],
-            [36_100, 0, 7, 36_100],
-            [36_100, 2, 1, 1],
+            [36_100, 0, 0, 0],
+            [36_100, 1, 1, 1],
         ],
         dtype=np.int64,
     )
     np.testing.assert_array_equal(denominators, expected)
-    coordinates = haldane_anscombe_coordinates(counts, denominators)
-    assert np.isfinite(coordinates).all()
-    np.testing.assert_allclose(coordinates[1, 1], 0.0)
-    np.testing.assert_allclose(
-        coordinates[0, 0],
-        np.log(0.5 / 36_100.5),
+    np.testing.assert_array_equal(
+        censored_target_mask(counts),
+        np.asarray(
+            [
+                [False, False, True, False],
+                [False, False, True, True],
+                [False, True, True, False],
+            ]
+        ),
     )
+    arrays = build_target_arrays(counts.astype(np.float64) / 36_100)
+    assert np.isfinite(arrays.coordinates).all()
+    np.testing.assert_allclose(arrays.coordinates[0, 0], np.log(0.5 / 36_100.5))
+    np.testing.assert_allclose(arrays.coordinates[0, 2], np.log(36_100.5 / 0.5))
+    np.testing.assert_allclose(arrays.coordinates[1, 2:], 0.0)
+    np.testing.assert_allclose(arrays.coordinates[2, 1:3], np.log(1.5 / 0.5))
+    np.testing.assert_array_equal(
+        arrays.observed_mask, arrays.positive_mask & ~arrays.censored_mask
+    )
+    coordinates = haldane_anscombe_coordinates(
+        np.minimum(counts, denominators), denominators
+    )
+    np.testing.assert_allclose(coordinates, arrays.coordinates)
+
+
+def test_haldane_to_fraction_inverts_coordinates_for_known_denominators() -> None:
+    """Invert log odds exactly and clip the positive branch to ``[1/n, 1]``.
+
+    Args:
+        None.
+
+    Returns:
+        None: Round trips and boundary behavior are asserted.
+    """
+
+    counts = np.asarray([1.0, 17.0, 900.0, 1_000.0])
+    denominators = np.full(4, 1_000.0)
+    coordinates = np.log((counts + 0.5) / (denominators - counts + 0.5))
+    np.testing.assert_allclose(
+        haldane_to_fraction(coordinates, denominators, 0.5), counts / 1_000.0
+    )
+    np.testing.assert_allclose(
+        haldane_to_fraction(np.asarray([-40.0, 40.0]), np.full(2, 1_000.0), 0.5),
+        [1.0e-3, 1.0],
+    )
+    assert np.isnan(
+        haldane_to_fraction(np.zeros(2), np.asarray([0.0, np.nan]), 0.5)
+    ).all()
+
+
+def test_build_target_arrays_keeps_missing_rows_only_when_allowed() -> None:
+    """Keep non-finite inference rows as unavailable instead of dropping labels.
+
+    Args:
+        None.
+
+    Returns:
+        None: Missing-row semantics and training rejection are asserted.
+    """
+
+    densities = np.asarray(
+        [[0.5, 0.1, 0.2, 0.01], [np.nan, 0.1, 0.2, 0.01]], dtype=np.float32
+    )
+    with pytest.raises(ValueError, match="non-finite"):
+        build_target_arrays(densities)
+    arrays = build_target_arrays(densities, allow_missing_rows=True)
+    assert arrays.available_mask.tolist() == [True, False]
+    assert np.isfinite(arrays.coordinates[0]).all()
+    assert np.isnan(arrays.coordinates[1]).all()
+    assert arrays.extratumoral_counts.tolist() == [18_050, -1]
+    assert not arrays.positive_mask[1].any()
 
 
 def test_target_standardizer_uses_training_positives_only() -> None:
@@ -315,6 +381,8 @@ def test_sparse_collator_preserves_empty_and_nonempty_rows() -> None:
             "target_counts": np.zeros(4, dtype=np.int64),
             "target_denominators": np.ones(4, dtype=np.int64),
             "target_positive_mask": np.zeros(4, dtype=bool),
+            "target_censored_mask": np.zeros(4, dtype=bool),
+            "target_available": True,
             "target_coordinates": np.zeros(4, dtype=np.float32),
             "targets": np.zeros(4, dtype=np.float32),
         },
@@ -328,6 +396,8 @@ def test_sparse_collator_preserves_empty_and_nonempty_rows() -> None:
             "target_counts": np.ones(4, dtype=np.int64),
             "target_denominators": np.ones(4, dtype=np.int64),
             "target_positive_mask": np.ones(4, dtype=bool),
+            "target_censored_mask": np.zeros(4, dtype=bool),
+            "target_available": True,
             "target_coordinates": np.ones(4, dtype=np.float32),
             "targets": np.ones(4, dtype=np.float32),
         },
@@ -345,6 +415,8 @@ def test_sparse_collator_preserves_empty_and_nonempty_rows() -> None:
         "target_counts",
         "target_denominators",
         "target_positive_mask",
+        "target_censored_mask",
+        "target_available",
         "target_coordinates",
         "targets",
     }
@@ -404,7 +476,7 @@ def test_inference_rejects_reordered_features(tmp_path: Path) -> None:
         create_inference_dataset(path, scaler, patient_mapping)
 
 
-def test_inference_treats_nonfinite_optional_targets_as_unlabeled(
+def test_inference_keeps_rows_with_nonfinite_optional_targets_unlabeled(
     tmp_path: Path,
 ) -> None:
     """Allow tissue inference when optional density columns contain missing values.
@@ -413,7 +485,7 @@ def test_inference_treats_nonfinite_optional_targets_as_unlabeled(
         tmp_path (Path): Pytest-provided temporary directory.
 
     Returns:
-        None: Assertions verify frozen-scaler inference omits invalid labels.
+        None: Assertions verify invalid rows are marked unavailable, not dropped.
     """
 
     _, scaler, _ = fit_example_scaler(tmp_path)
@@ -438,6 +510,11 @@ def test_inference_treats_nonfinite_optional_targets_as_unlabeled(
         CategoryMapping.from_names("patient", ("patient_a",)),
         target_standardizer=standardizer,
     )
-    assert dataset.metadata.target_arrays is None
-    assert "targets" not in dataset[0]
+    arrays = dataset.metadata.target_arrays
+    assert arrays is not None
+    assert arrays.available_mask.tolist() == [True, False]
+    assert dataset[0]["target_available"]
+    assert np.isfinite(dataset[0]["targets"]).all()
+    assert not dataset[1]["target_available"]
+    assert np.isnan(dataset[1]["targets"]).all()
     dataset.close()

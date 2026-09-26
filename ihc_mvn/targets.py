@@ -24,7 +24,15 @@ class TargetArrays:
     extratumoral_counts: np.ndarray
     denominators: np.ndarray
     positive_mask: np.ndarray
+    censored_mask: np.ndarray
+    available_mask: np.ndarray
     coordinates: np.ndarray
+
+    @property
+    def observed_mask(self) -> np.ndarray:
+        """Positive, uncensored coordinates that enter the Gaussian exactly."""
+
+        return self.positive_mask & ~self.censored_mask
 
 
 @dataclass(frozen=True)
@@ -51,7 +59,8 @@ class TargetStandardizer:
         Args:
             coordinates (np.ndarray): Haldane-Anscombe coordinates with shape
                 ``(observations, targets)``.
-            positive_mask (np.ndarray): Boolean positive-count mask of the same shape.
+            positive_mask (np.ndarray): Boolean mask of exactly observed positive
+                coordinates (positive and uncensored) of the same shape.
             train_indices (np.ndarray): Actual selected global training row indices.
             target_names (Sequence[str]): Ordered target names.
             standard_deviation_floor (float): Lower bound for fitted standard deviations.
@@ -201,22 +210,45 @@ def density_to_counts(densities: np.ndarray, total_count: int = 36_100) -> np.nd
 
 
 def target_denominators(counts: np.ndarray, total_count: int = 36_100) -> np.ndarray:
-    """Construct tumor and residual-compartment target denominators.
+    """Construct fixed tumor and non-tumor target denominators.
 
     Args:
         counts (np.ndarray): Integer counts ordered as tumor, stroma, collagen, CD8.
         total_count (int): Tumor denominator ``N``.
 
     Returns:
-        np.ndarray: Denominators with ``n_T=N`` and ``n_j=max(N-k_T, k_j)``.
+        np.ndarray: Denominators with ``n_T=N`` and ``n_j=E=N-k_T`` otherwise.
+            Unlike a ``max(E, k_j)`` rule, the denominator never depends on the
+            target's own outcome; counts above ``E`` are censored instead.
     """
 
     values = np.asarray(counts, dtype=np.int64)
     residual = extratumoral_counts(values, total_count)
     denominators = np.empty_like(values)
     denominators[..., 0] = int(total_count)
-    denominators[..., 1:] = np.maximum(residual[..., None], values[..., 1:])
+    denominators[..., 1:] = residual[..., None]
     return denominators
+
+
+def censored_target_mask(counts: np.ndarray, total_count: int = 36_100) -> np.ndarray:
+    """Flag positive non-tumor counts at or above the non-tumor count ``E``.
+
+    Such a count says the target covers at least all of the non-tumor area, so
+    its fraction ``k_j / E`` is right-censored at one rather than observed.
+
+    Args:
+        counts (np.ndarray): Integer counts ordered as tumor, stroma, collagen, CD8.
+        total_count (int): Total pixel count ``N``.
+
+    Returns:
+        np.ndarray: Boolean mask of the same shape; tumor is never censored.
+    """
+
+    values = np.asarray(counts, dtype=np.int64)
+    residual = extratumoral_counts(values, total_count)
+    censored = np.zeros(values.shape, dtype=bool)
+    censored[..., 1:] = (values[..., 1:] > 0) & (values[..., 1:] >= residual[..., None])
+    return censored
 
 
 def extratumoral_counts(
@@ -268,33 +300,94 @@ def haldane_anscombe_coordinates(
     return np.log((successes + correction) / (totals - successes + correction))
 
 
+def haldane_to_fraction(
+    coordinates: np.ndarray,
+    denominators: np.ndarray,
+    correction: float,
+) -> np.ndarray:
+    """Invert Haldane-Anscombe log odds to a fraction of a known denominator.
+
+    With ``q = sigmoid(u) = (k + c) / (n + 2c)``, the count is
+    ``k = (n + 2c) q - c``. Positive counts are restricted to ``[1, n]``: mass
+    above ``n`` is the censored full-coverage region, and mass below one count
+    is outside the positive branch's support.
+
+    Args:
+        coordinates (np.ndarray): Unstandardized log-odds values.
+        denominators (np.ndarray): Denominators ``n`` broadcastable to coordinates;
+            NaN or values below one yield NaN.
+        correction (float): Haldane-Anscombe pseudocount ``c``.
+
+    Returns:
+        np.ndarray: Positive-branch fractions ``k / n`` in ``[1/n, 1]``.
+    """
+
+    values = np.asarray(coordinates, dtype=np.float64)
+    totals = np.asarray(denominators, dtype=np.float64)
+    valid = np.isfinite(totals) & (totals >= 1.0)
+    safe_totals = np.where(valid, totals, 1.0)
+    probabilities = 0.5 * (1.0 + np.tanh(0.5 * values))
+    counts = (safe_totals + 2.0 * correction) * probabilities - correction
+    fractions = np.clip(counts, 1.0, safe_totals) / safe_totals
+    return np.where(valid, fractions, np.nan)
+
+
 def build_target_arrays(
     densities: np.ndarray,
     total_count: int = 36_100,
     correction: float = 0.5,
+    allow_missing_rows: bool = False,
 ) -> TargetArrays:
-    """Build counts, denominators, positive masks, and log-odds coordinates.
+    """Build counts, denominators, masks, and log-odds coordinates.
+
+    Non-tumor targets use the fixed denominator ``E = N - k_T``. Counts at or
+    above ``E`` are clipped to ``E`` for their coordinate, which is then the
+    censoring boundary ``log((E + c) / c)``, and flagged in ``censored_mask``.
 
     Args:
         densities (np.ndarray): Bounded densities ordered according to ``TARGET_COLUMNS``.
         total_count (int): Pixel count ``N`` represented by a unit density.
         correction (float): Haldane-Anscombe pseudocount.
+        allow_missing_rows (bool): Whether rows with any non-finite density are
+            kept as unavailable instead of rejected. Unavailable rows have NaN
+            densities and coordinates, ``-1`` counts and denominators, and false
+            positive and censored masks.
 
     Returns:
         TargetArrays: Complete immutable collection of derived target arrays.
     """
 
     density_values = np.asarray(densities, dtype=np.float32)
-    counts = density_to_counts(density_values, total_count)
+    if density_values.ndim != 2:
+        raise ValueError("densities must be a 2D array.")
+    available = np.isfinite(density_values).all(axis=1)
+    if not allow_missing_rows and not available.all():
+        raise ValueError("Density targets contain non-finite values.")
+    filled = np.where(available[:, None], density_values, 0.0).astype(np.float32)
+    counts = density_to_counts(filled, total_count)
     residual = extratumoral_counts(counts, total_count)
     denominators = target_denominators(counts, total_count)
     positive_mask = counts > 0
-    coordinates = haldane_anscombe_coordinates(counts, denominators, correction)
+    censored_mask = censored_target_mask(counts, total_count)
+    coordinates = haldane_anscombe_coordinates(
+        np.minimum(counts, denominators), denominators, correction
+    )
+    if not available.all():
+        missing = ~available
+        filled[missing] = np.nan
+        counts[missing] = -1
+        residual[missing] = -1
+        denominators[missing] = -1
+        positive_mask[missing] = False
+        censored_mask[missing] = False
+        coordinates[missing] = np.nan
     return TargetArrays(
-        densities=density_values,
+        densities=filled,
         counts=counts,
         extratumoral_counts=residual,
         denominators=denominators,
         positive_mask=positive_mask,
+        censored_mask=censored_mask,
+        available_mask=available,
         coordinates=coordinates,
     )

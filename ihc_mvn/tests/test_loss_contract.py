@@ -6,11 +6,13 @@ import itertools
 
 import numpy as np
 import torch
-from scipy.stats import multivariate_normal
+from scipy.stats import multivariate_normal, norm
 
 from ihc_mvn.losses import (
     MVNHurdleLoss,
+    censored_mvn_nll,
     conditional_gaussian_cd8,
+    conditional_gaussian_moments,
     masked_mvn_nll,
 )
 from ihc_mvn.model import GlobalCorrelation
@@ -170,3 +172,143 @@ def test_conditional_cd8_matches_block_gaussian_formula_and_z_score() -> None:
         (coordinates[1, 3] - means[1, 3]) / np.sqrt(covariance[3, 3]),
     )
     assert output.conditioning_count.tolist() == [3, 0]
+
+
+def _test_covariance() -> np.ndarray:
+    """Return a fixed positive-definite four-target covariance.
+
+    Args:
+        None.
+
+    Returns:
+        np.ndarray: Covariance matrix with shape ``[4, 4]``.
+    """
+
+    return np.asarray(
+        [
+            [1.4, 0.2, -0.1, 0.3],
+            [0.2, 1.1, 0.15, -0.2],
+            [-0.1, 0.15, 0.9, 0.25],
+            [0.3, -0.2, 0.25, 1.6],
+        ],
+        dtype=np.float64,
+    )
+
+
+def test_conditional_moments_match_block_formula_for_every_coordinate() -> None:
+    """Compare all-coordinate conditional moments with explicit block algebra.
+
+    Args:
+        None.
+
+    Returns:
+        None: Moments of every unobserved coordinate match NumPy.
+    """
+
+    covariance = _test_covariance()
+    means = np.asarray([0.1, -0.2, 0.3, 0.4])
+    values = np.asarray([0.7, -0.5, 1.2, 1.5])
+    for mask in itertools.product((False, True), repeat=4):
+        observed = np.asarray(mask)
+        mean, variance = conditional_gaussian_moments(
+            torch.from_numpy(values[None]),
+            torch.from_numpy(means[None]),
+            torch.from_numpy(covariance[None]),
+            torch.from_numpy(observed[None]),
+        )
+        for target in np.flatnonzero(~observed):
+            if observed.any():
+                cross = covariance[target, observed]
+                block = covariance[np.ix_(observed, observed)]
+                expected_mean = means[target] + cross @ np.linalg.solve(
+                    block, values[observed] - means[observed]
+                )
+                expected_variance = covariance[target, target] - cross @ np.linalg.solve(
+                    block, cross
+                )
+            else:
+                expected_mean = means[target]
+                expected_variance = covariance[target, target]
+            np.testing.assert_allclose(
+                mean[0, target].item(), expected_mean, atol=1.0e-12
+            )
+            np.testing.assert_allclose(
+                variance[0, target].item(), expected_variance, atol=1.0e-12
+            )
+
+
+def test_censored_mvn_nll_adds_conditional_log_survival() -> None:
+    """Match the censored objective with SciPy for one censored coordinate.
+
+    Args:
+        None.
+
+    Returns:
+        None: Censored, uncensored, and gradient behavior are asserted.
+    """
+
+    covariance = _test_covariance()
+    scales = np.sqrt(np.diag(covariance))
+    correlation = covariance / np.outer(scales, scales)
+    means = np.asarray([[0.1, -0.2, 0.3, 0.4]])
+    values = np.asarray([[0.7, -0.5, 2.5, 1.5]])
+    observed = np.asarray([[True, False, False, True]])
+    censored = np.asarray([[False, False, True, False]])
+    means_tensor = torch.tensor(means, requires_grad=True)
+    nll = censored_mvn_nll(
+        torch.from_numpy(values),
+        means_tensor,
+        torch.from_numpy(scales[None]),
+        torch.from_numpy(correlation),
+        torch.from_numpy(observed),
+        torch.from_numpy(censored),
+    )
+
+    kept = observed[0]
+    marginal = multivariate_normal(
+        mean=means[0, kept], cov=covariance[np.ix_(kept, kept)]
+    ).logpdf(values[0, kept])
+    cross = covariance[2, kept]
+    block = covariance[np.ix_(kept, kept)]
+    conditional_mean = means[0, 2] + cross @ np.linalg.solve(
+        block, values[0, kept] - means[0, kept]
+    )
+    conditional_sd = np.sqrt(covariance[2, 2] - cross @ np.linalg.solve(block, cross))
+    expected = -marginal - norm.logsf(values[0, 2], conditional_mean, conditional_sd)
+    np.testing.assert_allclose(nll.item(), expected)
+    nll.sum().backward()
+    assert torch.isfinite(means_tensor.grad).all()
+    np.testing.assert_allclose(
+        censored_mvn_nll(
+            torch.from_numpy(values),
+            torch.from_numpy(means),
+            torch.from_numpy(scales[None]),
+            torch.from_numpy(correlation),
+            torch.from_numpy(observed),
+            torch.zeros_like(torch.from_numpy(censored)),
+        ).item(),
+        -marginal,
+    )
+
+
+def test_conditional_cd8_target_mask_removes_zero_and_censored_scores() -> None:
+    """Return NaN excess where CD8 is not an exact positive observation.
+
+    Args:
+        None.
+
+    Returns:
+        None: Masked rows are NaN while moments stay defined.
+    """
+
+    covariance = np.repeat(_test_covariance()[None], 2, axis=0)
+    output = conditional_gaussian_cd8(
+        torch.zeros(2, 4, dtype=torch.float64),
+        torch.zeros(2, 4, dtype=torch.float64),
+        covariance=torch.from_numpy(covariance),
+        conditioning_mask=torch.zeros(2, 4, dtype=torch.bool),
+        target_mask=torch.tensor([True, False]),
+    )
+    assert torch.isfinite(output.excess[0])
+    assert torch.isnan(output.excess[1])
+    assert torch.isfinite(output.conditional_mean).all()

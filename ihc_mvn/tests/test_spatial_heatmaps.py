@@ -58,9 +58,10 @@ def tumor_prediction_frame() -> pd.DataFrame:
             "haldane_mean_msi_Density_Tumor": [-1.0, -0.5, 0.0, 0.5],
             "haldane_mean_patient_Density_Tumor": [-0.8, -0.3, 0.2, 0.7],
             "haldane_mean_total_Density_Tumor": [-0.6, -0.1, 0.4, 0.9],
-            "positive_median_density_Density_Tumor": [0.35, 0.48, 0.60, 0.71],
-            "q05_density_Density_Tumor": [0.1, 0.2, 0.3, 0.4],
-            "q95_density_Density_Tumor": [0.6, 0.7, 0.8, 0.9],
+            "positive_q05_fraction_Density_Tumor": [0.1, 0.2, 0.3, 0.4],
+            "positive_q95_fraction_Density_Tumor": [0.6, 0.7, 0.8, 0.9],
+            "expected_fraction_Density_Tumor": [0.2, 0.3, 0.4, 0.5],
+            "quantile_residual_Density_Tumor": [-1.0, 0.0, 0.5, 1.0],
         }
     )
     return frame
@@ -119,6 +120,12 @@ def test_spatial_derived_columns_and_plot(tmp_path: Path) -> None:
     assert "interval_width_Density_Tumor" in created
     assert "observed_haldane_Density_Tumor" in created
     assert np.allclose(adata.obs["interval_width_Density_Tumor"], 0.5)
+    np.testing.assert_allclose(
+        adata.obs["positive_median_total_Density_Tumor"].to_numpy(dtype=np.float64),
+        (36_101.0 / (1.0 + np.exp(-np.asarray([-0.6, -0.1, 0.4, 0.9]))) - 0.5)
+        / 36_100.0,
+        rtol=1.0e-6,
+    )
     padded = np.zeros((4, len(TARGET_COLUMNS)), dtype=np.float32)
     padded[:, 0] = adata.obs["Density_Tumor"].to_numpy(dtype=np.float32)
     expected_haldane = build_target_arrays(padded).coordinates[:, 0]

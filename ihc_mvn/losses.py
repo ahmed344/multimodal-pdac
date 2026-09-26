@@ -1,4 +1,4 @@
-"""Factorized hurdle and exactly masked multivariate Gaussian losses."""
+"""Factorized hurdle and masked, right-censored multivariate Gaussian losses."""
 
 from __future__ import annotations
 
@@ -176,6 +176,124 @@ def masked_mvn_nll(
     )
 
 
+def _padded_covariance(
+    covariance: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Replace excluded rows and columns of a covariance with identity blocks.
+
+    Args:
+        covariance (torch.Tensor): Row-wise covariance ``[B, T, T]``.
+        mask (torch.Tensor): Boolean included-coordinate mask ``[B, T]``.
+
+    Returns:
+        torch.Tensor: Positive-definite padded covariance ``[B, T, T]``.
+    """
+
+    pair_mask = mask.unsqueeze(-1) & mask.unsqueeze(-2)
+    identity = torch.eye(
+        covariance.shape[-1],
+        dtype=covariance.dtype,
+        device=covariance.device,
+    ).unsqueeze(0)
+    return torch.where(pair_mask, covariance, identity)
+
+
+def conditional_gaussian_moments(
+    values: torch.Tensor,
+    means: torch.Tensor,
+    covariance: torch.Tensor,
+    observed_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Condition every coordinate on the observed coordinates of its row.
+
+    For coordinate ``j`` and observed set ``O``, this returns
+    ``mu_j + S_jO S_OO^-1 (x_O - mu_O)`` and ``S_jj - S_jO S_OO^-1 S_Oj``.
+    Rows without observed coordinates return their marginal moments. Moments of
+    observed coordinates are returned too but are degenerate (variance ~0).
+
+    Args:
+        values (torch.Tensor): Coordinates ``[B, T]``; only observed entries are read.
+        means (torch.Tensor): Joint Gaussian means ``[B, T]``.
+        covariance (torch.Tensor): Row-wise covariance ``[B, T, T]``.
+        observed_mask (torch.Tensor): Boolean conditioning mask ``[B, T]``.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: Conditional means and variances ``[B, T]``.
+    """
+
+    residual = torch.where(observed_mask, values - means, torch.zeros_like(values))
+    cholesky = torch.linalg.cholesky(_padded_covariance(covariance, observed_mask))
+    cross = torch.where(
+        observed_mask.unsqueeze(-2),
+        covariance,
+        torch.zeros_like(covariance),
+    )
+    solved_residual = torch.cholesky_solve(residual.unsqueeze(-1), cholesky).squeeze(-1)
+    conditional_mean = means + (cross * solved_residual.unsqueeze(-2)).sum(dim=-1)
+    solved_cross = torch.cholesky_solve(cross.transpose(-1, -2), cholesky)
+    reduction = (cross * solved_cross.transpose(-1, -2)).sum(dim=-1)
+    conditional_variance = (
+        covariance.diagonal(dim1=-2, dim2=-1) - reduction
+    ).clamp_min(torch.finfo(covariance.dtype).eps)
+    return conditional_mean, conditional_variance
+
+
+def censored_mvn_nll(
+    values: torch.Tensor,
+    means: torch.Tensor,
+    scales: torch.Tensor,
+    correlation: torch.Tensor,
+    observed_mask: torch.Tensor,
+    censored_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Masked MVN NLL plus right-censored coordinates at their boundaries.
+
+    Exactly observed coordinates contribute their marginal multivariate normal
+    density. Each censored coordinate ``j`` holds its boundary ``b_j`` in
+    ``values`` and contributes ``-log P(Y_j >= b_j | Y_O)``. A row with several
+    censored coordinates uses the product of their univariate conditional
+    survival probabilities, a composite approximation to the joint orthant
+    probability that is exact when at most one coordinate is censored.
+
+    Args:
+        values (torch.Tensor): Standardized coordinates ``[B, T]``.
+        means (torch.Tensor): Gaussian means ``[B, T]``.
+        scales (torch.Tensor): Strictly positive marginal scales ``[B, T]``.
+        correlation (torch.Tensor): Shared correlation matrix ``[T, T]``.
+        observed_mask (torch.Tensor): Boolean exactly observed mask ``[B, T]``.
+        censored_mask (torch.Tensor): Boolean right-censored mask ``[B, T]``.
+
+    Returns:
+        torch.Tensor: Per-row NLL, shape ``[B]``.
+    """
+
+    if censored_mask.shape != observed_mask.shape or censored_mask.dtype != torch.bool:
+        raise ValueError("censored_mask must be boolean and match observed_mask.")
+    if torch.any(censored_mask & observed_mask):
+        raise ValueError("A coordinate cannot be both observed and censored.")
+    nll = masked_mvn_nll(values, means, scales, correlation, observed_mask)
+    if not bool(censored_mask.any()):
+        return nll
+    if not torch.isfinite(values[censored_mask]).all():
+        raise ValueError("Censoring boundaries must be finite.")
+    covariance = (
+        scales.unsqueeze(-1)
+        * correlation.unsqueeze(0)
+        * scales.unsqueeze(-2)
+    )
+    conditional_mean, conditional_variance = conditional_gaussian_moments(
+        values, means, covariance, observed_mask
+    )
+    standardized_boundary = (values - conditional_mean) / torch.sqrt(
+        conditional_variance
+    )
+    log_survival = torch.special.log_ndtr(-standardized_boundary)
+    return nll - torch.where(
+        censored_mask, log_survival, torch.zeros_like(log_survival)
+    ).sum(dim=-1)
+
+
 class MVNHurdleLoss(nn.Module):
     """Presence BCE plus exact masked multivariate Gaussian NLL."""
 
@@ -278,6 +396,7 @@ class MVNHurdleLoss(nn.Module):
         standardized_targets: torch.Tensor | None = None,
         prior_nll: torch.Tensor | float | None = None,
         normalized_prior: torch.Tensor | float | None = None,
+        censored_mask: torch.Tensor | None = None,
     ) -> MVNHurdleLossOutput:
         """Evaluate factorized presence and masked MVN positive branches.
 
@@ -296,6 +415,9 @@ class MVNHurdleLoss(nn.Module):
                 ``model.prior_nll()``.
             normalized_prior (torch.Tensor | float | None): Scalar prior already
                 divided by the configured training sample count.
+            censored_mask (torch.Tensor | None): Boolean ``[B, T]`` mask of
+                positive targets right-censored at the coordinate held in
+                ``standardized_targets``. ``None`` means nothing is censored.
 
         Returns:
             MVNHurdleLossOutput: Mean-per-pixel loss components and counts.
@@ -328,12 +450,19 @@ class MVNHurdleLoss(nn.Module):
             reduction="none",
         )
         hurdle = hurdle_per_target.sum(dim=-1).mean()
-        positive_per_pixel = masked_mvn_nll(
+        if censored_mask is None:
+            censored_mask = torch.zeros_like(positive_mask)
+        if censored_mask.shape != positive_mask.shape or censored_mask.dtype != torch.bool:
+            raise ValueError("censored_mask must be boolean with shape [B, T].")
+        if torch.any(censored_mask & ~positive_mask):
+            raise ValueError("Only positive targets can be censored.")
+        positive_per_pixel = censored_mvn_nll(
             gaussian_targets,
             means,
             scales,
             correlation,
-            positive_mask,
+            positive_mask & ~censored_mask,
+            censored_mask,
         )
         positive = positive_per_pixel.mean()
         prior = self._prior_component(
@@ -370,6 +499,7 @@ def conditional_gaussian_cd8(
     scales: torch.Tensor | None = None,
     correlation: torch.Tensor | None = None,
     conditioning_mask: torch.Tensor | None = None,
+    target_mask: torch.Tensor | None = None,
     target_index: int = 3,
 ) -> ConditionalGaussianOutput:
     """Condition one coordinate (CD8 by default) on the other three.
@@ -385,7 +515,12 @@ def conditional_gaussian_cd8(
         scales (torch.Tensor | None): Marginal scales ``[B, 4]`` used with correlation.
         correlation (torch.Tensor | None): Shared correlation ``[4, 4]``.
         conditioning_mask (torch.Tensor | None): Available-coordinate mask with
-            shape ``[B, 3]`` or ``[B, 4]``.
+            shape ``[B, 3]`` or ``[B, 4]``. Pass the exactly observed positive
+            mask: finite coordinates of zero-count targets are not Gaussian
+            observations and must not be conditioned on.
+        target_mask (torch.Tensor | None): Boolean ``[B]`` mask of rows whose
+            CD8 coordinate is an exact positive observation. The excess is NaN
+            elsewhere; ``None`` scores every finite CD8 coordinate.
         target_index (int): Index of the CD8 coordinate to predict.
 
     Returns:
@@ -483,8 +618,13 @@ def conditional_gaussian_cd8(
         torch.finfo(conditional_variance.dtype).eps
     )
     observed_target = coordinates[:, target_index]
+    scored = torch.isfinite(observed_target)
+    if target_mask is not None:
+        if target_mask.shape != observed_target.shape or target_mask.dtype != torch.bool:
+            raise ValueError("target_mask must be boolean with shape [B].")
+        scored = scored & target_mask
     excess = torch.where(
-        torch.isfinite(observed_target),
+        scored,
         (observed_target - conditional_mean) / torch.sqrt(conditional_variance),
         torch.full_like(observed_target, torch.nan),
     )
@@ -506,6 +646,8 @@ __all__ = [
     "MVNHurdleLoss",
     "MVNHurdleLossOutput",
     "MultivariateHurdleLoss",
+    "censored_mvn_nll",
     "conditional_gaussian_cd8",
+    "conditional_gaussian_moments",
     "masked_mvn_nll",
 ]

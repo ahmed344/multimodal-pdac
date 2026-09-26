@@ -13,10 +13,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy.special import expit
 
 from .config import load_config
-from .targets import TARGET_COLUMNS, build_target_arrays
+from .targets import TARGET_COLUMNS, build_target_arrays, haldane_to_fraction
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -201,7 +200,10 @@ def add_spatial_derived_columns(
     total_count: int = 36_100,
     correction: float = 0.5,
 ) -> list[str]:
-    """Create density summaries, uncertainty widths, and optional residuals.
+    """Create positive-fraction medians and interval widths.
+
+    Fractions are of the whole pixel for tumor and of the observed non-tumor
+    count (the exported ``nontumor_count``) for the other targets.
 
     Args:
         adata (ad.AnnData): AnnData with attached inference columns.
@@ -216,41 +218,41 @@ def add_spatial_derived_columns(
     created = _observed_haldane_from_obs(
         adata, targets, total_count=total_count, correction=correction
     )
+    nontumor = (
+        adata.obs["nontumor_count"].to_numpy(dtype=np.float64)
+        if "nontumor_count" in adata.obs
+        else np.full(adata.n_obs, np.nan)
+    )
     for target in targets:
         required = (
             f"haldane_mean_msi_{target}",
             f"haldane_mean_patient_{target}",
             f"haldane_mean_total_{target}",
-            f"q05_density_{target}",
-            f"q95_density_{target}",
-            f"positive_median_density_{target}",
+            f"positive_q05_fraction_{target}",
+            f"positive_q95_fraction_{target}",
         )
         missing = [column for column in required if column not in adata.obs]
         if missing:
             raise KeyError(f"Missing prediction columns for {target!r}: {missing}")
+        denominator = (
+            np.full(adata.n_obs, float(total_count))
+            if target == TARGET_COLUMNS[0]
+            else nontumor
+        )
         for layer in ("msi", "patient", "total"):
             column = f"positive_median_{layer}_{target}"
-            adata.obs[column] = expit(
-                adata.obs[f"haldane_mean_{layer}_{target}"].to_numpy(dtype=np.float64)
+            adata.obs[column] = haldane_to_fraction(
+                adata.obs[f"haldane_mean_{layer}_{target}"].to_numpy(dtype=np.float64),
+                denominator,
+                correction,
             ).astype(np.float32)
             created.append(column)
         width_column = f"interval_width_{target}"
         adata.obs[width_column] = (
-            adata.obs[f"q95_density_{target}"].to_numpy(dtype=np.float64)
-            - adata.obs[f"q05_density_{target}"].to_numpy(dtype=np.float64)
+            adata.obs[f"positive_q95_fraction_{target}"].to_numpy(dtype=np.float64)
+            - adata.obs[f"positive_q05_fraction_{target}"].to_numpy(dtype=np.float64)
         ).astype(np.float32)
         created.append(width_column)
-        if target in adata.obs:
-            residual_column = f"density_residual_{target}"
-            residual = (
-                adata.obs[f"positive_median_density_{target}"].to_numpy(
-                    dtype=np.float64
-                )
-                - adata.obs[target].to_numpy(dtype=np.float64)
-            )
-            residual[adata.obs[target].to_numpy(dtype=np.float64) <= 0.0] = np.nan
-            adata.obs[residual_column] = residual.astype(np.float32)
-            created.append(residual_column)
     return created
 
 
@@ -425,11 +427,20 @@ def plot_target_spatial_heatmap(
             ),
         )
     )
-    if f"density_residual_{target}" in adata.obs:
+    if f"expected_fraction_{target}" in adata.obs:
         panels.append(
             (
-                f"density_residual_{target}",
-                "Median minus observed",
+                f"expected_fraction_{target}",
+                "Expected fraction incl. zeros",
+                str(config["cmap"]),
+                False,
+            )
+        )
+    if f"quantile_residual_{target}" in adata.obs:
+        panels.append(
+            (
+                f"quantile_residual_{target}",
+                "Hurdle quantile residual",
                 str(config["residual_cmap"]),
                 True,
             )

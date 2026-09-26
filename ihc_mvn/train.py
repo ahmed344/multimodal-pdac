@@ -211,6 +211,10 @@ def _update_fit_statistics(
     means = predictions["mean_total"]
     targets = batch["targets"]
     positive_mask = batch["target_densities"] > 0.0
+    censored_mask = batch.get("target_censored_mask")
+    observed_mask = (
+        positive_mask if censored_mask is None else positive_mask & ~censored_mask
+    )
     predicted_positive = logits >= 0.0
     negative_mask = ~positive_mask
 
@@ -219,15 +223,15 @@ def _update_fit_statistics(
         "presence_true_negative": ((~predicted_positive) & negative_mask).sum(dim=0),
         "presence_positive": positive_mask.sum(dim=0),
         "presence_negative": negative_mask.sum(dim=0),
-        "positive_count": positive_mask.sum(dim=0),
+        "positive_count": observed_mask.sum(dim=0),
         "positive_target_sum": torch.where(
-            positive_mask, targets, torch.zeros_like(targets)
+            observed_mask, targets, torch.zeros_like(targets)
         ).sum(dim=0),
         "positive_target_sum_squares": torch.where(
-            positive_mask, targets.square(), torch.zeros_like(targets)
+            observed_mask, targets.square(), torch.zeros_like(targets)
         ).sum(dim=0),
         "positive_residual_sum_squares": torch.where(
-            positive_mask, (means - targets).square(), torch.zeros_like(targets)
+            observed_mask, (means - targets).square(), torch.zeros_like(targets)
         ).sum(dim=0),
     }
     for key, value in updates.items():
@@ -380,6 +384,7 @@ def run_epoch(
                 targets=batch["target_densities"],
                 standardized_targets=batch["targets"],
                 prior_nll=model.prior_nll(),
+                censored_mask=batch["target_censored_mask"],
             )
             components = (loss.total, loss.hurdle, loss.positive, loss.prior)
             if not all(torch.isfinite(component).all() for component in components):
