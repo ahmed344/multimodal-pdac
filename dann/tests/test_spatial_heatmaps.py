@@ -225,7 +225,7 @@ def test_plot_density_heatmap_requires_sigma_column(tmp_path: Path) -> None:
         )
 
 
-def test_plot_density_heatmap_writes_five_columns(
+def test_plot_density_heatmap_writes_six_columns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -236,7 +236,7 @@ def test_plot_density_heatmap_writes_five_columns(
         monkeypatch (pytest.MonkeyPatch): Fixture used to isolate Scanpy rendering.
 
     Returns:
-        None: Assertions inspect the five primary subplot titles.
+        None: Assertions inspect the six primary subplot titles.
     """
 
     density = "Density_CD8"
@@ -248,6 +248,7 @@ def test_plot_density_heatmap_writes_five_columns(
     adata.obs["mu_Density_CD8"] = np.arange(4, dtype=np.float32)
     adata.obs["prob_of_presence_Density_CD8"] = np.full(4, 0.75, dtype=np.float32)
     adata.obs["sigma_Density_CD8"] = np.ones(4, dtype=np.float32)
+    adata.obs["density_mean_Density_CD8"] = [0., .2, .4, .6]
     adata.obs["batch"] = ["batch-a"] * 4
     adata.obs["x"] = [0, 1, 0, 1]
     adata.obs["y"] = [0, 0, 1, 1]
@@ -265,9 +266,15 @@ def test_plot_density_heatmap_writes_five_columns(
     )
 
     figure = captured[0]
-    titles = [axis.get_title() for axis in figure.axes[:5]]
-    assert titles[4] == "HES"
-    assert figure.get_size_inches()[0] == pytest.approx(30.0)
+    titles = [axis.get_title() for axis in figure.axes[:6]]
+    assert titles[4] == "logit(sampled mean density): Density_CD8"
+    assert titles[5] == "HES"
+    mean_image = figure.axes[4].images[0]
+    np.testing.assert_array_equal(np.ma.getmaskarray(mean_image.get_array()), [[True, False], [False, False]])
+    expected = np.log(np.array([.2, .4, .6]) / np.array([.8, .6, .4]))
+    np.testing.assert_allclose(mean_image.get_array().compressed(), expected, rtol=1e-6)
+    np.testing.assert_allclose(mean_image.get_clim(), [expected.min(), expected.max()])
+    assert figure.get_size_inches()[0] == pytest.approx(36.0)
     original_close(figure)
 
 
@@ -338,7 +345,7 @@ def test_plot_diagnostics_density_heatmap_titles_and_residual_panel(
         monkeypatch (pytest.MonkeyPatch): Fixture used to isolate Scanpy rendering.
 
     Returns:
-        None: Assertions inspect the five primary subplot titles.
+        None: Assertions inspect the six primary subplot titles.
     """
 
     density = "Density_CD8"
@@ -418,7 +425,7 @@ def test_heatmaps_preserve_grid_with_masked_zeros(tmp_path, monkeypatch, values,
     """Masking zeros must neither shrink the tissue grid nor fail on empty signal."""
     density = "Density_CD8"
     adata = _tiny_adata(["0", "1", "2", "3"], {density: np.asarray(values)})
-    for prefix in ("logit_", "mu_", "prob_of_presence_", "sigma_", "logit_mean_", "residual_", "interval_width_"):
+    for prefix in ("logit_", "mu_", "prob_of_presence_", "sigma_", "density_mean_", "logit_mean_", "residual_", "interval_width_"):
         adata.obs[prefix + density] = np.ones(4)
     adata.obs["batch"] = ["a"] * 4
     adata.obs["x"] = [0, 1, 0, 1]
@@ -453,3 +460,30 @@ def test_hes_bounds_match_full_scanpy_image_limits() -> None:
     assert len(axes[1].collections[0].get_paths()) == 2
     assert axes[1].collections[0].get_facecolors()[0, 3] == 0.
     plt.close(figure)
+
+
+@pytest.mark.parametrize("means", [[0., .2, 1.], [0., 0., 0.]])
+def test_mean_heatmap_masks_own_zeros_and_preserves_grid(tmp_path, monkeypatch, means) -> None:
+    density = "Density_CD8"
+    adata = _tiny_adata(["0", "1", "2"], {density: np.zeros(3)})
+    for prefix in ("logit_", "mu_", "prob_of_presence_", "sigma_"):
+        adata.obs[prefix + density] = np.ones(3)
+    adata.obs["density_mean_" + density] = means
+    adata.obs["batch"] = ["a"] * 3
+    adata.obs["x"] = [0, 1, 0]
+    adata.obs["y"] = [0, 0, 1]
+    captured = []
+    original_close = plt.close
+    monkeypatch.setattr(plt, "close", captured.append)
+    monkeypatch.setattr(spatial_heatmaps.sc.pl, "spatial", Mock(return_value=None))
+    plot_density_heatmap(adata, density, ["a"], tmp_path / "means.png", dpi=20, logit_epsilon=1e-3)
+    image = captured[0].axes[4].images[0].get_array()
+    expected_mask = np.r_[np.asarray(means) == 0., True].reshape(2, 2)
+    np.testing.assert_array_equal(np.ma.getmaskarray(image), expected_mask)
+    positive = np.asarray(means)[np.asarray(means) > 0]
+    clipped = np.clip(positive, 1e-3, 1 - 1e-3)
+    np.testing.assert_allclose(image.compressed(), np.log(clipped / (1 - clipped)), rtol=1e-6)
+    original_close(captured[0])
+    del adata.obs["density_mean_" + density]
+    with pytest.raises(KeyError, match="rerun python -m dann.spatial"):
+        plot_density_heatmap(adata, density, ["a"], tmp_path / "old.png", dpi=20)

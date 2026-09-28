@@ -1,3 +1,11 @@
+latent_variance:
+  input: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled_tissue.h5ad  # Exact AnnData used for spatial inference; only observation metadata is read.
+  latents: /workspaces/multimodal-pdac/data/PDAC/Results/dann/analysis/spatial/spatial_latent.parquet  # Required existing inference export.
+  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/dann/latent_variance  # Standalone variance tables and figure.
+  slide_column: batch  # Observation field defining slides.
+  chunk_size: 8192  # Latent rows read at once; covariance is accumulated in float64.
+  figure_dpi: 300  # Resolution of the explained-variance PNG.
+
 data:
   path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled.h5ad  # Input AnnData file.
   matrix_key: X  # Sparse MSI source: X or layers/<layer_name>.
@@ -67,6 +75,8 @@ training:
   smoke_num_workers: 0  # Worker count used by --smoke-test for portability.
 
 analysis:
+  density_mc_samples: 1000  # Full hurdle draws per pixel/target; retain only their density-scale mean.
+  density_mc_seed: 20260719  # Isolated Monte Carlo seed (nonnegative integer).
   checkpoint: null  # Checkpoint to analyze; null selects training.output_dir/best.pt.
   split: test  # Data split used for latent and prediction plots.
   ziln_scatter_split: validation  # Held-out split used for the ZILN density validation scatter.

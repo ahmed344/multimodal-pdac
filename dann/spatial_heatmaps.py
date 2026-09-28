@@ -206,6 +206,7 @@ def plot_density_heatmap(
     *,
     batch_column: str = "batch",
     dpi: int = 300,
+    logit_epsilon: float = 1e-4,
 ) -> Path:
     """Write one per-batch spatial heatmap figure for a density target.
 
@@ -216,6 +217,7 @@ def plot_density_heatmap(
         output_path (Path): Destination PNG path.
         batch_column (str): Observation column holding batch labels.
         dpi (int): Saved figure resolution.
+        logit_epsilon (float): Same boundary clamp used for observed densities.
 
     Returns:
         Path: Written PNG path.
@@ -227,21 +229,30 @@ def plot_density_heatmap(
         f"mu_{density}",
         f"prob_of_presence_{density}",
         f"sigma_{density}",
+        f"density_mean_{density}",
         batch_column,
         "x",
         "y",
     )
     missing = [name for name in required if name not in adata.obs.columns]
+    if f"density_mean_{density}" in missing:
+        raise KeyError(
+            f"Missing density_mean_{density}; rerun python -m dann.spatial "
+            "with your input/checkpoint paths and --overwrite to regenerate predictions. "
+            f"Missing columns: {missing}"
+        )
     if missing:
         raise KeyError(f"Missing required obs columns for {density!r}: {missing}")
     if not batches:
         raise ValueError("At least one batch is required to plot heatmaps.")
 
+    mean_column = f"density_mean_{density}"
+    mean_logit_column = add_logit_columns(adata, [mean_column], logit_epsilon)[0]
     n_batches = len(batches)
     fig, axes = plt.subplots(
-        figsize=(30, 4 * n_batches),
+        figsize=(36, 4 * n_batches),
         nrows=n_batches,
-        ncols=5,
+        ncols=6,
         tight_layout=True,
         squeeze=False,
     )
@@ -279,13 +290,21 @@ def plot_density_heatmap(
         im3 = axes[i, 3].imshow(heatmap_data, cmap="jet", origin="upper")
         fig.colorbar(im3, ax=axes[i, 3])
 
-        _plot_hes_context(adata, batch_mask, batch, axes[i, 4])
+        heatmap_data = _positive_spatial_grid(
+            adata.obs.loc[batch_mask], mean_column, mean_logit_column
+        )
+        im4 = axes[i, 4].imshow(
+            heatmap_data, cmap="jet", origin="upper",
+        )
+        fig.colorbar(im4, ax=axes[i, 4])
+        _plot_hes_context(adata, batch_mask, batch, axes[i, 5])
 
     axes[0, 0].set_title(f"logit_{density}", fontsize=12)
     axes[0, 1].set_title(f"mu_{density}", fontsize=12)
     axes[0, 2].set_title(f"prob_of_presence_{density}", fontsize=12)
     axes[0, 3].set_title(f"sigma_{density}", fontsize=12)
-    axes[0, 4].set_title("HES", fontsize=12)
+    axes[0, 4].set_title(f"logit(sampled mean density): {density}", fontsize=12)
+    axes[0, 5].set_title("HES", fontsize=12)
 
     for ax in axes.flatten():
         ax.set_aspect("equal")
@@ -293,7 +312,7 @@ def plot_density_heatmap(
         ax.set_yticks([])
         ax.set_facecolor("gray")
 
-    for ax in axes[:, 4]:
+    for ax in axes[:, 5]:
         ax.invert_yaxis()
         ax.invert_xaxis()
 
@@ -532,6 +551,7 @@ def run_spatial_heatmaps(
             output_path,
             batch_column=batch_column,
             dpi=dpi,
+            logit_epsilon=logit_epsilon,
         )
         print(f"Wrote {output_path}", flush=True)
         diagnostics_path = output_dir / f"spatial_heatmap_diagnostics_{density}.png"

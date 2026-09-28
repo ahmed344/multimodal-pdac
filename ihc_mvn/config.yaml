@@ -80,12 +80,12 @@ model:
 
   # Sparse intensity-weighted Deep Sets encoder. Only active peaks are embedded;
   # per-peak features are mean pooled before the aggregation network.
-  embedding_dim: 128
-  peak_hidden_dims: [256, 256]
-  peak_output_dim: 256
-  aggregation_hidden_dims: [256]
-  latent_dim: 128
-  head_hidden_dims: [256, 128]
+  embedding_dim: 256
+  peak_hidden_dims: [512, 512]
+  peak_output_dim: 512
+  aggregation_hidden_dims: [512, 512]
+  latent_dim: 512
+  head_hidden_dims: [512, 256]
   activation: gelu
   dropout: 0.10
   use_layer_norm: true
@@ -132,7 +132,7 @@ training:
   beta1: 0.9
   beta2: 0.999
   gradient_clip_norm: 5.0
-  early_stopping_patience: 50
+  early_stopping_patience: 20
   early_stopping_min_delta: 0.0001
   resume_checkpoint: null
 

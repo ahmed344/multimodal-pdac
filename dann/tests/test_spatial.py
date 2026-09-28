@@ -301,3 +301,77 @@ def test_validate_output_rejects_unordered_quantiles(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="not ordered"):
         validate_output(output, tissue, TARGETS, expected_rows=2)
+
+
+@pytest.mark.parametrize("bad", [-.1, 1.1, np.nan])
+def test_validate_output_rejects_invalid_density_mean(tmp_path, bad) -> None:
+    tissue = _write_tiny_anndata(tmp_path / "tissue.h5ad", var_names=["mz_0"], obs_names=["a"])
+    table = build_output_table(
+        np.array([0]), np.array(["a"]), np.zeros((1, 4)),
+        np.zeros((1, 4)), np.ones((1, 4)), TARGETS,
+    )
+    name = f"density_mean_{TARGETS[0]}"
+    table = table.set_column(table.schema.get_field_index(name), table.schema.field(name), pa.array([bad], type=pa.float32()))
+    path = tmp_path / "bad.parquet"
+    pq.write_table(table, path)
+    with pytest.raises(ValueError, match="density_mean_"):
+        validate_output(path, tissue, TARGETS, expected_rows=1)
+
+
+def test_output_table_reuses_supplied_means() -> None:
+    means = np.arange(8, dtype=np.float32).reshape(2, 4) / 10
+    table = build_output_table(
+        np.array([0, 1]), np.array(["duplicate", "duplicate"]),
+        np.zeros((2, 4)), np.zeros((2, 4)), np.ones((2, 4)), TARGETS,
+        density_mean=means,
+    )
+    for index, target in enumerate(TARGETS):
+        np.testing.assert_array_equal(table[f"density_mean_{target}"].to_numpy(), means[:, index])
+
+
+def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch) -> None:
+    """Stream real CSR batches through inference and compare saved MC means."""
+    import torch
+    from dann import spatial
+
+    tissue = _write_tiny_anndata(
+        tmp_path / "tissue.h5ad", var_names=["mz_0", "mz_1"],
+        obs_names=["a", "a", "b"],
+    )
+    config = {
+        "data": {"path": str(tissue), "matrix_key": "X",
+                 "intensity_transform": "none", "nonzero_threshold": 0.},
+        "model": {"num_peaks": 2, "latent_dim": 2},
+        "analysis": {"batch_size": 2, "num_workers": 0},
+        "training": {"seed": 1, "pin_memory": False, "prefetch_factor": 2},
+    }
+
+    class FixedModel:
+        def encode(self, batch):
+            return torch.zeros((len(batch["peak_counts"]), 2))
+
+        def biology_predictor(self, latent):
+            shape = (len(latent), len(TARGETS))
+            return {"pi": torch.full(shape, .25), "mu": torch.zeros(shape),
+                    "sigma": torch.ones(shape)}
+
+    monkeypatch.setattr(spatial, "load_checkpoint_model", lambda *args: (
+        FixedModel(), config, TARGETS, torch.device("cpu"), 1,
+    ))
+    output = spatial.run_inference(
+        tissue, tmp_path / "legacy.pt", tmp_path / "predictions.parquet",
+        latent_output_path=tmp_path / "latent.parquet",
+        density_mc_samples=17, density_mc_seed=0,
+    )
+    table = pq.read_table(output)
+    rng = np.random.default_rng(0)
+    expected = np.concatenate([
+        ziln.sampled_density_mean(
+            np.full((size, 4), .25), np.zeros((size, 4)), np.ones((size, 4)),
+            num_samples=17, rng=rng,
+        ) for size in (2, 1)
+    ]).astype(np.float32)
+    for index, target in enumerate(TARGETS):
+        np.testing.assert_array_equal(table[f"density_mean_{target}"], expected[:, index])
+    assert table["obs_name"].to_pylist() == ["a", "a", "b"]
+    assert "density_mc_samples" not in config["analysis"]

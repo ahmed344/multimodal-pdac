@@ -195,3 +195,58 @@ def test_pit_rejects_zero_targets() -> None:
         ziln.positive_logit_pit(
             np.zeros(2), np.ones(2), np.asarray([0.0, 0.5]), 1e-6
         )
+
+
+def test_sampled_mean_matches_numerical_reference() -> None:
+    from scipy.integrate import quad
+    from scipy.special import expit
+    pi = np.array([0., .3, .8, 1.])
+    mu = np.array([-2., 0., 2., 1.])
+    sigma = np.array([.5, 1., 2., .1])
+    expected = np.array([
+        (1 - p) * quad(lambda z: expit(m + sd * z) * stats.norm.pdf(z), -12, 12)[0]
+        for p, m, sd in zip(pi, mu, sigma)
+    ])
+    actual = ziln.sampled_density_mean(pi, mu, sigma, num_samples=200000, rng=np.random.default_rng(42))
+    np.testing.assert_allclose(actual, expected, atol=.003, rtol=0)
+    assert actual[-1] == 0.
+
+
+def test_sampled_mean_reproducibility_broadcast_and_extremes() -> None:
+    kwargs = dict(pi=np.array([[0.], [1.]]), mu=np.array([-1000., 0., 1000.]), sigma=.5, num_samples=257)
+    a = ziln.sampled_density_mean(**kwargs, rng=np.random.default_rng(8))
+    b = ziln.sampled_density_mean(**kwargs, rng=np.random.default_rng(8))
+    np.testing.assert_array_equal(a, b)
+    assert a.shape == (2, 3)
+    assert np.isfinite(a).all() and np.all((a >= 0) & (a <= 1))
+    np.testing.assert_array_equal(a[1], 0.)
+    assert a[0, 0] == 0. and a[0, 2] == 1.
+    c = ziln.sampled_density_mean(**kwargs, rng=np.random.default_rng(9))
+    assert a[0, 1] != c[0, 1]
+    assert ziln.sampled_density_mean([], [], [], num_samples=1, rng=np.random.default_rng()).shape == (0,)
+
+
+@pytest.mark.parametrize("override", [
+    {"pi": -0.1}, {"pi": 1.1}, {"pi": np.nan}, {"mu": np.inf},
+    {"sigma": 0}, {"sigma": -1}, {"num_samples": 0},
+    {"num_samples": True}, {"num_samples": 1.5},
+])
+def test_sampled_mean_rejects_invalid_parameters(override) -> None:
+    kwargs = dict(pi=.2, mu=0., sigma=1., num_samples=10)
+    kwargs.update(override)
+    with pytest.raises(ValueError):
+        ziln.sampled_density_mean(**kwargs, rng=np.random.default_rng(0))
+
+
+def test_sampling_memory_is_bounded() -> None:
+    class CheckedGenerator:
+        def standard_normal(self, shape):
+            assert shape[0] <= 1024 and shape[1] <= 128
+            return np.zeros(shape)
+
+        def random(self, shape):
+            assert shape[0] <= 1024 and shape[1] <= 128
+            return np.full(shape, .5)
+
+    result = ziln.sampled_density_mean(np.zeros(2050), 0., 1., num_samples=259, rng=CheckedGenerator())
+    np.testing.assert_array_equal(result, .5)

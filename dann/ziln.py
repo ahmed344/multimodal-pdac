@@ -1,8 +1,8 @@
-"""Normal positive-branch summaries for the structural-zero logit-normal hurdle.
+"""Summaries and density sampling for the structural-zero logit-normal hurdle.
 
 The three parameters are the zero probability pi, logit mean mu, and logit
 standard deviation sigma. Logit summaries are conditional on the positive
-branch; exceedance probabilities include the hurdle.
+branch; exceedance probabilities and sampled density means include the hurdle.
 """
 
 from __future__ import annotations
@@ -11,9 +11,11 @@ from typing import Sequence
 
 import numpy as np
 from scipy import stats
+from scipy.special import expit
 
 
 __all__ = [
+    "sampled_density_mean",
     "clipped_logit",
     "exceedance_probability",
     "hurdle_logit_quantile",
@@ -266,3 +268,47 @@ def exceedance_probability(
     logit_threshold = float(clipped_logit(np.asarray([threshold]), epsilon)[0])
     survival = 1.0 - positive_logit_cdf(mu, sigma, logit_threshold)
     return (1.0 - zero_probability) * survival
+
+
+def sampled_density_mean(
+    pi: np.ndarray | Sequence[float],
+    mu: np.ndarray | Sequence[float],
+    sigma: np.ndarray | Sequence[float],
+    *,
+    num_samples: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Estimate the unconditional density mean using independent hurdle draws.
+
+    Each draw is zero with probability ``pi`` and otherwise is the sigmoid of
+    a normal draw with location ``mu`` and scale ``sigma``. Inputs broadcast;
+    the returned float64 array has that broadcast shape. Sampling uses only
+    the supplied generator and bounded blocks (at most 1024 cells x 128 draws),
+    accumulating sums in float64. Repeatability requires the same seed,
+    parameters, sample count, and processing order/batch boundaries.
+    """
+    if (
+        isinstance(num_samples, bool)
+        or not isinstance(num_samples, (int, np.integer))
+        or num_samples <= 0
+    ):
+        raise ValueError("num_samples must be a positive integer.")
+    zero, location, scale = np.broadcast_arrays(
+        _validate_probability(pi, "pi"), _as_float_array(mu, "mu"),
+        _validate_sigma(sigma),
+    )
+    output_shape = location.shape
+    result = np.zeros(location.size, dtype=np.float64)
+    zero, location, scale = zero.ravel(), location.ravel(), scale.ravel()
+    for start in range(0, result.size, 1024):
+        stop = min(start + 1024, result.size)
+        for draw_start in range(0, num_samples, 128):
+            shape = (stop - start, min(128, num_samples - draw_start))
+            draws = rng.standard_normal(shape)
+            with np.errstate(over="ignore"):
+                draws *= scale[start:stop, None]
+                draws += location[start:stop, None]
+            expit(draws, out=draws)
+            draws *= rng.random(shape) >= zero[start:stop, None]
+            result[start:stop] += draws.sum(axis=1, dtype=np.float64)
+    return (result / num_samples).reshape(output_shape)

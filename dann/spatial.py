@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dann import ziln
-from dann.config import resolve_device, seed_everything
+from dann.config import density_sampling_settings, resolve_device, seed_everything
 from dann.model import AdversarialLatentFusion
 
 
@@ -82,6 +82,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Replace an existing output only after successful inference.",
+    )
+    parser.add_argument(
+        "--density-mc-samples", type=int, default=None,
+        help="Hurdle draws per pixel/target; defaults to checkpoint setting or 1000.",
+    )
+    parser.add_argument(
+        "--density-mc-seed", type=int, default=None,
+        help="Sampling seed; defaults to checkpoint setting or 20260719.",
     )
     return parser.parse_args(argv)
 
@@ -475,9 +483,10 @@ def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
     """Build deterministic output names for every target parameter set.
 
     The first three columns per target hold mean, presence probability, and
-    standard deviation. ``mu_`` is the positive-branch mean on the logit scale. The remaining
-    five are the derived summaries from :mod:`dann.ziln`, all conditional on the
-    positive branch and all on the logit scale.
+    standard deviation. ``mu_`` is the positive-branch mean on the logit scale.
+    The next five columns are derived summaries from :mod:`dann.ziln`, conditional on the
+    positive branch and all on the logit scale. The final ``density_mean_``
+    column is the sampled unconditional mean on the original density scale.
 
     Args:
         target_columns (Sequence[str]): Ordered density target names.
@@ -498,6 +507,7 @@ def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
                 f"logit_median_{target}",
                 f"logit_q05_{target}",
                 f"logit_q95_{target}",
+                f"density_mean_{target}",
             ]
         )
     return names
@@ -567,6 +577,7 @@ def build_output_table(
     pi: np.ndarray,
     sigma: np.ndarray,
     target_columns: Sequence[str],
+    density_mean: np.ndarray | None = None,
 ) -> pa.Table:
     """Build one typed output table from a model inference batch.
 
@@ -575,6 +586,7 @@ def build_output_table(
     ``E[Z | y > 0]``, its standard deviation, and the median and central 90%
     interval of the positive branch. All are conditional on the positive branch,
     because ``logit(0)`` is undefined; ``prob_of_presence`` carries the hurdle.
+    The additional density mean includes both branches on the original scale.
 
     Args:
         row_positions (np.ndarray): Global zero-based AnnData row positions.
@@ -583,6 +595,8 @@ def build_output_table(
         pi (np.ndarray): Structural-zero probabilities.
         sigma (np.ndarray): Positive-branch ZILN standard deviations.
         target_columns (Sequence[str]): Ordered density target names.
+        density_mean (np.ndarray | None): Precomputed means; omitted values use
+            default sampling settings for standalone table construction.
 
     Returns:
         pa.Table: Typed Parquet-ready identity and prediction values.
@@ -597,6 +611,18 @@ def build_output_table(
         )
     if obs_names.size != row_positions.size:
         raise ValueError("Observation names and row positions must have equal length.")
+    if density_mean is None:
+        count, seed = density_sampling_settings({})
+        density_mean = ziln.sampled_density_mean(
+            pi, mu, sigma, num_samples=count, rng=np.random.default_rng(seed)
+        )
+    density_mean = np.asarray(density_mean)
+    if density_mean.shape != expected_shape:
+        raise ValueError(f"density_mean must have shape {expected_shape}.")
+    if not np.isfinite(density_mean).all() or np.any(
+        (density_mean < 0) | (density_mean > 1)
+    ):
+        raise ValueError("density_mean must contain finite values in [0, 1].")
     arrays: list[pa.Array] = [
         pa.array(np.asarray(row_positions, dtype=np.int64), type=pa.int64()),
         pa.array(np.asarray(obs_names, dtype=str), type=pa.string()),
@@ -610,6 +636,7 @@ def build_output_table(
             ziln.positive_logit_quantile(mu_column, sigma_column, 0.50),
             ziln.positive_logit_quantile(mu_column, sigma_column, 0.05),
             ziln.positive_logit_quantile(mu_column, sigma_column, 0.95),
+            density_mean[:, index],
         )
         arrays.extend(
             [
@@ -752,6 +779,8 @@ def run_inference(
     max_rows: int | None = None,
     overwrite: bool = False,
     latent_output_path: Path = DEFAULT_LATENT_OUTPUT,
+    density_mc_samples: int | None = None,
+    density_mc_seed: int | None = None,
 ) -> Path:
     """Run all-row sparse tissue inference and atomically write Parquet.
 
@@ -765,6 +794,8 @@ def run_inference(
         max_rows (int | None): Optional leading-row cap for smoke testing.
         overwrite (bool): Whether to replace an existing output after success.
         latent_output_path (Path): Destination Parquet path for full latent vectors.
+        density_mc_samples (int | None): Override checkpoint draw count.
+        density_mc_seed (int | None): Override checkpoint sampling seed.
 
     Returns:
         Path: Validated Parquet output path.
@@ -796,7 +827,13 @@ def run_inference(
         if int(max_rows) <= 0:
             raise ValueError("max_rows must be positive when provided.")
         selected_rows = min(total_rows, int(max_rows))
-    analysis_config = config["analysis"]
+    analysis_config = dict(config["analysis"])
+    if density_mc_samples is not None:
+        analysis_config["density_mc_samples"] = density_mc_samples
+    if density_mc_seed is not None:
+        analysis_config["density_mc_seed"] = density_mc_seed
+    mc_samples, mc_seed = density_sampling_settings(analysis_config)
+    density_rng = np.random.default_rng(mc_seed)
     training_config = config["training"]
     batch_size = int(batch_size_override or analysis_config["batch_size"])
     num_workers = int(
@@ -865,15 +902,23 @@ def run_inference(
                 }
                 latent = model.encode(model_batch)
                 predictions = model.biology_predictor(latent)
+                parameters = {
+                    key: predictions[key].cpu().numpy() for key in ("pi", "mu", "sigma")
+                }
+                density_mean = ziln.sampled_density_mean(
+                    parameters["pi"], parameters["mu"], parameters["sigma"],
+                    num_samples=mc_samples, rng=density_rng,
+                ).astype(np.float32)
                 obs_names = name_reader.read(
                     processed, processed + row_positions.size
                 )
                 table = build_output_table(
                     row_positions=row_positions,
                     obs_names=obs_names,
-                    mu=predictions["mu"].cpu().numpy(),
-                    pi=predictions["pi"].cpu().numpy(),
-                    sigma=predictions["sigma"].cpu().numpy(),
+                    mu=parameters["mu"],
+                    pi=parameters["pi"],
+                    sigma=parameters["sigma"],
+                    density_mean=density_mean,
                     target_columns=target_columns,
                 )
                 latent_table = build_latent_output_table(
@@ -974,10 +1019,10 @@ def validate_output(
                 values = batch.column(name).to_numpy(zero_copy_only=False)
                 if not np.isfinite(values).all():
                     raise ValueError(f"Prediction column {name!r} contains non-finite values.")
-                if name.startswith("prob_of_presence_") and np.any(
+                if name.startswith(("prob_of_presence_", "density_mean_")) and np.any(
                     (values < 0.0) | (values > 1.0)
                 ):
-                    raise ValueError(f"Probability column {name!r} lies outside [0, 1].")
+                    raise ValueError(f"Prediction column {name!r} lies outside [0, 1].")
                 if (
                     name.startswith("sigma_") or name.startswith("logit_sd_")
                 ) and np.any(values < 0.0):
@@ -1113,6 +1158,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers_override=args.num_workers,
         max_rows=args.max_rows,
         overwrite=args.overwrite,
+        density_mc_samples=args.density_mc_samples,
+        density_mc_seed=args.density_mc_seed,
     )
     print(f"Spatial inference written to {output}", flush=True)
     print(f"Spatial latent vectors written to {args.latent_output}", flush=True)

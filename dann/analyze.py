@@ -24,7 +24,10 @@ from scipy.spatial import distance
 
 from dann import ziln
 from dann.calibration import run_calibration
-from dann.config import apply_smoke_overrides, load_config, resolve_device, seed_everything
+from dann.config import (
+    apply_smoke_overrides, density_sampling_settings, load_config,
+    resolve_device, seed_everything,
+)
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.model import AdversarialLatentFusion
 from dann.train import move_batch_to_device
@@ -301,6 +304,7 @@ def build_latent_umap_frame(
         frame[f"pi_{column}"] = pi[:, index]
         frame[f"mu_{column}"] = mu[:, index]
         frame[f"sigma_{column}"] = sigma[:, index]
+        frame[f"density_mean_{column}"] = extracted["density_mean"][:, index]
     return frame
 
 
@@ -369,6 +373,7 @@ def build_ziln_scatter_frame(
         "predicted_mu",
         "predicted_pi",
         "predicted_sigma",
+        "predicted_density_mean",
     ]
     row_ids = np.asarray(extracted["row_ids"], dtype=np.int64)
     batch_ids = np.asarray(extracted["batches"], dtype=np.int64)
@@ -398,6 +403,7 @@ def build_ziln_scatter_frame(
                     "predicted_mu": mu_positive,
                     "predicted_pi": pi[positive, index],
                     "predicted_sigma": sigma_positive,
+                    "predicted_density_mean": extracted["density_mean"][positive, index],
                 }
             )
         )
@@ -581,10 +587,12 @@ def plot_latent_umap_densities(
     output_path: Path,
     config: Mapping[str, Any],
     logit_epsilon: float | None = None,
+    *,
+    sampled_means: bool = False,
 ) -> None:
     """Plot latent UMAP panels colored by each raw or logit IHC density target.
 
-    Only points with density ``> 0`` are drawn so zeros do not saturate the cmap.
+    Only points with density ``> 0`` are colored, including sampled means.
     When ``logit_epsilon`` is provided, positive densities are clamped and mapped
     with ``logit`` before coloring. Color limits use configured percentiles so
     extreme outliers do not dominate the colormap.
@@ -595,6 +603,7 @@ def plot_latent_umap_densities(
         target_columns (Sequence[str]): Ordered density column names matching ``targets``.
         output_path (Path): Destination PNG path.
         config (Mapping[str, Any]): Analysis settings.
+        sampled_means (bool): Label logit-transformed sampled means; requires epsilon.
         logit_epsilon (float | None): Optional clamp for logit coloring; ``None``
             keeps the raw density scale.
 
@@ -602,6 +611,8 @@ def plot_latent_umap_densities(
         None: Figure is saved to disk.
     """
 
+    if sampled_means and logit_epsilon is None:
+        raise ValueError("Sampled mean plots require logit_epsilon.")
     num_targets = len(target_columns)
     if targets.shape[1] != num_targets:
         raise ValueError(
@@ -629,7 +640,9 @@ def plot_latent_umap_densities(
         values = targets[positive, index]
         if use_logit and values.size > 0:
             values = _positive_logit_densities(values, float(logit_epsilon))
-        vmin, vmax = _robust_color_limits(values, lower_percentile, upper_percentile)
+        vmin, vmax = _robust_color_limits(
+            values, lower_percentile, upper_percentile
+        )
         scatter = axis.scatter(
             coordinates[positive, 0],
             coordinates[positive, 1],
@@ -641,6 +654,8 @@ def plot_latent_umap_densities(
             rasterized=True,
         )
         scale_label = f"logit({column})" if use_logit else column
+        if sampled_means:
+            scale_label = f"logit(sampled mean density): {column}"
         _style_umap_axis(axis, f"Latent UMAP by {scale_label}")
         if values.size > 0:
             figure.colorbar(scatter, ax=axis)
@@ -663,10 +678,11 @@ def plot_latent_umap_ziln_per_target(
     output_path: Path,
     config: Mapping[str, Any],
     logit_epsilon: float,
+    density_mean: np.ndarray,
 ) -> None:
     """Plot a 2x3 latent UMAP for one target's density, parameters, and batches.
 
-    All samples are drawn in every panel. For the logit panel, zero densities
+    All samples are drawn in every panel. For both logit panels, zero densities
     are shown in light gray and excluded from color-limit / colorbar scaling so
     they do not collapse the positive logit range. The existence panel colors by
     ``1 - pi`` (probability of a non-zero density). The categorical batch panel
@@ -683,6 +699,7 @@ def plot_latent_umap_ziln_per_target(
         target_column (str): IHC density column name (e.g. ``Density_CD8``).
         output_path (Path): Destination PNG path.
         config (Mapping[str, Any]): Analysis plot settings.
+        density_mean (np.ndarray): Precomputed unconditional sampled density means.
         logit_epsilon (float): Clamp applied before the positive-density logit.
 
     Returns:
@@ -694,6 +711,7 @@ def plot_latent_umap_ziln_per_target(
     mu = np.asarray(mu, dtype=np.float64).reshape(-1)
     sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)
     batches = np.asarray(batches, dtype=np.int64).reshape(-1)
+    density_mean = np.asarray(density_mean, dtype=np.float64).reshape(-1)
     n_samples = coordinates.shape[0]
     for name, values in (
         ("densities", densities),
@@ -701,6 +719,7 @@ def plot_latent_umap_ziln_per_target(
         ("mu", mu),
         ("sigma", sigma),
         ("batches", batches),
+        ("density_mean", density_mean),
     ):
         if values.shape[0] != n_samples:
             raise ValueError(
@@ -721,43 +740,26 @@ def plot_latent_umap_ziln_per_target(
     cmap = str(config["density_cmap"])
     lower_percentile = float(config["density_vmin_percentile"])
     upper_percentile = float(config["density_vmax_percentile"])
-    zero_color = "#d0d0d0"
+    def plot_logit_panel(axis: Axes, values: np.ndarray, title: str) -> None:
+        positive = values > 0.0
+        if np.any(~positive):
+            axis.scatter(
+                coordinates[~positive, 0], coordinates[~positive, 1],
+                c="#d0d0d0", s=point_size, rasterized=True,
+            )
+        if np.any(positive):
+            logits = _positive_logit_densities(values[positive], logit_epsilon)
+            vmin, vmax = _robust_color_limits(
+                logits, lower_percentile, upper_percentile
+            )
+            scatter = axis.scatter(
+                coordinates[positive, 0], coordinates[positive, 1], c=logits,
+                s=point_size, cmap=cmap, vmin=vmin, vmax=vmax, rasterized=True,
+            )
+            figure.colorbar(scatter, ax=axis)
+        _style_umap_axis(axis, title)
 
-    logit_label = f"Logit_{target_column}"
-    positive = densities > 0.0
-    zero = ~positive
-    axis = axes[0][0]
-    if np.any(zero):
-        axis.scatter(
-            coordinates[zero, 0],
-            coordinates[zero, 1],
-            c=zero_color,
-            s=point_size,
-            rasterized=True,
-        )
-    positive_logits = (
-        _positive_logit_densities(densities[positive], logit_epsilon)
-        if np.any(positive)
-        else np.asarray([], dtype=np.float64)
-    )
-    vmin, vmax = _robust_color_limits(
-        positive_logits, lower_percentile, upper_percentile
-    )
-    scatter = None
-    if np.any(positive):
-        scatter = axis.scatter(
-            coordinates[positive, 0],
-            coordinates[positive, 1],
-            c=positive_logits,
-            s=point_size,
-            cmap=cmap,
-            vmin=vmin,
-            vmax=vmax,
-            rasterized=True,
-        )
-    if scatter is not None:
-        figure.colorbar(scatter, ax=axis)
-    _style_umap_axis(axis, f"Latent UMAP by {logit_label}")
+    plot_logit_panel(axes[0][0], densities, f"Latent UMAP by Logit_{target_column}")
 
     parameter_panels = (
         (axes[0][1], 1.0 - pi, f"1-pi_{target_column}", cmap),
@@ -779,7 +781,9 @@ def plot_latent_umap_ziln_per_target(
         _style_umap_axis(axis, f"Latent UMAP by {label}")
         figure.colorbar(scatter, ax=axis)
 
-    axes[1][1].axis("off")
+    plot_logit_panel(
+        axes[1][1], density_mean, f"logit(sampled mean density): {target_column}"
+    )
 
     batch_axis = axes[1][2]
     batch_colors = _categorical_batch_colors(len(batch_names))
@@ -1169,7 +1173,13 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         f"extracting {len(bundle.datasets[split]):,} {split} rows.",
         flush=True,
     )
+    mc_samples, mc_seed = density_sampling_settings(config["analysis"])
+    density_rng = np.random.default_rng(mc_seed)
     extracted = extract_latent_predictions(model, bundle.loaders[split], device)
+    extracted["density_mean"] = ziln.sampled_density_mean(
+        extracted["pi"], extracted["mu"], extracted["sigma"],
+        num_samples=mc_samples, rng=density_rng,
+    )
     output_dir = Path(config["analysis"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
     umap_dir = output_dir / "umap"
@@ -1217,6 +1227,11 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         config["analysis"],
         logit_epsilon=logit_epsilon,
     )
+    plot_latent_umap_densities(
+        umap_coordinates, extracted["density_mean"], target_columns,
+        umap_dir / "latent_umap_density_means.png", config["analysis"],
+        logit_epsilon=logit_epsilon, sampled_means=True,
+    )
     for index, column in enumerate(target_columns):
         plot_latent_umap_ziln_per_target(
             umap_coordinates,
@@ -1230,6 +1245,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             umap_dir / f"latent_umap_ziln_{column}.png",
             config["analysis"],
             logit_epsilon,
+            extracted["density_mean"][:, index],
         )
         plot_latent_umap_ziln_diagnostics_per_target(
             umap_coordinates,
@@ -1265,6 +1281,10 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         else extract_latent_predictions(model, bundle.loaders[scatter_split], device)
     )
     if scatter_split != split:
+        scatter_data["density_mean"] = ziln.sampled_density_mean(
+            scatter_data["pi"], scatter_data["mu"], scatter_data["sigma"],
+            num_samples=mc_samples, rng=density_rng,
+        )
         run_calibration(
             extracted=scatter_data,
             target_columns=target_columns,

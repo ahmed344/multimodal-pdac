@@ -121,12 +121,20 @@ def test_ziln_umap_has_normal_and_batch_panels_without_legend(
         output_path=tmp_path / "ziln.png",
         config=_plot_config(),
         logit_epsilon=1e-4,
+        density_mean=densities.copy(),
     )
 
     figure = captured[0]
     panel_axes = [axis for axis in figure.axes[:6] if axis.axison]
     titles = {axis.get_title() for axis in panel_axes}
     assert "Latent UMAP by mu_Density_CD8" in titles
+    assert "logit(sampled mean density): Density_CD8" in titles
+    mean_points = figure.axes[4].collections[1]
+    observed_points = figure.axes[0].collections[1]
+    np.testing.assert_array_equal(mean_points.get_array(), observed_points.get_array())
+    assert mean_points.get_clim() == observed_points.get_clim()
+    assert len(mean_points.get_offsets()) == np.count_nonzero(densities)
+    assert len(figure.axes[4].collections[0].get_offsets()) == 2
     assert "Latent UMAP by batch" in titles
     assert all(axis.get_legend() is None for axis in panel_axes)
     assert all(axis.title.get_fontsize() == 14.0 for axis in panel_axes)
@@ -197,13 +205,57 @@ def test_normal_analysis_export_schema_and_row_order() -> None:
     extracted = {"row_ids": np.array([7, 2, 9]), "batches": np.array([0, 1, 0]),
                  "targets": np.array([[0., .2], [.3, 0.], [.5, 1.]]),
                  "pi": np.full((3, 2), .2), "mu": np.zeros((3, 2)),
-                 "sigma": np.ones((3, 2))}
+                 "sigma": np.ones((3, 2)),
+                 "density_mean": np.arange(6).reshape(3, 2) / 10}
     targets = ["Density_CD8", "Density_Tumor"]
     wide = build_latent_umap_frame(extracted, np.zeros((3, 2)), targets, ["a", "b"], "test")
     assert wide.row_id.tolist() == [7, 2, 9]
-    assert wide.columns[-8:].tolist() == [prefix + name for name in targets for prefix in ("", "pi_", "mu_", "sigma_")]
+    assert wide.columns[-10:].tolist() == [prefix + name for name in targets for prefix in ("", "pi_", "mu_", "sigma_", "density_mean_")]
     scatter = build_ziln_scatter_frame(extracted, targets, ["a", "b"], "validation", 1e-5)
-    assert scatter.columns.tolist() == ["row_id", "split", "batch_id", "batch", "target", "true_density", "true_logit", "predicted_mu", "predicted_pi", "predicted_sigma"]
+    assert scatter.columns.tolist() == ["row_id", "split", "batch_id", "batch", "target", "true_density", "true_logit", "predicted_mu", "predicted_pi", "predicted_sigma", "predicted_density_mean"]
     assert scatter.row_id.tolist() == [2, 9, 7, 9]
     assert scatter.target.tolist() == [targets[0], targets[0], targets[1], targets[1]]
     assert np.isfinite(scatter.true_logit).all()
+
+    np.testing.assert_array_equal(wide.density_mean_Density_CD8, extracted["density_mean"][:, 0])
+    np.testing.assert_array_equal(scatter.predicted_density_mean, [.2, .4, .1, .5])
+
+
+def test_combined_mean_umap_matches_observed_logit(tmp_path, monkeypatch) -> None:
+    from dann.analyze import plot_latent_umap_densities
+    captured = []
+    original_close = plt.close
+    monkeypatch.setattr(plt, "close", captured.append)
+    means = np.array([[0., .5], [.2, 1.]])
+    plot_latent_umap_densities(
+        np.array([[0., 0.], [1., 1.]]), means, ["a", "b"],
+        tmp_path / "means.png", _plot_config(), logit_epsilon=1e-3, sampled_means=True,
+    )
+    for index in range(2):
+        points = captured[0].axes[index].collections[0]
+        from dann.analyze import _robust_color_limits
+        values = np.clip(means[means[:, index] > 0, index], 1e-3, 1 - 1e-3)
+        expected = np.log(values / (1 - values))
+        np.testing.assert_allclose(points.get_array(), expected)
+        assert len(points.get_offsets()) == len(values)
+        assert points.get_clim() == _robust_color_limits(expected, 1., 99.)
+    original_close(captured[0])
+
+
+@pytest.mark.parametrize("key,value", [
+    ("density_mc_samples", 0), ("density_mc_samples", True),
+    ("density_mc_samples", 1.5), ("density_mc_seed", -1),
+    ("density_mc_seed", False), ("density_mc_seed", "12"),
+])
+def test_density_sampling_config_validation(key, value) -> None:
+    from dann.config import density_sampling_settings
+    with pytest.raises(ValueError, match=key):
+        density_sampling_settings({key: value})
+
+
+def test_density_sampling_legacy_defaults_and_cli() -> None:
+    from dann.config import density_sampling_settings
+    from dann.spatial import parse_args
+    assert density_sampling_settings({}) == (1000, 20260719)
+    args = parse_args(["--density-mc-samples", "40", "--density-mc-seed", "0"])
+    assert density_sampling_settings(vars(args)) == (40, 0)

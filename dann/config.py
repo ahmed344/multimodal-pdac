@@ -12,6 +12,42 @@ import torch
 import yaml
 
 
+def density_sampling_settings(analysis: Mapping[str, Any]) -> tuple[int, int]:
+    """Resolve and validate Monte Carlo settings, including legacy defaults."""
+    count = analysis.get("density_mc_samples", 1000)
+    seed = analysis.get("density_mc_seed", 20260719)
+    for name, value, minimum in (
+        ("density_mc_samples", count, 1), ("density_mc_seed", seed, 0)
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"analysis.{name} must be an integer >= {minimum}.")
+    return count, seed
+
+
+def latent_variance_settings(settings: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve standalone latent-variance defaults and validate their types."""
+    root = "/workspaces/multimodal-pdac/data/PDAC"
+    defaults = {
+        "input": f"{root}/Raw/adata_assembled_tissue.h5ad",
+        "latents": f"{root}/Results/dann/analysis/spatial/spatial_latent.parquet",
+        "output_dir": f"{root}/Results/dann/latent_variance",
+        "slide_column": "batch",
+        "chunk_size": 8192,
+        "figure_dpi": 300,
+    }
+    if settings is not None and not isinstance(settings, Mapping):
+        raise ValueError("latent_variance must be a mapping.")
+    resolved = {**defaults, **(settings or {})}
+    for key in ("input", "latents", "output_dir", "slide_column"):
+        if not isinstance(resolved[key], str) or not resolved[key].strip():
+            raise ValueError(f"latent_variance.{key} must be a nonempty string.")
+    for key in ("chunk_size", "figure_dpi"):
+        value = resolved[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"latent_variance.{key} must be a positive integer.")
+    return resolved
+
+
 def load_config(path: Path) -> dict[str, Any]:
     """Load and minimally validate a YAML configuration.
 
@@ -43,6 +79,9 @@ def load_config(path: Path) -> dict[str, Any]:
         or max_samples <= 0
     ):
         raise ValueError("analysis.max_samples must be null or a positive integer.")
+    count, seed = density_sampling_settings(config["analysis"])
+    config["analysis"].update(density_mc_samples=count, density_mc_seed=seed)
+    config["latent_variance"] = latent_variance_settings(config.get("latent_variance"))
     return config
 
 
