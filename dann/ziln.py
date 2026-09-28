@@ -1,37 +1,12 @@
-"""Derived summaries of the zero-inflated skew-logit-normal biology head.
+"""Normal positive-branch summaries for the structural-zero logit-normal hurdle.
 
-The biology head emits four parameters per pixel and target, which together
-define a distribution rather than a point prediction::
-
-    y = 0                                          with probability pi
-    y = expit(Z),  Z ~ SkewNormal(mu, sigma, alpha) with probability 1 - pi
-
-``mu`` is the *location* of the positive branch on the logit scale. It is not a
-mean: the skew-normal mean is shifted by ``sigma * delta * sqrt(2 / pi)``, it
-lives on the logit scale rather than the density scale, and it carries no
-information about ``pi``. Every function here turns the raw parameters into a
-quantity that can actually be read as a prediction.
-
-All summaries are on the **logit scale and conditional on the positive branch**.
-That is not a simplification; ``logit(0)`` is undefined, so any logit-scale
-summary is necessarily conditional on ``y > 0``, and ``pi`` must be reported
-separately. The one summary that mixes both branches, ``exceedance_probability``,
-is on the density scale by construction and is therefore unconditional.
-
-Deliberately absent: the density-scale expectation
-``E[y] = (1 - pi) * E[expit(Z)]``. ``E[expit(Z)]`` has no closed form, so it
-requires Monte Carlo or Gauss-Hermite quadrature over every pixel — the only
-genuinely expensive quantity in this module's problem space.
-
-The parametrization matches ``scipy.stats.skewnorm(a=alpha, loc=mu,
-scale=sigma)`` exactly, which is the same density as the positive branch of
-``dann.losses.ZILNLoss``; ``dann/tests/test_ziln.py`` verifies that equivalence
-rather than assuming it.
+The three parameters are the zero probability pi, logit mean mu, and logit
+standard deviation sigma. Logit summaries are conditional on the positive
+branch; exceedance probabilities include the hurdle.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Sequence
 
 import numpy as np
@@ -47,11 +22,8 @@ __all__ = [
     "positive_logit_pit",
     "positive_logit_quantile",
     "positive_logit_sd",
-    "skew_delta",
 ]
 
-
-_SQRT_2_OVER_PI = math.sqrt(2.0 / math.pi)
 
 
 def _as_float_array(values: np.ndarray | Sequence[float], name: str) -> np.ndarray:
@@ -125,74 +97,23 @@ def clipped_logit(
     return np.log(clipped / (1.0 - clipped))
 
 
-def skew_delta(alpha: np.ndarray | Sequence[float]) -> np.ndarray:
-    """Compute the skew-normal ``delta`` reparametrization.
-
-    ``delta`` is bounded in ``(-1, 1)`` and drives both the mean shift and the
-    variance deflation of the skew-normal relative to a plain normal.
-
-    Args:
-        alpha (np.ndarray | Sequence[float]): Skew-normal shape parameters.
-
-    Returns:
-        np.ndarray: ``alpha / sqrt(1 + alpha ** 2)``.
-    """
-
-    array = _as_float_array(alpha, "alpha")
-    return array / np.sqrt(1.0 + np.square(array))
-
-
 def positive_logit_mean(
     mu: np.ndarray | Sequence[float],
     sigma: np.ndarray | Sequence[float],
-    alpha: np.ndarray | Sequence[float],
 ) -> np.ndarray:
-    """Compute ``E[Z | y > 0]``, the skew-corrected logit-scale mean.
-
-    This is the quantity ``mu`` is frequently mistaken for. It reduces to ``mu``
-    exactly when ``alpha == 0``.
-
-    Args:
-        mu (np.ndarray | Sequence[float]): Positive-branch location parameters.
-        sigma (np.ndarray | Sequence[float]): Positive-branch scale parameters.
-        alpha (np.ndarray | Sequence[float]): Positive-branch shape parameters.
-
-    Returns:
-        np.ndarray: Logit-scale mean of the positive branch.
-    """
-
-    location = _as_float_array(mu, "mu")
-    scale = _validate_sigma(sigma)
-    return location + scale * skew_delta(alpha) * _SQRT_2_OVER_PI
+    """Return the normal positive-branch logit mean, broadcasting with sigma."""
+    location, _ = np.broadcast_arrays(_as_float_array(mu, "mu"), _validate_sigma(sigma))
+    return location
 
 
-def positive_logit_sd(
-    sigma: np.ndarray | Sequence[float],
-    alpha: np.ndarray | Sequence[float],
-) -> np.ndarray:
-    """Compute ``SD[Z | y > 0]``, the skew-corrected logit-scale spread.
-
-    Skewness always deflates the standard deviation below ``sigma``, so this is
-    strictly smaller than ``sigma`` whenever ``alpha != 0``.
-
-    Args:
-        sigma (np.ndarray | Sequence[float]): Positive-branch scale parameters.
-        alpha (np.ndarray | Sequence[float]): Positive-branch shape parameters.
-
-    Returns:
-        np.ndarray: Logit-scale standard deviation of the positive branch.
-    """
-
-    scale = _validate_sigma(sigma)
-    delta = skew_delta(alpha)
-    variance_factor = 1.0 - 2.0 * np.square(delta) / math.pi
-    return scale * np.sqrt(np.clip(variance_factor, 0.0, None))
+def positive_logit_sd(sigma: np.ndarray | Sequence[float]) -> np.ndarray:
+    """Return the normal positive-branch logit standard deviation."""
+    return _validate_sigma(sigma)
 
 
 def positive_logit_quantile(
     mu: np.ndarray | Sequence[float],
     sigma: np.ndarray | Sequence[float],
-    alpha: np.ndarray | Sequence[float],
     quantile: float,
 ) -> np.ndarray:
     """Compute a positive-branch quantile on the logit scale.
@@ -200,7 +121,6 @@ def positive_logit_quantile(
     Args:
         mu (np.ndarray | Sequence[float]): Positive-branch location parameters.
         sigma (np.ndarray | Sequence[float]): Positive-branch scale parameters.
-        alpha (np.ndarray | Sequence[float]): Positive-branch shape parameters.
         quantile (float): Requested quantile in ``(0, 1)``.
 
     Returns:
@@ -211,14 +131,12 @@ def positive_logit_quantile(
         raise ValueError("quantile must lie strictly between zero and one.")
     location = _as_float_array(mu, "mu")
     scale = _validate_sigma(sigma)
-    shape = _as_float_array(alpha, "alpha")
-    return stats.skewnorm.ppf(float(quantile), a=shape, loc=location, scale=scale)
+    return stats.norm.ppf(float(quantile), loc=location, scale=scale)
 
 
 def positive_logit_cdf(
     mu: np.ndarray | Sequence[float],
     sigma: np.ndarray | Sequence[float],
-    alpha: np.ndarray | Sequence[float],
     logit_values: np.ndarray | Sequence[float],
 ) -> np.ndarray:
     """Evaluate the positive-branch CDF at logit-scale points.
@@ -226,7 +144,6 @@ def positive_logit_cdf(
     Args:
         mu (np.ndarray | Sequence[float]): Positive-branch location parameters.
         sigma (np.ndarray | Sequence[float]): Positive-branch scale parameters.
-        alpha (np.ndarray | Sequence[float]): Positive-branch shape parameters.
         logit_values (np.ndarray | Sequence[float]): Logit-scale evaluation points.
 
     Returns:
@@ -235,15 +152,13 @@ def positive_logit_cdf(
 
     location = _as_float_array(mu, "mu")
     scale = _validate_sigma(sigma)
-    shape = _as_float_array(alpha, "alpha")
     points = _as_float_array(logit_values, "logit_values")
-    return stats.skewnorm.cdf(points, a=shape, loc=location, scale=scale)
+    return stats.norm.cdf(points, loc=location, scale=scale)
 
 
 def positive_logit_pit(
     mu: np.ndarray | Sequence[float],
     sigma: np.ndarray | Sequence[float],
-    alpha: np.ndarray | Sequence[float],
     targets: np.ndarray | Sequence[float],
     epsilon: float,
 ) -> np.ndarray:
@@ -261,7 +176,6 @@ def positive_logit_pit(
     Args:
         mu (np.ndarray | Sequence[float]): Positive-branch location parameters.
         sigma (np.ndarray | Sequence[float]): Positive-branch scale parameters.
-        alpha (np.ndarray | Sequence[float]): Positive-branch shape parameters.
         targets (np.ndarray | Sequence[float]): Observed positive densities.
         epsilon (float): Clamp applied before the observed-value logit.
 
@@ -272,14 +186,13 @@ def positive_logit_pit(
     observed = _as_float_array(targets, "targets")
     if np.any(observed <= 0.0):
         raise ValueError("positive_logit_pit requires strictly positive targets.")
-    return positive_logit_cdf(mu, sigma, alpha, clipped_logit(observed, epsilon))
+    return positive_logit_cdf(mu, sigma, clipped_logit(observed, epsilon))
 
 
 def hurdle_logit_quantile(
     pi: np.ndarray | Sequence[float],
     mu: np.ndarray | Sequence[float],
     sigma: np.ndarray | Sequence[float],
-    alpha: np.ndarray | Sequence[float],
     quantile: float,
 ) -> np.ndarray:
     """Compute an unconditional quantile, accounting for the zero point mass.
@@ -293,7 +206,6 @@ def hurdle_logit_quantile(
         pi (np.ndarray | Sequence[float]): Structural-zero probabilities.
         mu (np.ndarray | Sequence[float]): Positive-branch location parameters.
         sigma (np.ndarray | Sequence[float]): Positive-branch scale parameters.
-        alpha (np.ndarray | Sequence[float]): Positive-branch shape parameters.
         quantile (float): Requested quantile in ``(0, 1)``.
 
     Returns:
@@ -305,9 +217,8 @@ def hurdle_logit_quantile(
     zero_probability = _validate_probability(pi, "pi")
     location = _as_float_array(mu, "mu")
     scale = _validate_sigma(sigma)
-    shape = _as_float_array(alpha, "alpha")
-    location, scale, shape, zero_probability = np.broadcast_arrays(
-        location, scale, shape, zero_probability
+    location, scale, zero_probability = np.broadcast_arrays(
+        location, scale, zero_probability
     )
     remaining = 1.0 - zero_probability
     result = np.full(zero_probability.shape, np.nan, dtype=np.float64)
@@ -316,9 +227,8 @@ def hurdle_logit_quantile(
         inner = (float(quantile) - zero_probability[positive_branch]) / remaining[
             positive_branch
         ]
-        result[positive_branch] = stats.skewnorm.ppf(
+        result[positive_branch] = stats.norm.ppf(
             inner,
-            a=shape[positive_branch],
             loc=location[positive_branch],
             scale=scale[positive_branch],
         )
@@ -329,7 +239,6 @@ def exceedance_probability(
     pi: np.ndarray | Sequence[float],
     mu: np.ndarray | Sequence[float],
     sigma: np.ndarray | Sequence[float],
-    alpha: np.ndarray | Sequence[float],
     threshold: float,
     epsilon: float = 1e-6,
 ) -> np.ndarray:
@@ -344,7 +253,6 @@ def exceedance_probability(
         pi (np.ndarray | Sequence[float]): Structural-zero probabilities.
         mu (np.ndarray | Sequence[float]): Positive-branch location parameters.
         sigma (np.ndarray | Sequence[float]): Positive-branch scale parameters.
-        alpha (np.ndarray | Sequence[float]): Positive-branch shape parameters.
         threshold (float): Density threshold in ``(0, 1)``.
         epsilon (float): Clamp applied before the threshold logit.
 
@@ -356,5 +264,5 @@ def exceedance_probability(
         raise ValueError("threshold must lie strictly between zero and one.")
     zero_probability = _validate_probability(pi, "pi")
     logit_threshold = float(clipped_logit(np.asarray([threshold]), epsilon)[0])
-    survival = 1.0 - positive_logit_cdf(mu, sigma, alpha, logit_threshold)
+    survival = 1.0 - positive_logit_cdf(mu, sigma, logit_threshold)
     return (1.0 - zero_probability) * survival

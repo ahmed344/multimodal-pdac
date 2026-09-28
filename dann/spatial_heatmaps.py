@@ -169,6 +169,35 @@ def add_logit_columns(
     return logit_columns
 
 
+def _positive_spatial_grid(
+    frame: pd.DataFrame, density: str, column: str
+) -> pd.DataFrame:
+    """Mask zero observations while preserving the full batch coordinate grid."""
+    values = frame[["x", "y", column]].copy()
+    values[column] = values[column].where(frame[density] > 0.0)
+    return values.pivot(index="y", columns="x", values=column)
+
+
+def _plot_hes_context(
+    adata: ad.AnnData, batch_mask: pd.Series, batch: str, axis: plt.Axes
+) -> None:
+    """Render HES with the full tissue extent using two transparent bounds markers.
+
+    Scanpy normally constructs one invisible circle for each observation when
+    displaying an image without a color variable. Only the coordinate extrema
+    affect the limits, so two corners preserve the same crop and spot padding.
+    """
+    coordinates = np.asarray(adata.obsm["spatial"])[np.asarray(batch_mask)]
+    bounds = ad.AnnData(obs=pd.DataFrame(index=["minimum", "maximum"]))
+    bounds.obsm["spatial"] = np.vstack(
+        (coordinates.min(axis=0), coordinates.max(axis=0))
+    )
+    bounds.uns["spatial"] = {batch: adata.uns["spatial"][batch]}
+    sc.pl.spatial(
+        bounds, library_id=batch, img_key="HES", frameon=False, show=False, ax=axis
+    )
+
+
 def plot_density_heatmap(
     adata: ad.AnnData,
     density: str,
@@ -198,7 +227,6 @@ def plot_density_heatmap(
         f"mu_{density}",
         f"prob_of_presence_{density}",
         f"sigma_{density}",
-        f"alpha_{density}",
         batch_column,
         "x",
         "y",
@@ -211,20 +239,17 @@ def plot_density_heatmap(
 
     n_batches = len(batches)
     fig, axes = plt.subplots(
-        figsize=(36, 4 * n_batches),
+        figsize=(30, 4 * n_batches),
         nrows=n_batches,
-        ncols=6,
+        ncols=5,
         tight_layout=True,
         squeeze=False,
     )
     for i, batch in enumerate(batches):
         batch_mask = adata.obs[batch_column] == batch
-        positive_mask = batch_mask & (adata.obs[density] > 0)
 
-        heatmap_data = adata.obs.loc[positive_mask].pivot(
-            index="y",
-            columns="x",
-            values=f"logit_{density}",
+        heatmap_data = _positive_spatial_grid(
+            adata.obs.loc[batch_mask], density, f"logit_{density}"
         )
         im0 = axes[i, 0].imshow(heatmap_data, cmap="jet", origin="upper")
         fig.colorbar(im0, ax=axes[i, 0])
@@ -254,36 +279,13 @@ def plot_density_heatmap(
         im3 = axes[i, 3].imshow(heatmap_data, cmap="jet", origin="upper")
         fig.colorbar(im3, ax=axes[i, 3])
 
-        heatmap_data = adata.obs.loc[batch_mask].pivot(
-            index="y",
-            columns="x",
-            values=f"alpha_{density}",
-        )
-        vmin, vmax = _symmetric_zero_imshow_limits(heatmap_data)
-        im4 = axes[i, 4].imshow(
-            heatmap_data,
-            cmap="coolwarm",
-            origin="upper",
-            vmin=vmin,
-            vmax=vmax,
-        )
-        fig.colorbar(im4, ax=axes[i, 4])
-
-        sc.pl.spatial(
-            adata[batch_mask],
-            library_id=batch,
-            img_key="HES",
-            frameon=False,
-            show=False,
-            ax=axes[i, 5],
-        )
+        _plot_hes_context(adata, batch_mask, batch, axes[i, 4])
 
     axes[0, 0].set_title(f"logit_{density}", fontsize=12)
     axes[0, 1].set_title(f"mu_{density}", fontsize=12)
     axes[0, 2].set_title(f"prob_of_presence_{density}", fontsize=12)
     axes[0, 3].set_title(f"sigma_{density}", fontsize=12)
-    axes[0, 4].set_title(f"alpha_{density}", fontsize=12)
-    axes[0, 5].set_title("HES", fontsize=12)
+    axes[0, 4].set_title("HES", fontsize=12)
 
     for ax in axes.flatten():
         ax.set_aspect("equal")
@@ -291,7 +293,7 @@ def plot_density_heatmap(
         ax.set_yticks([])
         ax.set_facecolor("gray")
 
-    for ax in axes[:, 5]:
+    for ax in axes[:, 4]:
         ax.invert_yaxis()
         ax.invert_xaxis()
 
@@ -305,7 +307,7 @@ def add_residual_columns(
     adata: ad.AnnData,
     densities: Sequence[str],
 ) -> list[str]:
-    """Store the logit-scale residual between corrected mean and observation.
+    """Store the logit-scale residual between predicted mean and observation.
 
     Only positive observations have a defined residual, so zeros are stored as
     ``NaN`` and drop out of both the pivot and the color scaling.
@@ -362,7 +364,7 @@ def add_interval_width_columns(
     return width_columns
 
 
-def plot_corrected_density_heatmap(
+def plot_diagnostics_density_heatmap(
     adata: ad.AnnData,
     density: str,
     batches: Sequence[str],
@@ -371,14 +373,14 @@ def plot_corrected_density_heatmap(
     batch_column: str = "batch",
     dpi: int = 300,
 ) -> Path:
-    """Write one per-batch heatmap of corrected ZILN summaries for a target.
+    """Write one per-batch heatmap of normal ZILN diagnostics for a target.
 
     The companion to ``plot_density_heatmap``, which shows the raw parameters.
     Here the parameters are converted into quantities that read as predictions:
-    the skew-corrected mean ``E[Z | y > 0]``, the positive-branch median, the
+    the normal mean ``E[Z | y > 0]``, the
     residual against observed truth, and the width of the central 90% interval.
 
-    Unlike the raw-parameter figure, *every* panel is masked to observed
+    The numerical panels are masked to observed
     ``density > 0``. All summaries here are conditional on the positive branch,
     because ``logit(0)`` is undefined, so plotting them over pixels with no
     observed signal would be comparing against nothing.
@@ -399,7 +401,6 @@ def plot_corrected_density_heatmap(
         density,
         f"logit_{density}",
         f"logit_mean_{density}",
-        f"logit_median_{density}",
         f"residual_{density}",
         f"interval_width_{density}",
         batch_column,
@@ -414,27 +415,23 @@ def plot_corrected_density_heatmap(
 
     n_batches = len(batches)
     fig, axes = plt.subplots(
-        figsize=(36, 4 * n_batches),
+        figsize=(30, 4 * n_batches),
         nrows=n_batches,
-        ncols=6,
+        ncols=5,
         tight_layout=True,
         squeeze=False,
     )
     sequential_columns = (
         (0, f"logit_{density}"),
         (1, f"logit_mean_{density}"),
-        (2, f"logit_median_{density}"),
-        (4, f"interval_width_{density}"),
+        (3, f"interval_width_{density}"),
     )
     for i, batch in enumerate(batches):
         batch_mask = adata.obs[batch_column] == batch
-        positive_mask = batch_mask & (adata.obs[density] > 0)
 
         for column_index, column_name in sequential_columns:
-            heatmap_data = adata.obs.loc[positive_mask].pivot(
-                index="y",
-                columns="x",
-                values=column_name,
+            heatmap_data = _positive_spatial_grid(
+                adata.obs.loc[batch_mask], density, column_name
             )
             image = axes[i, column_index].imshow(
                 heatmap_data, cmap="jet", origin="upper"
@@ -442,36 +439,26 @@ def plot_corrected_density_heatmap(
             fig.colorbar(image, ax=axes[i, column_index])
         axes[i, 0].set_ylabel(batch, fontsize=12)
 
-        heatmap_data = adata.obs.loc[positive_mask].pivot(
-            index="y",
-            columns="x",
-            values=f"residual_{density}",
+        heatmap_data = _positive_spatial_grid(
+            adata.obs.loc[batch_mask], density, f"residual_{density}"
         )
         vmin, vmax = _symmetric_zero_imshow_limits(heatmap_data)
-        image = axes[i, 3].imshow(
+        image = axes[i, 2].imshow(
             heatmap_data,
             cmap="coolwarm",
             origin="upper",
             vmin=vmin,
             vmax=vmax,
         )
-        fig.colorbar(image, ax=axes[i, 3])
+        fig.colorbar(image, ax=axes[i, 2])
 
-        sc.pl.spatial(
-            adata[batch_mask],
-            library_id=batch,
-            img_key="HES",
-            frameon=False,
-            show=False,
-            ax=axes[i, 5],
-        )
+        _plot_hes_context(adata, batch_mask, batch, axes[i, 4])
 
     axes[0, 0].set_title(f"logit_{density} (observed)", fontsize=12)
     axes[0, 1].set_title(f"logit_mean_{density}", fontsize=12)
-    axes[0, 2].set_title(f"logit_median_{density}", fontsize=12)
-    axes[0, 3].set_title(f"residual_{density}", fontsize=12)
-    axes[0, 4].set_title(f"interval_width_{density}", fontsize=12)
-    axes[0, 5].set_title("HES", fontsize=12)
+    axes[0, 2].set_title(f"residual_{density}", fontsize=12)
+    axes[0, 3].set_title(f"interval_width_{density}", fontsize=12)
+    axes[0, 4].set_title("HES", fontsize=12)
 
     for ax in axes.flatten():
         ax.set_aspect("equal")
@@ -479,7 +466,7 @@ def plot_corrected_density_heatmap(
         ax.set_yticks([])
         ax.set_facecolor("gray")
 
-    for ax in axes[:, 5]:
+    for ax in axes[:, 4]:
         ax.invert_yaxis()
         ax.invert_xaxis()
 
@@ -547,16 +534,16 @@ def run_spatial_heatmaps(
             dpi=dpi,
         )
         print(f"Wrote {output_path}", flush=True)
-        corrected_path = output_dir / f"spatial_heatmap_corrected_{density}.png"
-        plot_corrected_density_heatmap(
+        diagnostics_path = output_dir / f"spatial_heatmap_diagnostics_{density}.png"
+        plot_diagnostics_density_heatmap(
             adata,
             density,
             batches,
-            corrected_path,
+            diagnostics_path,
             batch_column=batch_column,
             dpi=dpi,
         )
-        print(f"Wrote {corrected_path}", flush=True)
+        print(f"Wrote {diagnostics_path}", flush=True)
     return output_dir
 
 

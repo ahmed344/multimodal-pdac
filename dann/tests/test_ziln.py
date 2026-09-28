@@ -1,4 +1,4 @@
-"""Focused tests for derived zero-inflated skew-logit-normal summaries."""
+"""Focused tests for derived zero-inflated logit-normal summaries."""
 
 from __future__ import annotations
 
@@ -13,69 +13,56 @@ from dann import ziln
 from dann.losses import ZILNLoss
 
 
-def _parameter_grid() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Build a deterministic parameter grid spanning skew signs and scales.
+def _parameter_grid() -> tuple[np.ndarray, np.ndarray]:
+    """Build a deterministic parameter grid spanning locations and scales.
 
     Args:
         None.
 
     Returns:
-        tuple[np.ndarray, np.ndarray, np.ndarray]: Broadcast mu, sigma, and alpha.
+        tuple[np.ndarray, np.ndarray]: Broadcast mu and sigma.
     """
 
     mu = np.asarray([-4.0, -1.0, 0.0, 0.5, 3.0])
     sigma = np.asarray([0.25, 0.75, 1.0, 2.0, 3.5])
-    alpha = np.asarray([-6.0, -1.5, 0.0, 2.0, 8.0])
-    return mu, sigma, alpha
+    return mu, sigma
 
 
-def test_zero_alpha_collapses_to_gaussian() -> None:
-    """Zero skew reproduces the plain normal mean, spread, and quantiles."""
+def test_normal_summaries() -> None:
+    """Summaries reproduce the normal mean, spread, and quantiles."""
 
-    mu, sigma, _ = _parameter_grid()
-    alpha = np.zeros_like(mu)
-    np.testing.assert_allclose(ziln.positive_logit_mean(mu, sigma, alpha), mu)
-    np.testing.assert_allclose(ziln.positive_logit_sd(sigma, alpha), sigma)
+    mu, sigma = _parameter_grid()
+    np.testing.assert_allclose(ziln.positive_logit_mean(mu, sigma), mu)
+    np.testing.assert_allclose(ziln.positive_logit_sd(sigma), sigma)
     for quantile in (0.05, 0.5, 0.95):
         np.testing.assert_allclose(
-            ziln.positive_logit_quantile(mu, sigma, alpha, quantile),
+            ziln.positive_logit_quantile(mu, sigma, quantile),
             stats.norm.ppf(quantile, loc=mu, scale=sigma),
             atol=1e-9,
         )
 
 
 def test_closed_forms_match_scipy_moments() -> None:
-    """Closed-form mean and standard deviation match scipy's skew-normal."""
+    """Closed-form mean and standard deviation match scipy's normal."""
 
-    mu, sigma, alpha = _parameter_grid()
+    mu, sigma = _parameter_grid()
     np.testing.assert_allclose(
-        ziln.positive_logit_mean(mu, sigma, alpha),
-        stats.skewnorm.mean(a=alpha, loc=mu, scale=sigma),
+        ziln.positive_logit_mean(mu, sigma),
+        stats.norm.mean(loc=mu, scale=sigma),
         rtol=1e-10,
     )
     np.testing.assert_allclose(
-        ziln.positive_logit_sd(sigma, alpha),
-        stats.skewnorm.std(a=alpha, loc=mu, scale=sigma),
+        ziln.positive_logit_sd(sigma),
+        stats.norm.std(loc=mu, scale=sigma),
         rtol=1e-10,
     )
 
-
-def test_skew_shifts_mean_away_from_mu() -> None:
-    """Nonzero skew moves the mean off ``mu`` and deflates the spread."""
-
-    mu = np.asarray([0.0, 0.0])
-    sigma = np.asarray([1.0, 1.0])
-    alpha = np.asarray([5.0, -5.0])
-    means = ziln.positive_logit_mean(mu, sigma, alpha)
-    assert means[0] > 0.0
-    assert means[1] < 0.0
-    assert np.all(ziln.positive_logit_sd(sigma, alpha) < sigma)
 
 
 def test_parametrization_matches_ziln_loss_positive_branch() -> None:
     """The scipy density equals the loss module's positive-branch density."""
 
-    mu, sigma, alpha = _parameter_grid()
+    mu, sigma = _parameter_grid()
     targets = np.asarray([0.01, 0.2, 0.5, 0.75, 0.99])
     epsilon = 1e-6
     loss = ZILNLoss(
@@ -88,11 +75,10 @@ def test_parametrization_matches_ziln_loss_positive_branch() -> None:
         pi_logits=torch.zeros(1, targets.size, dtype=torch.float64),
         mu=torch.as_tensor(mu, dtype=torch.float64).unsqueeze(0),
         sigma=torch.as_tensor(sigma, dtype=torch.float64).unsqueeze(0),
-        alpha=torch.as_tensor(alpha, dtype=torch.float64).unsqueeze(0),
         targets=torch.as_tensor(targets, dtype=torch.float64).unsqueeze(0),
     )
-    expected = -stats.skewnorm.logpdf(
-        ziln.clipped_logit(targets, epsilon), a=alpha, loc=mu, scale=sigma
+    expected = -stats.norm.logpdf(
+        ziln.clipped_logit(targets, epsilon), loc=mu, scale=sigma
     ).sum()
     assert output.positive.item() == pytest.approx(float(expected), rel=1e-9)
 
@@ -100,10 +86,10 @@ def test_parametrization_matches_ziln_loss_positive_branch() -> None:
 def test_quantiles_are_ordered_and_monotone() -> None:
     """Quantiles increase with the requested probability level."""
 
-    mu, sigma, alpha = _parameter_grid()
-    previous = ziln.positive_logit_quantile(mu, sigma, alpha, 0.01)
+    mu, sigma = _parameter_grid()
+    previous = ziln.positive_logit_quantile(mu, sigma, 0.01)
     for quantile in (0.05, 0.25, 0.5, 0.75, 0.95, 0.99):
-        current = ziln.positive_logit_quantile(mu, sigma, alpha, quantile)
+        current = ziln.positive_logit_quantile(mu, sigma, quantile)
         assert np.all(current > previous)
         previous = current
 
@@ -115,10 +101,9 @@ def test_pit_is_uniform_for_correctly_specified_data() -> None:
     size = 40_000
     mu = rng.normal(-2.0, 1.0, size)
     sigma = np.abs(rng.normal(1.0, 0.2, size)) + 0.1
-    alpha = rng.normal(0.0, 3.0, size)
-    draws = stats.skewnorm.rvs(a=alpha, loc=mu, scale=sigma, random_state=rng)
+    draws = stats.norm.rvs(loc=mu, scale=sigma, random_state=rng)
     densities = 1.0 / (1.0 + np.exp(-draws))
-    pit = ziln.positive_logit_pit(mu, sigma, alpha, densities, 1e-9)
+    pit = ziln.positive_logit_pit(mu, sigma, densities, 1e-9)
     assert float(stats.kstest(pit, "uniform").statistic) < 0.01
     assert float(pit.mean()) == pytest.approx(0.5, abs=0.01)
 
@@ -130,10 +115,9 @@ def test_interval_coverage_matches_nominal_level() -> None:
     size = 40_000
     mu = rng.normal(0.0, 1.0, size)
     sigma = np.abs(rng.normal(1.0, 0.2, size)) + 0.1
-    alpha = rng.normal(0.0, 2.0, size)
-    draws = stats.skewnorm.rvs(a=alpha, loc=mu, scale=sigma, random_state=rng)
-    lower = ziln.positive_logit_quantile(mu, sigma, alpha, 0.05)
-    upper = ziln.positive_logit_quantile(mu, sigma, alpha, 0.95)
+    draws = stats.norm.rvs(loc=mu, scale=sigma, random_state=rng)
+    lower = ziln.positive_logit_quantile(mu, sigma, 0.05)
+    upper = ziln.positive_logit_quantile(mu, sigma, 0.95)
     coverage = float(((draws >= lower) & (draws <= upper)).mean())
     assert coverage == pytest.approx(0.90, abs=0.01)
 
@@ -145,15 +129,13 @@ def test_exceedance_probability_matches_monte_carlo() -> None:
     pi = np.asarray([0.0, 0.3, 0.8])
     mu = np.asarray([0.5, -1.0, 2.0])
     sigma = np.asarray([1.0, 0.5, 1.5])
-    alpha = np.asarray([0.0, 3.0, -2.0])
     threshold = 0.4
-    analytic = ziln.exceedance_probability(pi, mu, sigma, alpha, threshold)
+    analytic = ziln.exceedance_probability(pi, mu, sigma, threshold)
 
     draws = 400_000
     simulated = np.empty_like(analytic)
     for index in range(pi.size):
-        latent = stats.skewnorm.rvs(
-            a=alpha[index],
+        latent = stats.norm.rvs(
             loc=mu[index],
             scale=sigma[index],
             size=draws,
@@ -171,8 +153,7 @@ def test_hurdle_quantile_returns_nan_below_the_zero_mass() -> None:
     pi = np.asarray([0.0, 0.4, 0.9])
     mu = np.zeros(3)
     sigma = np.ones(3)
-    alpha = np.zeros(3)
-    result = ziln.hurdle_logit_quantile(pi, mu, sigma, alpha, 0.5)
+    result = ziln.hurdle_logit_quantile(pi, mu, sigma, 0.5)
     assert np.isnan(result[2])
     assert np.isfinite(result[0]) and np.isfinite(result[1])
     # The zero mass occupies the bottom of the distribution, so the requested
@@ -204,7 +185,7 @@ def test_nonpositive_sigma_is_rejected(kwargs: dict[str, np.ndarray]) -> None:
     """A nonpositive scale is rejected rather than silently producing NaNs."""
 
     with pytest.raises(ValueError, match="sigma must be strictly positive"):
-        ziln.positive_logit_mean(np.zeros(1), kwargs["sigma"], np.zeros(1))
+        ziln.positive_logit_mean(np.zeros(1), kwargs["sigma"])
 
 
 def test_pit_rejects_zero_targets() -> None:
@@ -212,5 +193,5 @@ def test_pit_rejects_zero_targets() -> None:
 
     with pytest.raises(ValueError, match="strictly positive targets"):
         ziln.positive_logit_pit(
-            np.zeros(2), np.ones(2), np.zeros(2), np.asarray([0.0, 0.5]), 1e-6
+            np.zeros(2), np.ones(2), np.asarray([0.0, 0.5]), 1e-6
         )

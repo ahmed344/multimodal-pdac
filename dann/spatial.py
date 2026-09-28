@@ -474,8 +474,8 @@ def validate_input_schema(
 def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
     """Build deterministic output names for every target parameter set.
 
-    The first four columns per target are the raw head outputs; ``mu_`` is the
-    positive-branch *location* on the logit scale, not a mean. The remaining
+    The first three columns per target hold mean, presence probability, and
+    standard deviation. ``mu_`` is the positive-branch mean on the logit scale. The remaining
     five are the derived summaries from :mod:`dann.ziln`, all conditional on the
     positive branch and all on the logit scale.
 
@@ -493,7 +493,6 @@ def prediction_column_names(target_columns: Sequence[str]) -> list[str]:
                 f"mu_{target}",
                 f"prob_of_presence_{target}",
                 f"sigma_{target}",
-                f"alpha_{target}",
                 f"logit_mean_{target}",
                 f"logit_sd_{target}",
                 f"logit_median_{target}",
@@ -567,13 +566,12 @@ def build_output_table(
     mu: np.ndarray,
     pi: np.ndarray,
     sigma: np.ndarray,
-    alpha: np.ndarray,
     target_columns: Sequence[str],
 ) -> pa.Table:
     """Build one typed output table from a model inference batch.
 
-    Alongside the four raw head parameters, this derives the logit-scale
-    summaries that are actually readable as predictions: the skew-corrected mean
+    Alongside the three raw head parameters, this derives the logit-scale
+    summaries that are actually readable as predictions: the normal mean
     ``E[Z | y > 0]``, its standard deviation, and the median and central 90%
     interval of the positive branch. All are conditional on the positive branch,
     because ``logit(0)`` is undefined; ``prob_of_presence`` carries the hurdle.
@@ -584,7 +582,6 @@ def build_output_table(
         mu (np.ndarray): Positive-branch locations on the logit-density scale.
         pi (np.ndarray): Structural-zero probabilities.
         sigma (np.ndarray): Positive-branch ZILN standard deviations.
-        alpha (np.ndarray): Positive-branch ZILN skewness parameters.
         target_columns (Sequence[str]): Ordered density target names.
 
     Returns:
@@ -592,11 +589,11 @@ def build_output_table(
     """
 
     expected_shape = (row_positions.size, len(target_columns))
-    shapes = (mu.shape, pi.shape, sigma.shape, alpha.shape)
+    shapes = (mu.shape, pi.shape, sigma.shape)
     if any(shape != expected_shape for shape in shapes):
         raise ValueError(
             f"Prediction arrays must all have shape {expected_shape}; observed "
-            f"{mu.shape}, {pi.shape}, {sigma.shape}, and {alpha.shape}."
+            f"{mu.shape}, {pi.shape}, and {sigma.shape}."
         )
     if obs_names.size != row_positions.size:
         raise ValueError("Observation names and row positions must have equal length.")
@@ -607,13 +604,12 @@ def build_output_table(
     for index in range(len(target_columns)):
         mu_column = np.asarray(mu[:, index], dtype=np.float64)
         sigma_column = np.asarray(sigma[:, index], dtype=np.float64)
-        alpha_column = np.asarray(alpha[:, index], dtype=np.float64)
         derived = (
-            ziln.positive_logit_mean(mu_column, sigma_column, alpha_column),
-            ziln.positive_logit_sd(sigma_column, alpha_column),
-            ziln.positive_logit_quantile(mu_column, sigma_column, alpha_column, 0.50),
-            ziln.positive_logit_quantile(mu_column, sigma_column, alpha_column, 0.05),
-            ziln.positive_logit_quantile(mu_column, sigma_column, alpha_column, 0.95),
+            ziln.positive_logit_mean(mu_column, sigma_column),
+            ziln.positive_logit_sd(sigma_column),
+            ziln.positive_logit_quantile(mu_column, sigma_column, 0.50),
+            ziln.positive_logit_quantile(mu_column, sigma_column, 0.05),
+            ziln.positive_logit_quantile(mu_column, sigma_column, 0.95),
         )
         arrays.extend(
             [
@@ -623,7 +619,6 @@ def build_output_table(
                     type=pa.float32(),
                 ),
                 pa.array(sigma_column.astype(np.float32), type=pa.float32()),
-                pa.array(alpha_column.astype(np.float32), type=pa.float32()),
             ]
         )
         arrays.extend(
@@ -879,7 +874,6 @@ def run_inference(
                     mu=predictions["mu"].cpu().numpy(),
                     pi=predictions["pi"].cpu().numpy(),
                     sigma=predictions["sigma"].cpu().numpy(),
-                    alpha=predictions["alpha"].cpu().numpy(),
                     target_columns=target_columns,
                 )
                 latent_table = build_latent_output_table(

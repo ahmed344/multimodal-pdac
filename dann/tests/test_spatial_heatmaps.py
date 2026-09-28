@@ -19,7 +19,7 @@ from dann.spatial_heatmaps import (
     add_logit_columns,
     add_residual_columns,
     attach_predictions,
-    plot_corrected_density_heatmap,
+    plot_diagnostics_density_heatmap,
     plot_density_heatmap,
 )
 
@@ -47,6 +47,12 @@ def _tiny_adata(obs_names: list[str], densities: dict[str, np.ndarray]) -> ad.An
     adata = ad.AnnData(X=sparse.csr_matrix(np.zeros((n_obs, 2), dtype=np.float32)))
     adata.obs_names = obs_names
     adata.var_names = ["500.1", "501.2"]
+    adata.obsm["spatial"] = np.arange(n_obs * 2).reshape(n_obs, 2)
+    adata.uns["spatial"] = {
+        batch: {"images": {"HES": np.zeros((8, 8, 3))},
+                "scalefactors": {"tissue_HES_scalef": 1., "spot_diameter_fullres": 1.}}
+        for batch in ("a", "batch-a")
+    }
     for name, values in densities.items():
         adata.obs[name] = np.asarray(values, dtype=np.float32)
     return adata
@@ -73,7 +79,6 @@ def test_attach_predictions_joins_float32_columns_in_order() -> None:
         mu=np.arange(12, dtype=np.float32).reshape(3, 4),
         pi=np.full((3, 4), 0.25, dtype=np.float32),
         sigma=np.ones((3, 4), dtype=np.float32),
-        alpha=np.full((3, 4), -0.5, dtype=np.float32),
         target_columns=TARGETS,
     )
     predictions = table.to_pandas()
@@ -86,10 +91,6 @@ def test_attach_predictions_joins_float32_columns_in_order() -> None:
     np.testing.assert_allclose(
         adata.obs["prob_of_presence_Density_CD8"].to_numpy(),
         np.full(3, 0.75, dtype=np.float32),
-    )
-    np.testing.assert_allclose(
-        adata.obs["alpha_Density_CD8"].to_numpy(),
-        np.full(3, -0.5, dtype=np.float32),
     )
 
 
@@ -113,7 +114,6 @@ def test_attach_predictions_rejects_obs_name_mismatch() -> None:
         mu=np.zeros((2, 4), dtype=np.float32),
         pi=np.full((2, 4), 0.5, dtype=np.float32),
         sigma=np.ones((2, 4), dtype=np.float32),
-        alpha=np.zeros((2, 4), dtype=np.float32),
         target_columns=TARGETS,
     )
     with pytest.raises(ValueError, match="obs_name"):
@@ -194,14 +194,14 @@ def test_add_logit_columns_rejects_missing_density() -> None:
         add_logit_columns(adata, ["Density_CD8", "Density_Tumor"], 1e-4)
 
 
-def test_plot_density_heatmap_requires_alpha_column(tmp_path: Path) -> None:
-    """Verify spatial figures require the exported skewness parameter.
+def test_plot_density_heatmap_requires_sigma_column(tmp_path: Path) -> None:
+    """Verify spatial figures require the exported normal scale.
 
     Args:
         tmp_path (Path): Pytest temporary directory.
 
     Returns:
-        None: Assertions require a missing-alpha KeyError before plotting.
+        None: Assertions require a missing-sigma KeyError before plotting.
     """
 
     density = "Density_CD8"
@@ -212,12 +212,11 @@ def test_plot_density_heatmap_requires_alpha_column(tmp_path: Path) -> None:
     adata.obs["logit_Density_CD8"] = np.zeros(2, dtype=np.float32)
     adata.obs["mu_Density_CD8"] = np.zeros(2, dtype=np.float32)
     adata.obs["prob_of_presence_Density_CD8"] = np.ones(2, dtype=np.float32)
-    adata.obs["sigma_Density_CD8"] = np.ones(2, dtype=np.float32)
     adata.obs["batch"] = ["batch-a", "batch-a"]
     adata.obs["x"] = [0, 1]
     adata.obs["y"] = [0, 0]
 
-    with pytest.raises(KeyError, match="alpha_Density_CD8"):
+    with pytest.raises(KeyError, match="sigma_Density_CD8"):
         plot_density_heatmap(
             adata,
             density,
@@ -226,18 +225,18 @@ def test_plot_density_heatmap_requires_alpha_column(tmp_path: Path) -> None:
         )
 
 
-def test_plot_density_heatmap_writes_six_columns(
+def test_plot_density_heatmap_writes_five_columns(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify the spatial figure includes alpha before the HES panel.
+    """Verify the spatial figure includes normal parameters before the HES panel.
 
     Args:
         tmp_path (Path): Pytest temporary directory.
         monkeypatch (pytest.MonkeyPatch): Fixture used to isolate Scanpy rendering.
 
     Returns:
-        None: Assertions inspect the six primary subplot titles.
+        None: Assertions inspect the five primary subplot titles.
     """
 
     density = "Density_CD8"
@@ -249,7 +248,6 @@ def test_plot_density_heatmap_writes_six_columns(
     adata.obs["mu_Density_CD8"] = np.arange(4, dtype=np.float32)
     adata.obs["prob_of_presence_Density_CD8"] = np.full(4, 0.75, dtype=np.float32)
     adata.obs["sigma_Density_CD8"] = np.ones(4, dtype=np.float32)
-    adata.obs["alpha_Density_CD8"] = np.linspace(-1.0, 1.0, 4, dtype=np.float32)
     adata.obs["batch"] = ["batch-a"] * 4
     adata.obs["x"] = [0, 1, 0, 1]
     adata.obs["y"] = [0, 0, 1, 1]
@@ -267,17 +265,9 @@ def test_plot_density_heatmap_writes_six_columns(
     )
 
     figure = captured[0]
-    titles = [axis.get_title() for axis in figure.axes[:6]]
-    assert titles[4] == "alpha_Density_CD8"
-    assert titles[5] == "HES"
-    assert figure.get_size_inches()[0] == pytest.approx(36.0)
-    alpha_images = figure.axes[4].images
-    assert alpha_images
-    alpha_image = alpha_images[0]
-    assert alpha_image.cmap.name == "coolwarm"
-    vmin, vmax = alpha_image.get_clim()
-    assert vmin == pytest.approx(-vmax)
-    assert vmax > 0.0
+    titles = [axis.get_title() for axis in figure.axes[:5]]
+    assert titles[4] == "HES"
+    assert figure.get_size_inches()[0] == pytest.approx(30.0)
     original_close(figure)
 
 
@@ -337,18 +327,18 @@ def test_add_interval_width_columns_computes_span() -> None:
     )
 
 
-def test_plot_corrected_density_heatmap_titles_and_residual_panel(
+def test_plot_diagnostics_density_heatmap_titles_and_residual_panel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify the corrected figure shows the expected six panels.
+    """Verify the diagnostics figure shows the expected five panels.
 
     Args:
         tmp_path (Path): Pytest temporary directory.
         monkeypatch (pytest.MonkeyPatch): Fixture used to isolate Scanpy rendering.
 
     Returns:
-        None: Assertions inspect the six primary subplot titles.
+        None: Assertions inspect the five primary subplot titles.
     """
 
     density = "Density_CD8"
@@ -369,33 +359,32 @@ def test_plot_corrected_density_heatmap_titles_and_residual_panel(
     monkeypatch.setattr(plt, "close", captured.append)
     monkeypatch.setattr(spatial_heatmaps.sc.pl, "spatial", Mock(return_value=None))
 
-    plot_corrected_density_heatmap(
+    plot_diagnostics_density_heatmap(
         adata,
         density,
         ["batch-a"],
-        tmp_path / "corrected.png",
+        tmp_path / "diagnostics.png",
         dpi=20,
     )
 
     figure = captured[0]
-    titles = [axis.get_title() for axis in figure.axes[:6]]
+    titles = [axis.get_title() for axis in figure.axes[:5]]
     assert titles[0] == f"logit_{density} (observed)"
     assert titles[1] == f"logit_mean_{density}"
-    assert titles[2] == f"logit_median_{density}"
-    assert titles[3] == f"residual_{density}"
-    assert titles[4] == f"interval_width_{density}"
-    assert titles[5] == "HES"
-    residual_image = figure.axes[3].images[0]
+    assert titles[2] == f"residual_{density}"
+    assert titles[3] == f"interval_width_{density}"
+    assert titles[4] == "HES"
+    residual_image = figure.axes[2].images[0]
     assert residual_image.cmap.name == "coolwarm"
     vmin, vmax = residual_image.get_clim()
     assert vmin == pytest.approx(-vmax)
     original_close(figure)
 
 
-def test_plot_corrected_density_heatmap_requires_derived_columns(
+def test_plot_diagnostics_density_heatmap_requires_derived_columns(
     tmp_path: Path,
 ) -> None:
-    """Verify the corrected figure refuses to plot without derived columns.
+    """Verify the diagnostics figure refuses to plot without derived columns.
 
     Args:
         tmp_path (Path): Pytest temporary directory.
@@ -415,9 +404,52 @@ def test_plot_corrected_density_heatmap_requires_derived_columns(
     adata.obs["y"] = [0, 0]
 
     with pytest.raises(KeyError, match=f"logit_mean_{density}"):
-        plot_corrected_density_heatmap(
+        plot_diagnostics_density_heatmap(
             adata,
             density,
             ["batch-a"],
-            tmp_path / "corrected.png",
+            tmp_path / "diagnostics.png",
         )
+
+
+@pytest.mark.parametrize("values", [[0., 0., 0., 0.], [0., 0., 0., .5]])
+@pytest.mark.parametrize("plot", [plot_density_heatmap, plot_diagnostics_density_heatmap])
+def test_heatmaps_preserve_grid_with_masked_zeros(tmp_path, monkeypatch, values, plot) -> None:
+    """Masking zeros must neither shrink the tissue grid nor fail on empty signal."""
+    density = "Density_CD8"
+    adata = _tiny_adata(["0", "1", "2", "3"], {density: np.asarray(values)})
+    for prefix in ("logit_", "mu_", "prob_of_presence_", "sigma_", "logit_mean_", "residual_", "interval_width_"):
+        adata.obs[prefix + density] = np.ones(4)
+    adata.obs["batch"] = ["a"] * 4
+    adata.obs["x"] = [0, 1, 0, 1]
+    adata.obs["y"] = [0, 0, 1, 1]
+    captured = []
+    original_close = plt.close
+    monkeypatch.setattr(plt, "close", captured.append)
+    monkeypatch.setattr(spatial_heatmaps.sc.pl, "spatial", Mock(return_value=None))
+    plot(adata, density, ["a"], tmp_path / "masked.png", dpi=20)
+    image = captured[0].axes[0].images[0].get_array()
+    assert image.shape == (2, 2)
+    np.testing.assert_array_equal(np.ma.getmaskarray(image), (np.asarray(values) == 0).reshape(2, 2))
+    original_close(captured[0])
+
+
+def test_hes_bounds_match_full_scanpy_image_limits() -> None:
+    """Two invisible corners preserve Scanpy's crop, scale, image, and spot padding."""
+    adata = _tiny_adata([str(i) for i in range(5)], {"Density_CD8": np.ones(5)})
+    adata.obsm["spatial"] = np.array([[-2., 3.], [6., 2.], [0., 5.], [2., 9.], [6., -1.]])
+    adata.uns["spatial"]["a"]["scalefactors"] = {
+        "tissue_HES_scalef": 1.25, "spot_diameter_fullres": 4.}
+    adata.uns["spatial"]["a"]["images"]["HES"] = np.random.default_rng(1).random((15, 20, 3))
+    figure, axes = plt.subplots(1, 2)
+    spatial_heatmaps.sc.pl.spatial(
+        adata, library_id="a", img_key="HES", frameon=False, show=False, ax=axes[0])
+    spatial_heatmaps._plot_hes_context(
+        adata, pd.Series(True, index=adata.obs_names), "a", axes[1])
+    np.testing.assert_allclose(axes[0].get_xlim(), axes[1].get_xlim())
+    np.testing.assert_allclose(axes[0].get_ylim(), axes[1].get_ylim())
+    np.testing.assert_array_equal(axes[0].images[0].get_array(), axes[1].images[0].get_array())
+    np.testing.assert_allclose(axes[0].images[0].get_extent(), axes[1].images[0].get_extent())
+    assert len(axes[1].collections[0].get_paths()) == 2
+    assert axes[1].collections[0].get_facecolors()[0, 3] == 0.
+    plt.close(figure)

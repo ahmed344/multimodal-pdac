@@ -1,4 +1,4 @@
-"""Zero-inflated skew-logit-normal losses for the DANN biology head."""
+"""Zero-inflated logit-normal losses for the DANN biology head."""
 
 from __future__ import annotations
 
@@ -22,13 +22,9 @@ class ZILNLossOutput:
 
 
 class ZILNLoss(nn.Module):
-    """Zero-inflated skew-logit-normal negative log likelihood.
+    """Zero-inflated logit-normal negative log likelihood.
 
-    The positive branch is a skew-normal on the logit scale rather than the
-    PDF's plain normal: ``distributions_tests`` found the logit-transformed
-    residuals of all four targets are consistently skewed, and skew-normal was
-    the best- or near-best-fitting family. The extra ``alpha`` shape parameter
-    collapses exactly to the PDF's Gaussian branch when ``alpha == 0``.
+    The positive branch is Gaussian on the clipped logit scale.
     """
 
     def __init__(
@@ -102,16 +98,14 @@ class ZILNLoss(nn.Module):
         pi_logits: torch.Tensor,
         mu: torch.Tensor,
         sigma: torch.Tensor,
-        alpha: torch.Tensor,
         targets: torch.Tensor,
     ) -> ZILNLossOutput:
-        """Evaluate hurdle and positive skew-logit-normal loss branches.
+        """Evaluate hurdle and positive logit-normal loss branches.
 
         Args:
             pi_logits (torch.Tensor): Structural-zero logits.
             mu (torch.Tensor): Positive-branch location on the logit-density scale.
             sigma (torch.Tensor): Positive-branch scale, strictly positive.
-            alpha (torch.Tensor): Positive-branch skew-normal shape parameter.
             targets (torch.Tensor): Bounded density targets in ``[0, 1]``.
 
         Returns:
@@ -119,10 +113,10 @@ class ZILNLoss(nn.Module):
         """
 
         if not (
-            pi_logits.shape == mu.shape == sigma.shape == alpha.shape == targets.shape
+            pi_logits.shape == mu.shape == sigma.shape == targets.shape
         ):
             raise ValueError(
-                "pi_logits, mu, sigma, alpha, and targets must have identical shapes."
+                "pi_logits, mu, sigma, and targets must have identical shapes."
             )
         if targets.shape[-1] != self.target_weights.numel():
             raise ValueError(
@@ -142,15 +136,7 @@ class ZILNLoss(nn.Module):
         safe_targets = targets.clamp(self.logit_epsilon, 1.0 - self.logit_epsilon)
         transformed = torch.logit(safe_targets)
         standardized = (transformed - mu) / sigma
-        # log(2) and log_ndtr(alpha * z) both depend only on alpha, and cancel
-        # exactly at alpha == 0 (log_ndtr(0) == -log(2)), so this reduces to the
-        # plain Gaussian branch whenever alpha is zero.
-        positive_nll = (
-            0.5 * standardized.square()
-            + torch.log(sigma)
-            - math.log(2.0)
-            - torch.special.log_ndtr(alpha * standardized)
-        )
+        positive_nll = 0.5 * standardized.square() + torch.log(sigma)
         if self.include_normal_constant:
             positive_nll = positive_nll + 0.5 * math.log(2.0 * math.pi)
         positive_nll = torch.where(

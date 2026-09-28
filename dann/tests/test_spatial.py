@@ -80,8 +80,7 @@ def test_output_table_preserves_parameters_dtypes_and_duplicate_names() -> None:
         [[0.0, 0.25, 0.5, 1.0], [1.0, 0.5, 0.25, 0.0]], dtype=np.float32
     )
     sigma = np.full((2, 4), 0.75, dtype=np.float32)
-    alpha = np.arange(8, dtype=np.float32).reshape(2, 4) - 4.0
-    table = build_output_table(rows, obs_names, mu, pi, sigma, alpha, TARGETS)
+    table = build_output_table(rows, obs_names, mu, pi, sigma, TARGETS)
 
     assert table.schema.equals(output_schema(TARGETS))
     assert table.column_names == [
@@ -98,10 +97,6 @@ def test_output_table_preserves_parameters_dtypes_and_duplicate_names() -> None:
     np.testing.assert_allclose(
         table.column("prob_of_presence_Density_CD8").to_numpy(),
         np.asarray([1.0, 0.0], dtype=np.float32),
-    )
-    np.testing.assert_allclose(
-        table.column("alpha_Density_CD8").to_numpy(),
-        np.asarray([-4.0, 0.0], dtype=np.float32),
     )
 
 
@@ -153,8 +148,7 @@ def test_parquet_validation_uses_position_with_duplicate_obs_names(
     mu = np.zeros((3, 4), dtype=np.float32)
     pi = np.full((3, 4), 0.25, dtype=np.float32)
     sigma = np.ones((3, 4), dtype=np.float32)
-    alpha = np.full((3, 4), -1.5, dtype=np.float32)
-    table = build_output_table(rows, obs_names, mu, pi, sigma, alpha, TARGETS)
+    table = build_output_table(rows, obs_names, mu, pi, sigma, TARGETS)
     output = tmp_path / "predictions.parquet"
     pq.write_table(table, output)
 
@@ -162,7 +156,6 @@ def test_parquet_validation_uses_position_with_duplicate_obs_names(
     assert report["rows"] == 3
     assert report["minima"]["prob_of_presence_Density_CD8"] == pytest.approx(0.75)
     assert report["maxima"]["sigma_Density_Stroma"] == pytest.approx(1.0)
-    assert report["minima"]["alpha_Density_CD8"] == pytest.approx(-1.5)
 
 
 def test_latent_parquet_preserves_dimension_order_and_duplicate_names(
@@ -250,21 +243,19 @@ def test_output_table_derives_ziln_summaries_from_raw_parameters() -> None:
     mu = np.asarray([[0.0, -1.0, 2.0, 0.5], [1.0, 0.0, -2.0, 3.0]], dtype=np.float32)
     pi = np.full((2, 4), 0.25, dtype=np.float32)
     sigma = np.asarray([[1.0, 0.5, 2.0, 1.5], [0.75, 1.0, 0.25, 2.5]], dtype=np.float32)
-    alpha = np.asarray([[0.0, 3.0, -4.0, 1.0], [-2.0, 0.0, 5.0, -1.0]], dtype=np.float32)
-    table = build_output_table(rows, obs_names, mu, pi, sigma, alpha, TARGETS)
+    table = build_output_table(rows, obs_names, mu, pi, sigma, TARGETS)
 
     for index, target in enumerate(TARGETS):
         column_mu = mu[:, index].astype(np.float64)
         column_sigma = sigma[:, index].astype(np.float64)
-        column_alpha = alpha[:, index].astype(np.float64)
         np.testing.assert_allclose(
             table.column(f"logit_mean_{target}").to_numpy(),
-            ziln.positive_logit_mean(column_mu, column_sigma, column_alpha),
+            ziln.positive_logit_mean(column_mu, column_sigma),
             rtol=1e-6,
         )
         np.testing.assert_allclose(
             table.column(f"logit_sd_{target}").to_numpy(),
-            ziln.positive_logit_sd(column_sigma, column_alpha),
+            ziln.positive_logit_sd(column_sigma),
             rtol=1e-6,
         )
         lower = table.column(f"logit_q05_{target}").to_numpy()
@@ -273,14 +264,6 @@ def test_output_table_derives_ziln_summaries_from_raw_parameters() -> None:
         assert np.all(lower < median)
         assert np.all(median < upper)
 
-    # A zero-skew target must leave mu untouched, which is the whole point of
-    # keeping mu and logit_mean as separate columns.
-    zero_skew = TARGETS[1]
-    np.testing.assert_allclose(
-        table.column(f"logit_mean_{zero_skew}").to_numpy()[1],
-        table.column(f"mu_{zero_skew}").to_numpy()[1],
-        rtol=1e-6,
-    )
 
 
 def test_validate_output_rejects_unordered_quantiles(tmp_path: Path) -> None:
@@ -305,7 +288,6 @@ def test_validate_output_rejects_unordered_quantiles(tmp_path: Path) -> None:
         np.zeros((2, len(TARGETS)), dtype=np.float32),
         np.full((2, len(TARGETS)), 0.5, dtype=np.float32),
         np.ones((2, len(TARGETS)), dtype=np.float32),
-        np.zeros((2, len(TARGETS)), dtype=np.float32),
         TARGETS,
     )
     corrupted_name = f"logit_q05_{TARGETS[0]}"

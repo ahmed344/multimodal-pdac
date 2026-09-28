@@ -36,6 +36,13 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"Data split fractions must sum to one, observed {fractions}.")
     if any(value < 0.0 for value in fractions):
         raise ValueError("Data split fractions cannot be negative.")
+    max_samples = config["analysis"].get("max_samples")
+    if max_samples is not None and (
+        isinstance(max_samples, bool)
+        or not isinstance(max_samples, int)
+        or max_samples <= 0
+    ):
+        raise ValueError("analysis.max_samples must be null or a positive integer.")
     return config
 
 

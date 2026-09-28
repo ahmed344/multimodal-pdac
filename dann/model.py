@@ -182,7 +182,7 @@ class IntensityWeightedPeakEncoder(nn.Module):
 
 
 class BiologyPredictor(nn.Module):
-    """Predict four zero-inflated skew-logit-normal parameter quadruplets."""
+    """Predict four zero-inflated logit-normal parameter triplets."""
 
     def __init__(
         self,
@@ -215,17 +215,11 @@ class BiologyPredictor(nn.Module):
         self.network = build_mlp(
             latent_dim,
             hidden_dims,
-            self.num_targets * 4,
+            self.num_targets * 3,
             activation,
             dropout,
             use_layer_norm,
         )
-        # Zero-init the alpha (skew) output slice so training starts identical
-        # to the prior Gaussian-only model and learns skew only as needed.
-        final_layer = self.network[-1]
-        with torch.no_grad():
-            final_layer.weight[3::4].zero_()
-            final_layer.bias[3::4].zero_()
 
     def forward(self, latent: torch.Tensor) -> dict[str, torch.Tensor]:
         """Map latent vectors to stable ZILN parameters.
@@ -234,20 +228,18 @@ class BiologyPredictor(nn.Module):
             latent (torch.Tensor): Shared latent matrix.
 
         Returns:
-            dict[str, torch.Tensor]: ``pi_logits``, ``pi``, ``mu``, ``sigma``, and ``alpha``.
+            dict[str, torch.Tensor]: ``pi_logits``, ``pi``, ``mu``, ``sigma``.
         """
 
-        raw = self.network(latent).reshape(-1, self.num_targets, 4)
+        raw = self.network(latent).reshape(-1, self.num_targets, 3)
         pi_logits = raw[..., 0]
         mu = raw[..., 1]
         sigma = F.softplus(raw[..., 2]) + self.sigma_min
-        alpha = raw[..., 3]
         return {
             "pi_logits": pi_logits,
             "pi": torch.sigmoid(pi_logits),
             "mu": mu,
             "sigma": sigma,
-            "alpha": alpha,
         }
 
 

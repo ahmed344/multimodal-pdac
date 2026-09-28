@@ -80,9 +80,7 @@ def _analysis_config(config: Mapping[str, Any]) -> dict[str, Any]:
             f"Unsupported analysis splits: main={split!r}, scatter={scatter_split!r}"
         )
     for selected_split in {split, scatter_split}:
-        updated["data"][f"max_{selected_split}_samples"] = int(
-            updated["analysis"]["max_samples"]
-        )
+        updated["data"][f"max_{selected_split}_samples"] = updated["analysis"]["max_samples"]
     updated["training"]["num_workers"] = int(updated["analysis"]["num_workers"])
     return updated
 
@@ -138,7 +136,6 @@ def extract_latent_predictions(
         "pi": [],
         "mu": [],
         "sigma": [],
-        "alpha": [],
         "targets": [],
         "batches": [],
         "row_ids": [],
@@ -147,7 +144,7 @@ def extract_latent_predictions(
         for cpu_batch in loader:
             batch = move_batch_to_device(cpu_batch, device)
             predictions = model(batch, grl_strength=0.0)
-            for key in ("latent", "pi", "mu", "sigma", "alpha"):
+            for key in ("latent", "pi", "mu", "sigma"):
                 outputs[key].append(predictions[key].cpu().numpy())
             for key in ("targets", "batches", "row_ids"):
                 outputs[key].append(batch[key].cpu().numpy())
@@ -299,13 +296,11 @@ def build_latent_umap_frame(
     pi = np.asarray(extracted["pi"])
     mu = np.asarray(extracted["mu"])
     sigma = np.asarray(extracted["sigma"])
-    alpha = np.asarray(extracted["alpha"])
     for index, column in enumerate(target_columns):
         frame[column] = targets[:, index]
         frame[f"pi_{column}"] = pi[:, index]
         frame[f"mu_{column}"] = mu[:, index]
         frame[f"sigma_{column}"] = sigma[:, index]
-        frame[f"alpha_{column}"] = alpha[:, index]
     return frame
 
 
@@ -349,7 +344,7 @@ def build_ziln_scatter_frame(
     """Build a long-format table of positive-density ZILN scatter points.
 
     Only rows with true density ``> 0`` are retained, matching the scatter plot.
-    All four predicted parameters are stored, not just ``mu``, so the table is
+    All three predicted parameters are stored, not just ``mu``, so the table is
     self-sufficient for later recalibration without repeating model inference.
 
     Args:
@@ -374,8 +369,6 @@ def build_ziln_scatter_frame(
         "predicted_mu",
         "predicted_pi",
         "predicted_sigma",
-        "predicted_alpha",
-        "predicted_logit_mean",
     ]
     row_ids = np.asarray(extracted["row_ids"], dtype=np.int64)
     batch_ids = np.asarray(extracted["batches"], dtype=np.int64)
@@ -384,7 +377,6 @@ def build_ziln_scatter_frame(
     mu = np.asarray(extracted["mu"])
     pi = np.asarray(extracted["pi"])
     sigma = np.asarray(extracted["sigma"])
-    alpha = np.asarray(extracted["alpha"])
     parts: list[pd.DataFrame] = []
     for index, column in enumerate(target_columns):
         positive = targets[:, index] > 0.0
@@ -393,7 +385,6 @@ def build_ziln_scatter_frame(
         truth = targets[positive, index]
         mu_positive = mu[positive, index]
         sigma_positive = sigma[positive, index]
-        alpha_positive = alpha[positive, index]
         parts.append(
             pd.DataFrame(
                 {
@@ -407,10 +398,6 @@ def build_ziln_scatter_frame(
                     "predicted_mu": mu_positive,
                     "predicted_pi": pi[positive, index],
                     "predicted_sigma": sigma_positive,
-                    "predicted_alpha": alpha_positive,
-                    "predicted_logit_mean": ziln.positive_logit_mean(
-                        mu_positive, sigma_positive, alpha_positive
-                    ),
                 }
             )
         )
@@ -670,7 +657,6 @@ def plot_latent_umap_ziln_per_target(
     pi: np.ndarray,
     mu: np.ndarray,
     sigma: np.ndarray,
-    alpha: np.ndarray,
     batches: np.ndarray,
     batch_names: Sequence[str],
     target_column: str,
@@ -692,7 +678,6 @@ def plot_latent_umap_ziln_per_target(
         pi (np.ndarray): Predicted structural-zero probabilities ``[n_samples]``.
         mu (np.ndarray): Predicted logit-normal means ``[n_samples]``.
         sigma (np.ndarray): Predicted logit-normal standard deviations ``[n_samples]``.
-        alpha (np.ndarray): Predicted skewness parameters ``[n_samples]``.
         batches (np.ndarray): Encoded integer batch labels ``[n_samples]``.
         batch_names (Sequence[str]): Display names for encoded batches.
         target_column (str): IHC density column name (e.g. ``Density_CD8``).
@@ -708,7 +693,6 @@ def plot_latent_umap_ziln_per_target(
     pi = np.asarray(pi, dtype=np.float64).reshape(-1)
     mu = np.asarray(mu, dtype=np.float64).reshape(-1)
     sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)
-    alpha = np.asarray(alpha, dtype=np.float64).reshape(-1)
     batches = np.asarray(batches, dtype=np.int64).reshape(-1)
     n_samples = coordinates.shape[0]
     for name, values in (
@@ -716,7 +700,6 @@ def plot_latent_umap_ziln_per_target(
         ("pi", pi),
         ("mu", mu),
         ("sigma", sigma),
-        ("alpha", alpha),
         ("batches", batches),
     ):
         if values.shape[0] != n_samples:
@@ -796,23 +779,7 @@ def plot_latent_umap_ziln_per_target(
         _style_umap_axis(axis, f"Latent UMAP by {label}")
         figure.colorbar(scatter, ax=axis)
 
-    alpha_axis = axes[1][1]
-    alpha_label = f"alpha_{target_column}"
-    vmin, vmax = _symmetric_zero_color_limits(
-        alpha, lower_percentile, upper_percentile
-    )
-    scatter = alpha_axis.scatter(
-        coordinates[:, 0],
-        coordinates[:, 1],
-        c=alpha,
-        s=point_size,
-        cmap="coolwarm",
-        vmin=vmin,
-        vmax=vmax,
-        rasterized=True,
-    )
-    _style_umap_axis(alpha_axis, f"Latent UMAP by {alpha_label}")
-    figure.colorbar(scatter, ax=alpha_axis)
+    axes[1][1].axis("off")
 
     batch_axis = axes[1][2]
     batch_colors = _categorical_batch_colors(len(batch_names))
@@ -833,13 +800,12 @@ def plot_latent_umap_ziln_per_target(
     plt.close(figure)
 
 
-def plot_latent_umap_ziln_corrected_per_target(
+def plot_latent_umap_ziln_diagnostics_per_target(
     coordinates: np.ndarray,
     densities: np.ndarray,
     pi: np.ndarray,
     mu: np.ndarray,
     sigma: np.ndarray,
-    alpha: np.ndarray,
     batches: np.ndarray,
     batch_names: Sequence[str],
     target_column: str,
@@ -847,18 +813,17 @@ def plot_latent_umap_ziln_corrected_per_target(
     config: Mapping[str, Any],
     logit_epsilon: float,
 ) -> None:
-    """Plot a 2x3 latent UMAP of corrected ZILN summaries for one target.
+    """Plot a 2x3 latent UMAP of normal ZILN diagnostics for one target.
 
     The companion to ``plot_latent_umap_ziln_per_target``, which shows the raw
     parameters. Here the parameters are converted into quantities that read as
-    predictions: the skew-corrected mean ``E[Z | y > 0]``, the positive-branch
-    median, the residual against observed truth, and the width of the central
-    90% predictive interval.
+    predictions: the normal mean ``E[Z | y > 0]``, presence probability,
+    residual against observed truth, and central 90% predictive interval width.
 
     Every panel is masked to observed ``density > 0``. That is not a stylistic
     choice: ``logit(0)`` is undefined, so all logit-scale summaries are
-    necessarily conditional on the positive branch, and ``pi`` is reported by
-    the raw-parameter figure instead.
+    necessarily conditional on the positive branch. Presence probability is
+    also shown on all rows in the raw-parameter figure.
 
     Args:
         coordinates (np.ndarray): Precomputed UMAP coordinates ``[n_samples, 2]``.
@@ -866,7 +831,6 @@ def plot_latent_umap_ziln_corrected_per_target(
         pi (np.ndarray): Predicted structural-zero probabilities ``[n_samples]``.
         mu (np.ndarray): Predicted positive-branch locations ``[n_samples]``.
         sigma (np.ndarray): Predicted positive-branch scales ``[n_samples]``.
-        alpha (np.ndarray): Predicted skewness parameters ``[n_samples]``.
         batches (np.ndarray): Encoded integer batch labels ``[n_samples]``.
         batch_names (Sequence[str]): Display names for encoded batches.
         target_column (str): IHC density column name (e.g. ``Density_CD8``).
@@ -882,7 +846,6 @@ def plot_latent_umap_ziln_corrected_per_target(
     pi = np.asarray(pi, dtype=np.float64).reshape(-1)
     mu = np.asarray(mu, dtype=np.float64).reshape(-1)
     sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)
-    alpha = np.asarray(alpha, dtype=np.float64).reshape(-1)
     batches = np.asarray(batches, dtype=np.int64).reshape(-1)
     n_samples = coordinates.shape[0]
     for name, values in (
@@ -890,7 +853,6 @@ def plot_latent_umap_ziln_corrected_per_target(
         ("pi", pi),
         ("mu", mu),
         ("sigma", sigma),
-        ("alpha", alpha),
         ("batches", batches),
     ):
         if values.shape[0] != n_samples:
@@ -918,22 +880,18 @@ def plot_latent_umap_ziln_corrected_per_target(
     truth = _positive_logit_densities(densities[positive], logit_epsilon)
     mu_positive = mu[positive]
     sigma_positive = sigma[positive]
-    alpha_positive = alpha[positive]
-    logit_mean = ziln.positive_logit_mean(mu_positive, sigma_positive, alpha_positive)
-    logit_median = ziln.positive_logit_quantile(
-        mu_positive, sigma_positive, alpha_positive, 0.50
-    )
+    logit_mean = ziln.positive_logit_mean(mu_positive, sigma_positive)
     interval_width = ziln.positive_logit_quantile(
-        mu_positive, sigma_positive, alpha_positive, 0.95
+        mu_positive, sigma_positive, 0.95
     ) - ziln.positive_logit_quantile(
-        mu_positive, sigma_positive, alpha_positive, 0.05
+        mu_positive, sigma_positive, 0.05
     )
     residual = logit_mean - truth
 
     sequential_panels = (
         (axes[0][0], truth, f"Logit_{target_column} (observed)"),
         (axes[0][1], logit_mean, f"logit_mean_{target_column}"),
-        (axes[0][2], logit_median, f"logit_median_{target_column}"),
+        (axes[0][2], 1.0 - pi[positive], f"1-pi_{target_column}"),
         (axes[1][1], interval_width, f"logit_q95-q05_{target_column}"),
     )
     for axis, values, label in sequential_panels:
@@ -1206,6 +1164,11 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     )
     model, checkpoint_epoch = load_model(checkpoint_path, config, bundle, device)
     split = str(config["analysis"]["split"])
+    print(
+        f"Analyzing checkpoint epoch {checkpoint_epoch} on {device}; "
+        f"extracting {len(bundle.datasets[split]):,} {split} rows.",
+        flush=True,
+    )
     extracted = extract_latent_predictions(model, bundle.loaders[split], device)
     output_dir = Path(config["analysis"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1216,7 +1179,9 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
 
     target_columns = list(config["data"]["target_columns"])
     batch_names = bundle.metadata.batch_names
+    print(f"Fitting UMAP for {len(extracted['row_ids']):,} {split} rows.", flush=True)
     umap_coordinates = fit_latent_umap(extracted["latent"], config["analysis"])
+    print("Writing latent tables and UMAP figures.", flush=True)
     build_latent_umap_frame(
         extracted,
         umap_coordinates,
@@ -1259,7 +1224,6 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             extracted["pi"][:, index],
             extracted["mu"][:, index],
             extracted["sigma"][:, index],
-            extracted["alpha"][:, index],
             extracted["batches"],
             batch_names,
             column,
@@ -1267,17 +1231,16 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             config["analysis"],
             logit_epsilon,
         )
-        plot_latent_umap_ziln_corrected_per_target(
+        plot_latent_umap_ziln_diagnostics_per_target(
             umap_coordinates,
             extracted["targets"][:, index],
             extracted["pi"][:, index],
             extracted["mu"][:, index],
             extracted["sigma"][:, index],
-            extracted["alpha"][:, index],
             extracted["batches"],
             batch_names,
             column,
-            umap_dir / f"latent_umap_ziln_corrected_{column}.png",
+            umap_dir / f"latent_umap_ziln_diagnostics_{column}.png",
             config["analysis"],
             logit_epsilon,
         )
@@ -1291,11 +1254,26 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         epsilon=logit_epsilon,
     )
     scatter_split = str(config["analysis"]["ziln_scatter_split"])
+    print(
+        f"Analyzing {len(bundle.datasets[scatter_split]):,} {scatter_split} "
+        "rows for the prediction scatter and calibration.",
+        flush=True,
+    )
     scatter_data = (
         extracted
         if scatter_split == split
         else extract_latent_predictions(model, bundle.loaders[scatter_split], device)
     )
+    if scatter_split != split:
+        run_calibration(
+            extracted=scatter_data,
+            target_columns=target_columns,
+            batch_names=batch_names,
+            split=scatter_split,
+            output_dir=output_dir / "calibration" / scatter_split,
+            config=config["analysis"],
+            epsilon=logit_epsilon,
+        )
     build_ziln_scatter_frame(
         scatter_data,
         target_columns,
@@ -1312,6 +1290,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         config["analysis"],
     )
 
+    print("Computing peptide families and peak activity.", flush=True)
     embedding_weights = model.encoder.embedding.weight.detach().cpu().numpy()
     similarity, families, hierarchy_order = embedding_cosine_families(
         embedding_weights,

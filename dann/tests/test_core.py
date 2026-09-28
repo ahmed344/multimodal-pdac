@@ -173,7 +173,7 @@ def test_gradient_reversal_changes_only_gradient_sign_and_scale() -> None:
 
 
 def test_ziln_branches_match_formula_and_handle_one() -> None:
-    """Verify hurdle math, positive Gaussian math at alpha=0, and exact-one handling.
+    """Verify hurdle math, positive Gaussian math, and exact-one handling.
 
     Args:
         None.
@@ -186,9 +186,8 @@ def test_ziln_branches_match_formula_and_handle_one() -> None:
     pi_logits = torch.zeros((3, 1), requires_grad=True)
     mu = torch.zeros((3, 1), requires_grad=True)
     sigma = torch.ones((3, 1), requires_grad=True)
-    alpha = torch.zeros((3, 1), requires_grad=True)
     targets = torch.tensor([[0.0], [0.5], [1.0]])
-    result = criterion(pi_logits, mu, sigma, alpha, targets)
+    result = criterion(pi_logits, mu, sigma, targets)
     transformed_one = torch.logit(torch.tensor(1.0 - 1e-4))
     expected_hurdle = torch.tensor(np.log(2.0), dtype=torch.float32)
     expected_positive = transformed_one.square() / 6.0
@@ -198,19 +197,19 @@ def test_ziln_branches_match_formula_and_handle_one() -> None:
     result.total.backward()
     assert all(
         tensor.grad is not None and torch.isfinite(tensor.grad).all()
-        for tensor in (pi_logits, mu, sigma, alpha)
+        for tensor in (pi_logits, mu, sigma)
     )
 
 
-def test_ziln_positive_branch_matches_scipy_skewnorm() -> None:
-    """Verify the positive branch is an exact skew-normal negative log likelihood.
+def test_ziln_positive_branch_matches_scipy_normal() -> None:
+    """Verify the positive branch is an exact normal negative log likelihood.
 
     Args:
         None.
 
     Returns:
-        None: Assertions compare against ``scipy.stats.skewnorm`` for several
-        shape parameters, including the alpha=0 Gaussian reduction.
+        None: Assertions compare against ``scipy.stats.norm`` for several
+        locations and scales.
     """
 
     criterion = ZILNLoss([1.0], logit_epsilon=1e-4, reduction="sum", include_normal_constant=True)
@@ -220,17 +219,13 @@ def test_ziln_positive_branch_matches_scipy_skewnorm() -> None:
     pi_logits = torch.zeros_like(targets)
     mu = torch.full_like(targets, mu_value)
     sigma = torch.full_like(targets, sigma_value)
-    for alpha_value in (0.0, 1.7, -3.0):
-        alpha = torch.full_like(targets, alpha_value)
-        result = criterion(pi_logits, mu, sigma, alpha, targets)
-        expected = -stats.skewnorm.logpdf(x, a=alpha_value, loc=mu_value, scale=sigma_value).sum()
-        torch.testing.assert_close(
-            float(result.positive), float(expected), rtol=1e-4, atol=1e-4
-        )
+    result = criterion(pi_logits, mu, sigma, targets)
+    expected = -stats.norm.logpdf(x, loc=mu_value, scale=sigma_value).sum()
+    assert float(result.positive) == pytest.approx(float(expected), rel=1e-4)
 
 
 def test_model_output_shapes() -> None:
-    """Verify complete model emits four ZILN quadruplets and batch logits.
+    """Verify complete model emits four ZILN triplets and batch logits.
 
     Args:
         None.
@@ -267,10 +262,8 @@ def test_model_output_shapes() -> None:
     assert outputs["pi_logits"].shape == (2, 4)
     assert outputs["mu"].shape == (2, 4)
     assert outputs["sigma"].shape == (2, 4)
-    assert outputs["alpha"].shape == (2, 4)
     assert outputs["batch_logits"].shape == (2, 3)
     assert torch.all(outputs["sigma"] > 0.0)
-    torch.testing.assert_close(outputs["alpha"], torch.zeros_like(outputs["alpha"]))
 
 
 def test_stratified_splits_and_embedding_families() -> None:
@@ -301,3 +294,63 @@ def test_stratified_splits_and_embedding_families() -> None:
     np.testing.assert_allclose(np.diag(similarity), 1.0, atol=1e-6)
     assert labels.shape == (4,)
     assert sorted(order.tolist()) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("reduction", ["mean", "sum"])
+@pytest.mark.parametrize("constant", [False, True])
+def test_normal_weighted_likelihood_and_gradients(reduction: str, constant: bool) -> None:
+    """Check weighted Gaussian values and analytic derivatives, including zeros."""
+    weights = torch.tensor([8., 0., 2., 1.], dtype=torch.float64)
+    targets = torch.tensor([[0., .2, .5, 1.], [.3, 0., .8, .1]], dtype=torch.float64)
+    logits = torch.full_like(targets, .3, requires_grad=True)
+    mu = torch.full_like(targets, -.4, requires_grad=True)
+    sigma = torch.full_like(targets, 1.2, requires_grad=True)
+    loss = ZILNLoss(weights, logit_epsilon=1e-5, reduction=reduction,
+                    include_normal_constant=constant)
+    result = loss(logits, mu, sigma, targets)
+    positive = targets > 0
+    z = torch.logit(targets.clamp(1e-5, 1-1e-5))
+    normal = -torch.distributions.Normal(mu, sigma).log_prob(z)
+    if not constant:
+        normal = normal - .5 * np.log(2 * np.pi)
+    hurdle = torch.where(positive, torch.nn.functional.softplus(logits),
+                        torch.nn.functional.softplus(-logits))
+    divisor = weights.sum() * targets.shape[0] if reduction == "mean" else 1.
+    torch.testing.assert_close(result.total, ((hurdle + normal * positive) * weights).sum() / divisor)
+    result.total.backward()
+    torch.testing.assert_close(mu.grad, (mu-z) / sigma.square() * positive * weights / divisor)
+    torch.testing.assert_close(sigma.grad, (1/sigma-(z-mu).square()/sigma.pow(3)) * positive * weights / divisor)
+    torch.testing.assert_close(logits.grad, (logits.sigmoid()-(~positive).to(logits)) * weights / divisor)
+
+
+def test_normal_checkpoint_round_trip(tmp_path: Path, tiny_h5ad: Path) -> None:
+    """Preserve normal predictions, target ordering, splits, and optimizer state."""
+    from dann.config import load_config
+    from dann.data_loader import create_data_bundle
+    from dann.train import save_checkpoint, load_training_checkpoint
+    config = load_config(Path("dann/config.yaml"))
+    config["data"]["path"] = str(tiny_h5ad)
+    config["training"].update(num_workers=0, batch_size=2, validation_batch_size=2)
+    config["model"].update(num_peaks=4, embedding_dim=3, peak_hidden_dims=[4],
+                           peak_output_dim=4, aggregation_hidden_dims=[4], latent_dim=3,
+                           biology_hidden_dims=[3], discriminator_hidden_dims=[3], dropout=0.)
+    bundle = create_data_bundle(config)
+    model = AdversarialLatentFusion.from_config(config, num_batches=2, num_targets=4).eval()
+    optimizer = torch.optim.AdamW(model.parameters())
+    batch = next(iter(bundle.loaders["train"]))
+    expected = model(batch)
+    path = tmp_path / "normal.pt"
+    save_checkpoint(path, model, optimizer, 2, config, bundle, 1.25)
+    restored = AdversarialLatentFusion.from_config(config, num_batches=2, num_targets=4).eval()
+    restored_optimizer = torch.optim.AdamW(restored.parameters())
+    assert load_training_checkpoint(path, restored, restored_optimizer, torch.device("cpu")) == (3, 1.25)
+    actual = restored(batch)
+    assert set(actual) == {"latent", "pi_logits", "pi", "mu", "sigma", "batch_logits"}
+    for key in expected:
+        torch.testing.assert_close(expected[key], actual[key])
+    payload = torch.load(path, weights_only=False)
+    assert payload["target_columns"] == tuple(config["data"]["target_columns"])
+    for split, indices in bundle.split_indices.items():
+        np.testing.assert_array_equal(payload["split_indices"][split], indices)
+    for dataset in bundle.datasets.values():
+        dataset.close()

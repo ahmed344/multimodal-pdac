@@ -1,26 +1,6 @@
-"""Distributional validation of the zero-inflated skew-logit-normal head.
+"""Normal positive-branch PIT, coverage, accuracy, and hurdle calibration.
 
-Training loss decreasing says the optimizer worked; it says nothing about
-whether the predicted distributions are *calibrated*. This module answers the
-question the training loop cannot: given the four predicted parameters, do the
-observed densities behave like draws from the predicted distributions?
-
-Two branches are scored separately, because they are two different claims:
-
-* **Positive branch** (zeros masked, logit scale). Accuracy of the location via
-  correlation and error metrics, and calibration of the whole shape via the
-  probability integral transform and interval coverage. Point accuracy is
-  reported twice — once against the raw ``mu`` that the pipeline previously
-  treated as a prediction, and once against the skew-corrected ``E[Z | y > 0]``
-  — so the cost of the old shortcut is visible as a number.
-* **Hurdle branch**. Calibration of ``pi`` against the observed rate of exact
-  zeros, via Brier score, ROC AUC, and a reliability curve. This branch is the
-  model *of* the zeros, so it is the one place zeros are deliberately not
-  masked.
-
-Everything is additionally broken out per batch, since batch invariance is the
-entire purpose of the gradient reversal layer and a per-batch spread in these
-metrics is the evidence for or against it.
+Reports aggregate and per-batch metrics on held-out observations.
 """
 
 from __future__ import annotations
@@ -69,7 +49,6 @@ def compute_target_metrics(
     pi: np.ndarray,
     mu: np.ndarray,
     sigma: np.ndarray,
-    alpha: np.ndarray,
     epsilon: float,
     coverage_levels: Sequence[float] = DEFAULT_COVERAGE_LEVELS,
 ) -> dict[str, float]:
@@ -80,7 +59,6 @@ def compute_target_metrics(
         pi (np.ndarray): Predicted structural-zero probabilities.
         mu (np.ndarray): Predicted positive-branch locations.
         sigma (np.ndarray): Predicted positive-branch scales.
-        alpha (np.ndarray): Predicted positive-branch shapes.
         epsilon (float): Clamp applied before observed-value logits.
         coverage_levels (Sequence[float]): Central interval levels to score.
 
@@ -92,8 +70,7 @@ def compute_target_metrics(
     pi = np.asarray(pi, dtype=np.float64).reshape(-1)
     mu = np.asarray(mu, dtype=np.float64).reshape(-1)
     sigma = np.asarray(sigma, dtype=np.float64).reshape(-1)
-    alpha = np.asarray(alpha, dtype=np.float64).reshape(-1)
-    sizes = {targets.size, pi.size, mu.size, sigma.size, alpha.size}
+    sizes = {targets.size, pi.size, mu.size, sigma.size}
     if len(sizes) != 1:
         raise ValueError(f"Metric inputs must share one length; observed {sizes}.")
 
@@ -123,10 +100,8 @@ def compute_target_metrics(
                 "bias": np.nan,
                 "mae": np.nan,
                 "rmse": np.nan,
-                "pearson_r_mu": np.nan,
-                "pearson_r_corrected": np.nan,
-                "spearman_r_corrected": np.nan,
-                "mean_skew_shift": np.nan,
+                "pearson_r": np.nan,
+                "spearman_r": np.nan,
                 "pit_mean": np.nan,
                 "pit_ks": np.nan,
             }
@@ -138,20 +113,17 @@ def compute_target_metrics(
     truth = ziln.clipped_logit(targets[positive], epsilon)
     mu_positive = mu[positive]
     sigma_positive = sigma[positive]
-    alpha_positive = alpha[positive]
-    corrected = ziln.positive_logit_mean(mu_positive, sigma_positive, alpha_positive)
-    residual = corrected - truth
+    prediction = ziln.positive_logit_mean(mu_positive, sigma_positive)
+    residual = prediction - truth
 
     metrics["bias"] = float(residual.mean())
     metrics["mae"] = float(np.abs(residual).mean())
     metrics["rmse"] = float(np.sqrt(np.mean(np.square(residual))))
-    metrics["mean_skew_shift"] = float(np.mean(corrected - mu_positive))
-    metrics["pearson_r_mu"] = _safe_pearson(truth, mu_positive)
-    metrics["pearson_r_corrected"] = _safe_pearson(truth, corrected)
-    metrics["spearman_r_corrected"] = _safe_spearman(truth, corrected)
+    metrics["pearson_r"] = _safe_pearson(truth, prediction)
+    metrics["spearman_r"] = _safe_spearman(truth, prediction)
 
     pit = ziln.positive_logit_pit(
-        mu_positive, sigma_positive, alpha_positive, targets[positive], epsilon
+        mu_positive, sigma_positive, targets[positive], epsilon
     )
     metrics["pit_mean"] = float(pit.mean())
     metrics["pit_ks"] = float(stats.kstest(pit, "uniform").statistic)
@@ -159,10 +131,10 @@ def compute_target_metrics(
     for level in coverage_levels:
         lower_q, upper_q = _interval_bounds(float(level))
         lower = ziln.positive_logit_quantile(
-            mu_positive, sigma_positive, alpha_positive, lower_q
+            mu_positive, sigma_positive, lower_q
         )
         upper = ziln.positive_logit_quantile(
-            mu_positive, sigma_positive, alpha_positive, upper_q
+            mu_positive, sigma_positive, upper_q
         )
         inside = (truth >= lower) & (truth <= upper)
         metrics[f"coverage_{int(round(float(level) * 100))}"] = float(inside.mean())
@@ -229,7 +201,6 @@ def build_metrics_frame(
             np.asarray(extracted["pi"])[:, index],
             np.asarray(extracted["mu"])[:, index],
             np.asarray(extracted["sigma"])[:, index],
-            np.asarray(extracted["alpha"])[:, index],
             epsilon,
             coverage_levels,
         )
@@ -277,7 +248,6 @@ def build_batch_metrics_frame(
                 np.asarray(extracted["pi"])[mask, index],
                 np.asarray(extracted["mu"])[mask, index],
                 np.asarray(extracted["sigma"])[mask, index],
-                np.asarray(extracted["alpha"])[mask, index],
                 epsilon,
                 coverage_levels,
             )
@@ -339,7 +309,7 @@ def _positive_arrays(
     extracted: Mapping[str, np.ndarray],
     index: int,
     epsilon: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Extract the masked positive-branch inputs for one target.
 
     Args:
@@ -348,7 +318,7 @@ def _positive_arrays(
         epsilon (float): Clamp applied before observed-value logits.
 
     Returns:
-        tuple: Observed logits and the matching mu, sigma, alpha, and pi arrays.
+        tuple: Observed logits and the matching mu, sigma, and pi arrays.
     """
 
     targets = np.asarray(extracted["targets"])[:, index]
@@ -358,7 +328,6 @@ def _positive_arrays(
         truth,
         np.asarray(extracted["mu"])[positive, index],
         np.asarray(extracted["sigma"])[positive, index],
-        np.asarray(extracted["alpha"])[positive, index],
         np.asarray(extracted["pi"])[positive, index],
     )
 
@@ -393,12 +362,12 @@ def plot_pit(
         squeeze=False,
     )
     for index, column in enumerate(target_columns):
-        truth, mu, sigma, alpha, _ = _positive_arrays(extracted, index, epsilon)
+        truth, mu, sigma, _ = _positive_arrays(extracted, index, epsilon)
         if truth.size == 0:
             axes[0][index].axis("off")
             axes[1][index].axis("off")
             continue
-        pit = ziln.positive_logit_cdf(mu, sigma, alpha, truth)
+        pit = ziln.positive_logit_cdf(mu, sigma, truth)
 
         histogram_axis = axes[0][index]
         histogram_axis.hist(
@@ -427,63 +396,6 @@ def plot_pit(
             ylim=(0.0, 1.0),
         )
         qq_axis.grid(alpha=0.25)
-    figure.savefig(output_path, dpi=int(config["figure_dpi"]))
-    plt.close(figure)
-
-
-def plot_corrected_scatter(
-    extracted: Mapping[str, np.ndarray],
-    target_columns: Sequence[str],
-    epsilon: float,
-    output_path: Path,
-    config: Mapping[str, Any],
-) -> None:
-    """Scatter the skew-corrected logit mean against observed positive logits.
-
-    This is the corrected counterpart of ``analyze.plot_ziln_density_scatter``,
-    which plots the raw ``mu`` instead. Both correlations are annotated so the
-    contribution of the skew correction is directly readable.
-
-    Args:
-        extracted (Mapping[str, np.ndarray]): Targets and parameter arrays.
-        target_columns (Sequence[str]): Ordered density target names.
-        epsilon (float): Clamp applied before observed-value logits.
-        output_path (Path): Destination PNG path.
-        config (Mapping[str, Any]): Plot settings.
-
-    Returns:
-        None: Figure is saved to disk.
-    """
-
-    num_targets = len(target_columns)
-    figure, axes = _grid(num_targets, 2, 12.0, 6.0)
-    point_size = float(config["point_size"])
-    for index, column in enumerate(target_columns):
-        row, col = divmod(index, axes.shape[1])
-        axis = axes[row][col]
-        truth, mu, sigma, alpha, _ = _positive_arrays(extracted, index, epsilon)
-        if truth.size == 0:
-            axis.axis("off")
-            continue
-        corrected = ziln.positive_logit_mean(mu, sigma, alpha)
-        axis.scatter(truth, corrected, s=point_size, alpha=0.25, rasterized=True)
-        lower = float(min(truth.min(), corrected.min()))
-        upper = float(max(truth.max(), corrected.max()))
-        axis.plot(
-            [lower, upper], [lower, upper], linestyle="--", color="black", linewidth=1
-        )
-        r_corrected = _safe_pearson(truth, corrected)
-        r_mu = _safe_pearson(truth, mu)
-        axis.set(
-            title=(
-                f"Positive {column}: corrected r={r_corrected:.3f} "
-                f"(raw mu r={r_mu:.3f})"
-            ),
-            xlabel=f"True logit({column})",
-            ylabel=f"Predicted E[Z|y>0] ({column})",
-        )
-        axis.grid(alpha=0.25)
-    _hide_unused(axes, num_targets)
     figure.savefig(output_path, dpi=int(config["figure_dpi"]))
     plt.close(figure)
 
@@ -574,14 +486,14 @@ def plot_interval_coverage(
     figure, axis = plt.subplots(figsize=(8, 7), constrained_layout=True)
     axis.plot([0.0, 1.0], [0.0, 1.0], linestyle="--", color="black", linewidth=1)
     for index, column in enumerate(target_columns):
-        truth, mu, sigma, alpha, _ = _positive_arrays(extracted, index, epsilon)
+        truth, mu, sigma, _ = _positive_arrays(extracted, index, epsilon)
         if truth.size == 0:
             continue
         empirical: list[float] = []
         for level in COVERAGE_SWEEP:
             lower_q, upper_q = _interval_bounds(level)
-            lower = ziln.positive_logit_quantile(mu, sigma, alpha, lower_q)
-            upper = ziln.positive_logit_quantile(mu, sigma, alpha, upper_q)
+            lower = ziln.positive_logit_quantile(mu, sigma, lower_q)
+            upper = ziln.positive_logit_quantile(mu, sigma, upper_q)
             empirical.append(float(((truth >= lower) & (truth <= upper)).mean()))
         axis.plot(COVERAGE_SWEEP, empirical, marker="o", linewidth=1.5, label=column)
     axis.set(
@@ -641,13 +553,6 @@ def run_calibration(
         output_dir / "calibration_pit.png",
         config,
     )
-    plot_corrected_scatter(
-        extracted,
-        target_columns,
-        epsilon,
-        output_dir / "calibration_scatter_corrected.png",
-        config,
-    )
     plot_hurdle_reliability(
         extracted,
         target_columns,
@@ -688,7 +593,7 @@ def load_extracted_from_frame(
     if missing:
         raise KeyError(f"Table is missing required identity columns: {missing}")
     for column in target_columns:
-        for prefix in ("", "pi_", "mu_", "sigma_", "alpha_"):
+        for prefix in ("", "pi_", "mu_", "sigma_"):
             name = f"{prefix}{column}"
             if name not in frame.columns:
                 raise KeyError(f"Table is missing required column {name!r}.")
@@ -708,7 +613,6 @@ def load_extracted_from_frame(
         ("pi", "pi_"),
         ("mu", "mu_"),
         ("sigma", "sigma_"),
-        ("alpha", "alpha_"),
     ):
         extracted[key] = np.column_stack(
             [

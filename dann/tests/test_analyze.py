@@ -88,7 +88,7 @@ def test_batch_umap_uses_one_column_larger_legend(
     original_close(figure)
 
 
-def test_ziln_umap_has_alpha_and_batch_panels_without_legend(
+def test_ziln_umap_has_normal_and_batch_panels_without_legend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -115,7 +115,6 @@ def test_ziln_umap_has_alpha_and_batch_panels_without_legend(
         pi=np.linspace(0.1, 0.6, 6),
         mu=np.linspace(-2.0, 2.0, 6),
         sigma=np.linspace(0.5, 1.5, 6),
-        alpha=np.linspace(-3.0, 3.0, 6),
         batches=batches,
         batch_names=["batch-a", "batch-b", "batch-c"],
         target_column="Density_CD8",
@@ -125,32 +124,86 @@ def test_ziln_umap_has_alpha_and_batch_panels_without_legend(
     )
 
     figure = captured[0]
-    panel_axes = figure.axes[:6]
+    panel_axes = [axis for axis in figure.axes[:6] if axis.axison]
     titles = {axis.get_title() for axis in panel_axes}
-    assert "Latent UMAP by alpha_Density_CD8" in titles
+    assert "Latent UMAP by mu_Density_CD8" in titles
     assert "Latent UMAP by batch" in titles
     assert all(axis.get_legend() is None for axis in panel_axes)
     assert all(axis.title.get_fontsize() == 14.0 for axis in panel_axes)
     for axis in panel_axes:
         _assert_umap_axis_hidden(axis)
 
-    alpha_axis = next(
-        axis
-        for axis in panel_axes
-        if axis.get_title() == "Latent UMAP by alpha_Density_CD8"
-    )
-    alpha_collections = [
-        collection
-        for collection in alpha_axis.collections
-        if isinstance(collection, PathCollection)
-    ]
-    assert alpha_collections
-    alpha_scatter = alpha_collections[0]
-    assert alpha_scatter.cmap.name == "coolwarm"
-    vmin, vmax = alpha_scatter.get_clim()
-    assert vmin == pytest.approx(-vmax)
-    assert vmax > 0.0
     colorbar_axes = figure.axes[6:]
     assert colorbar_axes
     assert all(axis.get_ylabel() == "" for axis in colorbar_axes)
     original_close(figure)
+
+
+@pytest.mark.parametrize("cap", [None, 3])
+def test_analysis_sample_cap(cap: int | None) -> None:
+    """An uncapped analysis preserves all held-out rows; a cap remains optional."""
+    from dann.analyze import _analysis_config
+    config = {"analysis": {"split": "test", "ziln_scatter_split": "validation",
+                           "max_samples": cap, "num_workers": 0},
+              "data": {"max_train_samples": None}, "training": {}}
+    result = _analysis_config(config)
+    assert result["data"]["max_test_samples"] == cap
+    assert result["data"]["max_validation_samples"] == cap
+    assert config["data"] == {"max_train_samples": None}
+
+
+def test_normal_diagnostics_umap_panels(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Diagnostics display observed logits, mean, presence, residual, width, batch."""
+    from dann.analyze import plot_latent_umap_ziln_diagnostics_per_target
+    captured = []
+    original_close = plt.close
+    monkeypatch.setattr(plt, "close", captured.append)
+    plot_latent_umap_ziln_diagnostics_per_target(
+        np.arange(12).reshape(6, 2), np.array([0., .2, .4, .6, .8, 1.]),
+        np.full(6, .25), np.zeros(6), np.ones(6), np.zeros(6), ["a"],
+        "Density_CD8", tmp_path / "diagnostics.png", _plot_config(), 1e-5)
+    figure = captured[0]
+    titles = [axis.get_title() for axis in figure.axes[:6]]
+    assert titles == ["Latent UMAP by Logit_Density_CD8 (observed)",
+                      "Latent UMAP by logit_mean_Density_CD8",
+                      "Latent UMAP by 1-pi_Density_CD8",
+                      "Latent UMAP by residual_Density_CD8",
+                      "Latent UMAP by logit_q95-q05_Density_CD8",
+                      "Latent UMAP by batch (positives)"]
+    for axis in figure.axes[:6]:
+        assert len(axis.collections[0].get_offsets()) == 5
+    original_close(figure)
+
+
+@pytest.mark.parametrize("cap", [None, 10, 0, -1, 1.5, True, "10"])
+def test_config_validates_analysis_cap(tmp_path: Path, cap: object) -> None:
+    """Only null and positive integer analysis limits are accepted."""
+    import yaml
+    from dann.config import load_config
+    config = yaml.safe_load(Path("dann/config.yaml").read_text())
+    config["analysis"]["max_samples"] = cap
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(config))
+    if cap is None or type(cap) is int and cap > 0:
+        assert load_config(path)["analysis"]["max_samples"] == cap
+    else:
+        with pytest.raises(ValueError, match="analysis.max_samples"):
+            load_config(path)
+
+
+def test_normal_analysis_export_schema_and_row_order() -> None:
+    """Wide and scatter exports contain three parameters in target and row order."""
+    from dann.analyze import build_latent_umap_frame, build_ziln_scatter_frame
+    extracted = {"row_ids": np.array([7, 2, 9]), "batches": np.array([0, 1, 0]),
+                 "targets": np.array([[0., .2], [.3, 0.], [.5, 1.]]),
+                 "pi": np.full((3, 2), .2), "mu": np.zeros((3, 2)),
+                 "sigma": np.ones((3, 2))}
+    targets = ["Density_CD8", "Density_Tumor"]
+    wide = build_latent_umap_frame(extracted, np.zeros((3, 2)), targets, ["a", "b"], "test")
+    assert wide.row_id.tolist() == [7, 2, 9]
+    assert wide.columns[-8:].tolist() == [prefix + name for name in targets for prefix in ("", "pi_", "mu_", "sigma_")]
+    scatter = build_ziln_scatter_frame(extracted, targets, ["a", "b"], "validation", 1e-5)
+    assert scatter.columns.tolist() == ["row_id", "split", "batch_id", "batch", "target", "true_density", "true_logit", "predicted_mu", "predicted_pi", "predicted_sigma"]
+    assert scatter.row_id.tolist() == [2, 9, 7, 9]
+    assert scatter.target.tolist() == [targets[0], targets[0], targets[1], targets[1]]
+    assert np.isfinite(scatter.true_logit).all()

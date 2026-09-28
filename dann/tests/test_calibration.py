@@ -41,8 +41,7 @@ def _well_specified_sample(
     rng = np.random.default_rng(seed)
     mu = rng.normal(-1.0, 1.0, size)
     sigma = np.abs(rng.normal(1.0, 0.2, size)) + 0.1
-    alpha = rng.normal(0.0, 2.0, size)
-    latent = stats.skewnorm.rvs(a=alpha, loc=mu, scale=sigma, random_state=rng)
+    latent = stats.norm.rvs(loc=mu, scale=sigma, random_state=rng)
     densities = 1.0 / (1.0 + np.exp(-latent))
     densities[rng.random(size) < zero_probability] = 0.0
     return {
@@ -50,7 +49,6 @@ def _well_specified_sample(
         "pi": np.full(size, zero_probability),
         "mu": mu,
         "sigma": sigma,
-        "alpha": alpha,
     }
 
 
@@ -82,7 +80,6 @@ def test_well_specified_model_is_calibrated() -> None:
         sample["pi"],
         sample["mu"],
         sample["sigma"],
-        sample["alpha"],
         EPSILON,
     )
     assert metrics["pit_ks"] < 0.02
@@ -102,28 +99,11 @@ def test_understated_sigma_produces_u_shaped_pit_and_undercoverage() -> None:
         sample["pi"],
         sample["mu"],
         sample["sigma"] * 0.5,
-        sample["alpha"],
         EPSILON,
     )
     assert overconfident["coverage_90"] < 0.80
     assert overconfident["pit_ks"] > 0.05
 
-
-def test_skew_correction_changes_reported_accuracy() -> None:
-    """The corrected mean and the raw ``mu`` are scored as distinct quantities."""
-
-    sample = _well_specified_sample()
-    metrics = compute_target_metrics(
-        sample["targets"],
-        sample["pi"],
-        sample["mu"],
-        sample["sigma"],
-        sample["alpha"],
-        EPSILON,
-    )
-    assert not np.isclose(metrics["mean_skew_shift"], 0.0)
-    assert np.isfinite(metrics["pearson_r_mu"])
-    assert np.isfinite(metrics["pearson_r_corrected"])
 
 
 def test_metrics_exclude_zeros_from_the_positive_branch() -> None:
@@ -135,7 +115,6 @@ def test_metrics_exclude_zeros_from_the_positive_branch() -> None:
         np.full(4, 0.5),
         np.zeros(4),
         np.ones(4),
-        np.zeros(4),
         EPSILON,
     )
     assert metrics["n"] == 4.0
@@ -152,7 +131,6 @@ def test_all_zero_target_yields_nan_positive_metrics() -> None:
         np.full(8, 0.9),
         np.zeros(8),
         np.ones(8),
-        np.zeros(8),
         EPSILON,
     )
     assert metrics["n_positive"] == 0.0
@@ -190,13 +168,12 @@ def test_round_trip_through_saved_wide_table() -> None:
             ("pi_", "pi"),
             ("mu_", "mu"),
             ("sigma_", "sigma"),
-            ("alpha_", "alpha"),
         ):
             frame[f"{prefix}{column}"] = extracted[key][:, index]
 
     restored, batch_names = load_extracted_from_frame(frame, TARGETS)
     assert batch_names == ["slide_a", "slide_b"]
-    for key in ("targets", "pi", "mu", "sigma", "alpha"):
+    for key in ("targets", "pi", "mu", "sigma"):
         np.testing.assert_allclose(restored[key], extracted[key])
 
 
@@ -209,7 +186,7 @@ def test_load_from_frame_rejects_missing_columns() -> None:
 
 
 def test_run_calibration_writes_every_artifact(tmp_path: Path) -> None:
-    """The report writes both tables and all four figures."""
+    """The report writes both tables and all three figures."""
 
     extracted = _stack(_well_specified_sample(size=1_000), len(TARGETS))
     config = {
@@ -231,7 +208,6 @@ def test_run_calibration_writes_every_artifact(tmp_path: Path) -> None:
         "calibration_metrics.csv",
         "calibration_metrics_by_batch.csv",
         "calibration_pit.png",
-        "calibration_scatter_corrected.png",
         "calibration_hurdle_reliability.png",
         "calibration_interval_coverage.png",
     }
