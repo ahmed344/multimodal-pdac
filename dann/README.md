@@ -10,6 +10,32 @@ zero probability `pi`, positive logit mean `mu`, and positive logit standard
 deviation `sigma`. A gradient reversal layer trains the shared latent space to
 confuse the batch discriminator while preserving IHC prediction.
 
+## CD8 per non-tumor area
+
+The supplied configuration enables `data.cd8_normalization.enabled` with
+`min_non_tumor_fraction: 0.01`. The CD8 target is `Density_CD8 / (1 - Density_Tumor)`.
+Rows with less non-tumor area or a ratio above one lose only CD8 supervision;
+the other targets and domain objective remain active. The threshold is inclusive.
+Valid zeros retain the hurdle-zero label, and exact-one ratios use existing logit
+clipping. Both CD8 loss branches are masked. Mean biology losses and epoch metrics
+use valid target-weight mass as the denominator.
+
+Raw input densities must be finite and in `[0, 1]`. Training reports exclusions
+separately by cause and split in the console and `model/data_schema.json`, and
+fails if its selected rows have no valid CD8 observations or no valid positive CD8.
+
+Retrain to obtain normalized-CD8 predictions. Checkpoints store the transformation
+and ordered targets; incompatible resumes are rejected. Checkpoints without this
+contract retain raw-CD8 semantics, including when analyzed using the new YAML.
+Prediction formulas and machine-readable prediction column names are unchanged.
+Plot labels identify normalized CD8. Wide analysis CSVs retain `raw_*`, `valid_*`,
+and `label_*` columns, with excluded observations missing in the model-target
+columns. They also include the transformation contract for standalone calibration.
+Spatial Parquet metadata carries the same contract so heatmaps transform observed
+CD8 consistently. Missing tissue annotations stay missing in heatmaps while
+predictions remain available; normalized observed CD8 requires both CD8 and tumor
+annotations. Older exports without metadata are interpreted as raw CD8.
+
 ## Standalone latent variance
 
 After running `python -m dann.spatial`, compute diagnostics from its existing
@@ -27,10 +53,10 @@ This independent script does not run inference or require a checkpoint/GPU.
 Settings live in `latent_variance` in the YAML. Defaults write to
 `data/PDAC/Results/dann/latent_variance/`, separately from analysis:
 
-- `explained_variance.png`: per-PC and cumulative explained variance, with
-  90%, 99%, and 99.9% thresholds marked.
+- `explained_variance.png`: stacked per-PC (logarithmic y-axis) and cumulative
+  explained variance, with 90%, 99%, 99.9%, 99.99%, and 99.999% thresholds marked.
 - `latent_variance_summary.csv`: latent width, participation ratio, minimum PCs
-  reaching each threshold (`pcs_90`, `pcs_99`, `pcs_99_9`),
+  reaching each threshold (`pcs_90`, `pcs_99`, `pcs_99_9`, `pcs_99_99`, `pcs_99_999`),
   `variance_explained_by_slide_means`, total variance, observation/slide counts,
   source paths, grouping column, and inference coverage.
 - `pca_variance.csv`: one-based PC numbers, covariance eigenvalues, explained

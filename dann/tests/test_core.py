@@ -343,7 +343,7 @@ def test_normal_checkpoint_round_trip(tmp_path: Path, tiny_h5ad: Path) -> None:
     save_checkpoint(path, model, optimizer, 2, config, bundle, 1.25)
     restored = AdversarialLatentFusion.from_config(config, num_batches=2, num_targets=4).eval()
     restored_optimizer = torch.optim.AdamW(restored.parameters())
-    assert load_training_checkpoint(path, restored, restored_optimizer, torch.device("cpu")) == (3, 1.25)
+    assert load_training_checkpoint(path, restored, restored_optimizer, torch.device("cpu"), config) == (3, 1.25)
     actual = restored(batch)
     assert set(actual) == {"latent", "pi_logits", "pi", "mu", "sigma", "batch_logits"}
     for key in expected:

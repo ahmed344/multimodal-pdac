@@ -210,9 +210,9 @@ def test_normal_analysis_export_schema_and_row_order() -> None:
     targets = ["Density_CD8", "Density_Tumor"]
     wide = build_latent_umap_frame(extracted, np.zeros((3, 2)), targets, ["a", "b"], "test")
     assert wide.row_id.tolist() == [7, 2, 9]
-    assert wide.columns[-10:].tolist() == [prefix + name for name in targets for prefix in ("", "pi_", "mu_", "sigma_", "density_mean_")]
+    assert wide.columns[-16:].tolist() == [prefix + name for name in targets for prefix in ("", "raw_", "valid_", "label_", "pi_", "mu_", "sigma_", "density_mean_")]
     scatter = build_ziln_scatter_frame(extracted, targets, ["a", "b"], "validation", 1e-5)
-    assert scatter.columns.tolist() == ["row_id", "split", "batch_id", "batch", "target", "true_density", "true_logit", "predicted_mu", "predicted_pi", "predicted_sigma", "predicted_density_mean"]
+    assert scatter.columns.tolist() == ["row_id", "split", "batch_id", "batch", "target", "target_label", "raw_density", "true_density", "true_logit", "predicted_mu", "predicted_pi", "predicted_sigma", "predicted_density_mean"]
     assert scatter.row_id.tolist() == [2, 9, 7, 9]
     assert scatter.target.tolist() == [targets[0], targets[0], targets[1], targets[1]]
     assert np.isfinite(scatter.true_logit).all()

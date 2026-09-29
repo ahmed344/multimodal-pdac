@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -31,6 +32,9 @@ from dann.config import (
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.model import AdversarialLatentFusion
 from dann.train import move_batch_to_device
+from dann.targets import (
+    checkpoint_analysis_config, observed_targets, target_contract, target_label,
+)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -140,6 +144,8 @@ def extract_latent_predictions(
         "mu": [],
         "sigma": [],
         "targets": [],
+        "raw_targets": [],
+        "target_valid_mask": [],
         "batches": [],
         "row_ids": [],
     }
@@ -151,7 +157,15 @@ def extract_latent_predictions(
                 outputs[key].append(predictions[key].cpu().numpy())
             for key in ("targets", "batches", "row_ids"):
                 outputs[key].append(batch[key].cpu().numpy())
-    return {key: np.concatenate(parts, axis=0) for key, parts in outputs.items()}
+            raw = batch.get("raw_targets", batch["targets"])
+            valid = batch.get("target_valid_mask")
+            if valid is None:
+                valid = torch.ones_like(batch["targets"], dtype=torch.bool)
+            outputs["raw_targets"].append(raw.cpu().numpy())
+            outputs["target_valid_mask"].append(valid.cpu().numpy())
+    extracted = {key: np.concatenate(parts, axis=0) for key, parts in outputs.items()}
+    extracted["targets"] = observed_targets(extracted)
+    return extracted
 
 
 def compute_peak_activity(
@@ -266,7 +280,7 @@ def _batch_name_series(
 
 
 def build_latent_umap_frame(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     umap_coordinates: np.ndarray,
     target_columns: Sequence[str],
     batch_names: Sequence[str],
@@ -295,12 +309,19 @@ def build_latent_umap_frame(
             "umap_2": umap_coordinates[:, 1],
         }
     )
-    targets = np.asarray(extracted["targets"])
+    if "target_transform" in extracted:
+        frame["target_transform_json"] = json.dumps(
+            extracted["target_transform"], sort_keys=True
+        )
+    targets = observed_targets(extracted)
     pi = np.asarray(extracted["pi"])
     mu = np.asarray(extracted["mu"])
     sigma = np.asarray(extracted["sigma"])
     for index, column in enumerate(target_columns):
         frame[column] = targets[:, index]
+        frame[f"raw_{column}"] = np.asarray(extracted.get("raw_targets", targets))[:, index]
+        frame[f"valid_{column}"] = np.isfinite(targets[:, index])
+        frame[f"label_{column}"] = target_label(column, extracted.get("target_transform"))
         frame[f"pi_{column}"] = pi[:, index]
         frame[f"mu_{column}"] = mu[:, index]
         frame[f"sigma_{column}"] = sigma[:, index]
@@ -309,7 +330,7 @@ def build_latent_umap_frame(
 
 
 def build_latent_embeddings_frame(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     batch_names: Sequence[str],
     split: str,
 ) -> pd.DataFrame:
@@ -339,7 +360,7 @@ def build_latent_embeddings_frame(
 
 
 def build_ziln_scatter_frame(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     target_columns: Sequence[str],
     batch_names: Sequence[str],
     split: str,
@@ -368,6 +389,8 @@ def build_ziln_scatter_frame(
         "batch_id",
         "batch",
         "target",
+        "target_label",
+        "raw_density",
         "true_density",
         "true_logit",
         "predicted_mu",
@@ -378,7 +401,7 @@ def build_ziln_scatter_frame(
     row_ids = np.asarray(extracted["row_ids"], dtype=np.int64)
     batch_ids = np.asarray(extracted["batches"], dtype=np.int64)
     batch_labels = _batch_name_series(batch_ids, batch_names).to_numpy()
-    targets = np.asarray(extracted["targets"])
+    targets = observed_targets(extracted)
     mu = np.asarray(extracted["mu"])
     pi = np.asarray(extracted["pi"])
     sigma = np.asarray(extracted["sigma"])
@@ -398,6 +421,8 @@ def build_ziln_scatter_frame(
                     "batch_id": batch_ids[positive],
                     "batch": batch_labels[positive],
                     "target": column,
+                    "target_label": target_label(column, extracted.get("target_transform")),
+                    "raw_density": np.asarray(extracted.get("raw_targets", targets))[positive, index],
                     "true_density": truth,
                     "true_logit": _positive_logit_densities(truth, epsilon),
                     "predicted_mu": mu_positive,
@@ -1159,13 +1184,15 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     config = _analysis_config(config)
     seed_everything(int(config["training"]["seed"]))
     device = resolve_device(str(config["training"]["device"]))
-    bundle = create_data_bundle(config)
     configured_checkpoint = config["analysis"].get("checkpoint")
     checkpoint_path = checkpoint_override or (
         Path(configured_checkpoint)
         if configured_checkpoint
         else Path(config["training"]["output_dir"]) / "best.pt"
     )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    config = checkpoint_analysis_config(config, checkpoint)
+    bundle = create_data_bundle(config)
     model, checkpoint_epoch = load_model(checkpoint_path, config, bundle, device)
     split = str(config["analysis"]["split"])
     print(
@@ -1176,18 +1203,25 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     mc_samples, mc_seed = density_sampling_settings(config["analysis"])
     density_rng = np.random.default_rng(mc_seed)
     extracted = extract_latent_predictions(model, bundle.loaders[split], device)
+    extracted["target_transform"] = target_contract(config)
     extracted["density_mean"] = ziln.sampled_density_mean(
         extracted["pi"], extracted["mu"], extracted["sigma"],
         num_samples=mc_samples, rng=density_rng,
     )
     output_dir = Path(config["analysis"]["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "target_transform.json").write_text(
+        json.dumps(target_contract(config), indent=2), encoding="utf-8"
+    )
     umap_dir = output_dir / "umap"
     umap_dir.mkdir(parents=True, exist_ok=True)
     model_dir = Path(config["training"]["output_dir"])
     model_dir.mkdir(parents=True, exist_ok=True)
 
     target_columns = list(config["data"]["target_columns"])
+    display_columns = [
+        target_label(column, target_contract(config)) for column in target_columns
+    ]
     batch_names = bundle.metadata.batch_names
     print(f"Fitting UMAP for {len(extracted['row_ids']):,} {split} rows.", flush=True)
     umap_coordinates = fit_latent_umap(extracted["latent"], config["analysis"])
@@ -1198,7 +1232,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         target_columns,
         batch_names,
         split,
-    ).to_csv(umap_dir / "latent_umap.csv", index=False)
+    ).to_csv(umap_dir / "latent_umap.csv", index=False, float_format="%.17g")
     build_latent_embeddings_frame(
         extracted,
         batch_names,
@@ -1214,7 +1248,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     plot_latent_umap_densities(
         umap_coordinates,
         extracted["targets"],
-        target_columns,
+        display_columns,
         umap_dir / "latent_umap_densities.png",
         config["analysis"],
     )
@@ -1222,13 +1256,13 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     plot_latent_umap_densities(
         umap_coordinates,
         extracted["targets"],
-        target_columns,
+        display_columns,
         umap_dir / "latent_umap_densities_logit.png",
         config["analysis"],
         logit_epsilon=logit_epsilon,
     )
     plot_latent_umap_densities(
-        umap_coordinates, extracted["density_mean"], target_columns,
+        umap_coordinates, extracted["density_mean"], display_columns,
         umap_dir / "latent_umap_density_means.png", config["analysis"],
         logit_epsilon=logit_epsilon, sampled_means=True,
     )
@@ -1241,7 +1275,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             extracted["sigma"][:, index],
             extracted["batches"],
             batch_names,
-            column,
+            display_columns[index],
             umap_dir / f"latent_umap_ziln_{column}.png",
             config["analysis"],
             logit_epsilon,
@@ -1255,7 +1289,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
             extracted["sigma"][:, index],
             extracted["batches"],
             batch_names,
-            column,
+            display_columns[index],
             umap_dir / f"latent_umap_ziln_diagnostics_{column}.png",
             config["analysis"],
             logit_epsilon,
@@ -1280,6 +1314,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         if scatter_split == split
         else extract_latent_predictions(model, bundle.loaders[scatter_split], device)
     )
+    scatter_data["target_transform"] = target_contract(config)
     if scatter_split != split:
         scatter_data["density_mean"] = ziln.sampled_density_mean(
             scatter_data["pi"], scatter_data["mu"], scatter_data["sigma"],
@@ -1300,11 +1335,11 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         batch_names,
         scatter_split,
         logit_epsilon,
-    ).to_csv(output_dir / "ziln_density_scatter.csv", index=False)
+    ).to_csv(output_dir / "ziln_density_scatter.csv", index=False, float_format="%.17g")
     plot_ziln_density_scatter(
         scatter_data["mu"],
         scatter_data["targets"],
-        target_columns,
+        display_columns,
         logit_epsilon,
         output_dir / "ziln_density_scatter.png",
         config["analysis"],

@@ -329,7 +329,8 @@ def test_output_table_reuses_supplied_means() -> None:
         np.testing.assert_array_equal(table[f"density_mean_{target}"].to_numpy(), means[:, index])
 
 
-def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("normalized", [False, True])
+def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch, normalized) -> None:
     """Stream real CSR batches through inference and compare saved MC means."""
     import torch
     from dann import spatial
@@ -339,12 +340,14 @@ def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch) ->
         obs_names=["a", "a", "b"],
     )
     config = {
-        "data": {"path": str(tissue), "matrix_key": "X",
+        "data": {"path": str(tissue), "matrix_key": "X", "target_columns": TARGETS,
                  "intensity_transform": "none", "nonzero_threshold": 0.},
         "model": {"num_peaks": 2, "latent_dim": 2},
         "analysis": {"batch_size": 2, "num_workers": 0},
         "training": {"seed": 1, "pin_memory": False, "prefetch_factor": 2},
     }
+
+    config["data"]["cd8_normalization"] = {"enabled": normalized}
 
     class FixedModel:
         def encode(self, batch):
@@ -364,6 +367,10 @@ def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch) ->
         density_mc_samples=17, density_mc_seed=0,
     )
     table = pq.read_table(output)
+    import json
+    contract = json.loads(table.schema.metadata[b"dann_target_transform"])
+    assert contract["cd8_normalization"]["enabled"] == normalized
+    assert contract["target_columns"] == list(TARGETS)
     rng = np.random.default_rng(0)
     expected = np.concatenate([
         ziln.sampled_density_mean(

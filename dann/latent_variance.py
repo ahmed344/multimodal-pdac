@@ -21,7 +21,13 @@ from matplotlib import pyplot as plt
 from .config import latent_variance_settings, load_config
 
 
-THRESHOLDS = ((0.9, "pcs_90"), (0.99, "pcs_99"), (0.999, "pcs_99_9"))
+THRESHOLDS = (
+    (0.9, "pcs_90"),
+    (0.99, "pcs_99"),
+    (0.999, "pcs_99_9"),
+    (0.9999, "pcs_99_99"),
+    (0.99999, "pcs_99_999"),
+)
 
 
 def read_slide_metadata(path: Path, slide_column: str) -> tuple[np.ndarray, np.ndarray]:
@@ -192,23 +198,42 @@ def compute_latent_variance(
 def plot_explained_variance(
     spectrum: pd.DataFrame, summary: Mapping[str, Any], path: Path, dpi: int = 300
 ) -> None:
-    """Save individual and cumulative explained-variance panels."""
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4), constrained_layout=True)
+    """Save stacked explained-variance panels under one global title.
+
+    Args:
+        spectrum (pd.DataFrame): One row per principal component, including ``pc``,
+            ``explained_variance_fraction``, and ``cumulative_variance_fraction``.
+        summary (Mapping[str, Any]): Variance summary with ``total_variance``,
+            observation and width counts, and the PC count at each threshold.
+        path (Path): Destination PNG path.
+        dpi (int): Figure resolution. Defaults to 300.
+
+    Returns:
+        None
+    """
+    fig, axes = plt.subplots(2, 1, figsize=(6, 8), sharex=True, constrained_layout=True)
     try:
-        axes[0].set(title="Variance per principal component", ylabel="Explained variance (%)")
-        axes[1].set(title="Cumulative explained variance", ylabel="Cumulative variance (%)", ylim=(0, 102))
+        axes[0].set_ylabel("Explained variance (%)")
+        axes[0].set_yscale("log")
+        axes[1].set_ylabel("Cumulative variance (%)")
+        axes[1].set_xlabel("Principal component")
+        component_count = len(spectrum)
+        # Keep 0 and the last component inside the frame, away from the spines.
+        margin = max(1.0, 0.03 * component_count)
+        axes[1].set_xlim(-margin, component_count + margin)
         for ax in axes:
-            ax.set_xlabel("Principal component")
-            ax.set_xlim(0.5, len(spectrum) + 0.5)
             ax.grid(alpha=0.25)
         if summary["total_variance"] == 0:
             for ax in axes:
                 ax.text(0.5, 0.5, "Constant latents: variance fractions undefined",
                         ha="center", va="center", transform=ax.transAxes, wrap=True)
         else:
-            axes[0].plot(spectrum["pc"], 100 * spectrum["explained_variance_fraction"])
-            axes[1].plot(spectrum["pc"], 100 * spectrum["cumulative_variance_fraction"])
-            for (threshold, key), color in zip(THRESHOLDS, ("C1", "C2", "C3")):
+            per_component = 100 * spectrum["explained_variance_fraction"].to_numpy()
+            cumulative = 100 * spectrum["cumulative_variance_fraction"].to_numpy()
+            axes[0].plot(spectrum["pc"], np.ma.masked_less_equal(per_component, 0))
+            axes[1].plot(spectrum["pc"], np.ma.masked_less_equal(cumulative, 0))
+            axes[1].set_ylim(-5, 105)
+            for (threshold, key), color in zip(THRESHOLDS, ("C1", "C2", "C3", "C4", "C5")):
                 pc = summary[key]
                 axes[1].axhline(100 * threshold, color=color, linestyle=":", alpha=0.6)
                 axes[1].axvline(pc, color=color, linestyle="--", alpha=0.6,

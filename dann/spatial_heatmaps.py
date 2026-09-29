@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import warnings
 from pathlib import Path
 from typing import Sequence
@@ -14,9 +15,12 @@ matplotlib.use("Agg")
 import anndata as ad
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import scanpy as sc
 import seaborn as sns
 from matplotlib import pyplot as plt
+
+from dann.targets import prepare_observed_targets, target_label
 
 warnings.filterwarnings("ignore")
 sns.set_style("ticks", {"axes.grid": True})
@@ -317,6 +321,11 @@ def plot_density_heatmap(
         ax.invert_xaxis()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    contract = adata.uns.get("dann_target_transform")
+    if contract:
+        label = target_label(density, contract)
+        for axis in fig.axes:
+            axis.set_title(axis.get_title().replace(density, label))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
     return output_path
@@ -490,6 +499,11 @@ def plot_diagnostics_density_heatmap(
         ax.invert_xaxis()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    contract = adata.uns.get("dann_target_transform")
+    if contract:
+        label = target_label(density, contract)
+        for axis in fig.axes:
+            axis.set_title(axis.get_title().replace(density, label))
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
     return output_path
@@ -529,6 +543,21 @@ def run_spatial_heatmaps(
     print(f"Loading predictions from {predictions_path}", flush=True)
     predictions = pd.read_parquet(predictions_path)
     prediction_columns = attach_predictions(adata, predictions)
+    metadata = pq.read_schema(predictions_path).metadata or {}
+    if b"dann_target_transform" in metadata:
+        contract = json.loads(metadata[b"dann_target_transform"])
+        if contract.get("version") != 1:
+            raise ValueError("Unsupported spatial target transformation version.")
+        columns = contract["target_columns"]
+        raw = adata.obs[columns].to_numpy(copy=True)
+        targets, valid = prepare_observed_targets(
+            raw, columns, contract["cd8_normalization"]
+        )
+        for index, column in enumerate(columns):
+            adata.obs[f"raw_{column}"] = raw[:, index]
+            adata.obs[f"valid_{column}"] = valid[:, index]
+            adata.obs[column] = np.where(valid[:, index], targets[:, index], np.nan)
+        adata.uns["dann_target_transform"] = contract
     logit_columns = add_logit_columns(adata, densities, logit_epsilon)
     residual_columns = add_residual_columns(adata, densities)
     width_columns = add_interval_width_columns(adata, densities)

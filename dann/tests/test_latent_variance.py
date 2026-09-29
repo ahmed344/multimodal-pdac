@@ -40,7 +40,7 @@ def test_known_spectrum_and_chunk_invariance(tmp_path, chunk_size):
     np.testing.assert_allclose(spectrum.eigenvalue, [6, 2 / 3])
     np.testing.assert_allclose(spectrum.explained_variance_fraction, [0.9, 0.1])
     assert summary["participation_ratio"] == pytest.approx(1 / 0.82)
-    assert [summary[k] for k in ("pcs_90", "pcs_99", "pcs_99_9")] == [1, 2, 2]
+    assert [summary[k] for k in ("pcs_90", "pcs_99", "pcs_99_9", "pcs_99_99", "pcs_99_999")] == [1, 2, 2, 2, 2]
     assert summary["variance_explained_by_slide_means"] == 0
     assert summary["latent_width"] == 2
 

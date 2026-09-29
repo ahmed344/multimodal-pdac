@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import json
 import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -17,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from dann import ziln
 from dann.config import density_sampling_settings, resolve_device, seed_everything
 from dann.model import AdversarialLatentFusion
+from dann.targets import checkpoint_contract, target_contract
 
 
 DEFAULT_INPUT = Path(
@@ -716,7 +719,8 @@ def load_checkpoint_model(
     missing = required.difference(checkpoint)
     if missing:
         raise KeyError(f"Checkpoint is missing required keys: {sorted(missing)}")
-    config = dict(checkpoint["config"])
+    config = copy.deepcopy(checkpoint["config"])
+    config["data"]["cd8_normalization"] = checkpoint_contract(checkpoint)["cd8_normalization"]
     target_columns = tuple(str(value) for value in checkpoint["target_columns"])
     batch_names = tuple(str(value) for value in checkpoint["batch_names"])
     requested_device = (
@@ -870,7 +874,9 @@ def run_inference(
             candidate.unlink()
     prediction_writer = pq.ParquetWriter(
         temporary_path,
-        output_schema(target_columns),
+        output_schema(target_columns).with_metadata({
+            b"dann_target_transform": json.dumps(target_contract(config)).encode()
+        }),
         compression="zstd",
         use_dictionary=["obs_name"],
     )

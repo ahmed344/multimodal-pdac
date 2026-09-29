@@ -19,6 +19,7 @@ class ZILNLossOutput:
     hurdle: torch.Tensor
     positive: torch.Tensor
     positive_count: torch.Tensor
+    valid_weight_mass: torch.Tensor
 
 
 class ZILNLoss(nn.Module):
@@ -78,11 +79,12 @@ class ZILNLoss(nn.Module):
             include_normal_constant=bool(values["include_normal_constant"]),
         )
 
-    def _reduce(self, values: torch.Tensor) -> torch.Tensor:
+    def _reduce(self, values: torch.Tensor, weight_mass: torch.Tensor) -> torch.Tensor:
         """Apply the configured reduction over all pixels and targets.
 
         Args:
             values (torch.Tensor): Elementwise weighted losses.
+            weight_mass (torch.Tensor): Valid target-weight mass.
 
         Returns:
             torch.Tensor: Scalar reduced loss.
@@ -90,7 +92,6 @@ class ZILNLoss(nn.Module):
 
         if self.reduction == "sum":
             return values.sum()
-        weight_mass = self.target_weights.sum() * values.shape[0]
         return values.sum() / weight_mass.clamp_min(torch.finfo(values.dtype).eps)
 
     def forward(
@@ -99,6 +100,7 @@ class ZILNLoss(nn.Module):
         mu: torch.Tensor,
         sigma: torch.Tensor,
         targets: torch.Tensor,
+        target_valid_mask: torch.Tensor | None = None,
     ) -> ZILNLossOutput:
         """Evaluate hurdle and positive logit-normal loss branches.
 
@@ -107,6 +109,7 @@ class ZILNLoss(nn.Module):
             mu (torch.Tensor): Positive-branch location on the logit-density scale.
             sigma (torch.Tensor): Positive-branch scale, strictly positive.
             targets (torch.Tensor): Bounded density targets in ``[0, 1]``.
+            target_valid_mask (torch.Tensor | None): Observed target entries.
 
         Returns:
             ZILNLossOutput: Total loss and additive reduced components.
@@ -123,13 +126,18 @@ class ZILNLoss(nn.Module):
                 f"Expected {self.target_weights.numel()} targets, "
                 f"observed {targets.shape[-1]}."
             )
-        if torch.any((targets < 0.0) | (targets > 1.0)):
+        if target_valid_mask is None:
+            target_valid_mask = torch.ones_like(targets, dtype=torch.bool)
+        if target_valid_mask.shape != targets.shape or target_valid_mask.dtype != torch.bool:
+            raise ValueError("target_valid_mask must be boolean and match targets.")
+        targets = torch.where(target_valid_mask, targets, torch.zeros_like(targets))
+        if not torch.isfinite(targets).all() or torch.any((targets < 0.0) | (targets > 1.0)):
             raise ValueError("ZILN targets must lie inside [0, 1].")
         if torch.any(sigma <= 0.0):
             raise ValueError("ZILN sigma values must be strictly positive.")
 
         zero_mask = targets == 0.0
-        positive_mask = ~zero_mask
+        positive_mask = ~zero_mask & target_valid_mask
         hurdle = F.binary_cross_entropy_with_logits(
             pi_logits, zero_mask.to(pi_logits.dtype), reduction="none"
         )
@@ -142,12 +150,15 @@ class ZILNLoss(nn.Module):
         positive_nll = torch.where(
             positive_mask, positive_nll, torch.zeros_like(positive_nll)
         )
+        hurdle = torch.where(target_valid_mask, hurdle, torch.zeros_like(hurdle))
         weights = self.target_weights.to(targets).unsqueeze(0)
-        reduced_hurdle = self._reduce(hurdle * weights)
-        reduced_positive = self._reduce(positive_nll * weights)
+        weight_mass = (weights * target_valid_mask).sum()
+        reduced_hurdle = self._reduce(hurdle * weights, weight_mass)
+        reduced_positive = self._reduce(positive_nll * weights, weight_mass)
         return ZILNLossOutput(
             total=reduced_hurdle + reduced_positive,
             hurdle=reduced_hurdle,
             positive=reduced_positive,
             positive_count=positive_mask.sum(),
+            valid_weight_mass=weight_mass,
         )

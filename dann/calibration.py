@@ -6,6 +6,7 @@ Reports aggregate and per-batch metrics on held-out observations.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +21,7 @@ from scipy import stats
 from sklearn.metrics import roc_auc_score
 
 from dann import ziln
+from dann.targets import observed_targets, target_label
 
 
 DEFAULT_COVERAGE_LEVELS = (0.50, 0.90)
@@ -74,10 +76,14 @@ def compute_target_metrics(
     if len(sizes) != 1:
         raise ValueError(f"Metric inputs must share one length; observed {sizes}.")
 
+    valid = np.isfinite(targets)
+    n_excluded = int((~valid).sum())
+    targets, pi, mu, sigma = (values[valid] for values in (targets, pi, mu, sigma))
     is_zero = targets == 0.0
     positive = ~is_zero
     metrics: dict[str, float] = {
         "n": float(targets.size),
+        "n_excluded": float(n_excluded),
         "n_positive": float(positive.sum()),
         "n_zero": float(is_zero.sum()),
         "observed_zero_rate": float(is_zero.mean()) if targets.size else np.nan,
@@ -175,7 +181,7 @@ def _safe_spearman(first: np.ndarray, second: np.ndarray) -> float:
 
 
 def build_metrics_frame(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     target_columns: Sequence[str],
     split: str,
     epsilon: float,
@@ -184,7 +190,7 @@ def build_metrics_frame(
     """Score every target over all samples in the split.
 
     Args:
-        extracted (Mapping[str, np.ndarray]): Targets and ZILN parameter arrays.
+        extracted (Mapping[str, Any]): Targets and ZILN parameter arrays.
         target_columns (Sequence[str]): Ordered density target names.
         split (str): Split name recorded in the table.
         epsilon (float): Clamp applied before observed-value logits.
@@ -195,21 +201,24 @@ def build_metrics_frame(
     """
 
     rows: list[dict[str, Any]] = []
+    targets = observed_targets(extracted)
     for index, column in enumerate(target_columns):
         metrics = compute_target_metrics(
-            np.asarray(extracted["targets"])[:, index],
+            targets[:, index],
             np.asarray(extracted["pi"])[:, index],
             np.asarray(extracted["mu"])[:, index],
             np.asarray(extracted["sigma"])[:, index],
             epsilon,
             coverage_levels,
         )
-        rows.append({"split": split, "target": column, **metrics})
+        rows.append({"split": split, "target": column,
+                     "target_label": target_label(column, extracted.get("target_transform")),
+                     **metrics})
     return pd.DataFrame(rows)
 
 
 def build_batch_metrics_frame(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     target_columns: Sequence[str],
     batch_names: Sequence[str],
     split: str,
@@ -222,7 +231,7 @@ def build_batch_metrics_frame(
     still carrying batch identity into the biology head.
 
     Args:
-        extracted (Mapping[str, np.ndarray]): Targets, parameters, and batch codes.
+        extracted (Mapping[str, Any]): Targets, parameters, and batch codes.
         target_columns (Sequence[str]): Ordered density target names.
         batch_names (Sequence[str]): Display names indexed by batch code.
         split (str): Split name recorded in the table.
@@ -235,6 +244,7 @@ def build_batch_metrics_frame(
 
     batches = np.asarray(extracted["batches"], dtype=np.int64).reshape(-1)
     rows: list[dict[str, Any]] = []
+    targets = observed_targets(extracted)
     for batch_id in np.unique(batches):
         mask = batches == batch_id
         name = (
@@ -244,7 +254,7 @@ def build_batch_metrics_frame(
         )
         for index, column in enumerate(target_columns):
             metrics = compute_target_metrics(
-                np.asarray(extracted["targets"])[mask, index],
+                targets[mask, index],
                 np.asarray(extracted["pi"])[mask, index],
                 np.asarray(extracted["mu"])[mask, index],
                 np.asarray(extracted["sigma"])[mask, index],
@@ -257,6 +267,7 @@ def build_batch_metrics_frame(
                     "batch_id": int(batch_id),
                     "batch": name,
                     "target": column,
+                    "target_label": target_label(column, extracted.get("target_transform")),
                     **metrics,
                 }
             )
@@ -306,14 +317,14 @@ def _hide_unused(axes, num_targets: int) -> None:
 
 
 def _positive_arrays(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     index: int,
     epsilon: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Extract the masked positive-branch inputs for one target.
 
     Args:
-        extracted (Mapping[str, np.ndarray]): Targets and parameter arrays.
+        extracted (Mapping[str, Any]): Targets and parameter arrays.
         index (int): Target column position.
         epsilon (float): Clamp applied before observed-value logits.
 
@@ -321,7 +332,7 @@ def _positive_arrays(
         tuple: Observed logits and the matching mu, sigma, and pi arrays.
     """
 
-    targets = np.asarray(extracted["targets"])[:, index]
+    targets = observed_targets(extracted)[:, index]
     positive = targets > 0.0
     truth = ziln.clipped_logit(targets[positive], epsilon)
     return (
@@ -333,7 +344,7 @@ def _positive_arrays(
 
 
 def plot_pit(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     target_columns: Sequence[str],
     epsilon: float,
     output_path: Path,
@@ -342,7 +353,7 @@ def plot_pit(
     """Plot PIT histograms and uniform QQ plots for the positive branch.
 
     Args:
-        extracted (Mapping[str, np.ndarray]): Targets and parameter arrays.
+        extracted (Mapping[str, Any]): Targets and parameter arrays.
         target_columns (Sequence[str]): Ordered density target names.
         epsilon (float): Clamp applied before observed-value logits.
         output_path (Path): Destination PNG path.
@@ -401,7 +412,7 @@ def plot_pit(
 
 
 def plot_hurdle_reliability(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     target_columns: Sequence[str],
     output_path: Path,
     config: Mapping[str, Any],
@@ -409,7 +420,7 @@ def plot_hurdle_reliability(
     """Plot reliability curves for the structural-zero probability.
 
     Args:
-        extracted (Mapping[str, np.ndarray]): Targets and parameter arrays.
+        extracted (Mapping[str, Any]): Targets and parameter arrays.
         target_columns (Sequence[str]): Ordered density target names.
         output_path (Path): Destination PNG path.
         config (Mapping[str, Any]): Plot settings.
@@ -424,8 +435,10 @@ def plot_hurdle_reliability(
     for index, column in enumerate(target_columns):
         row, col = divmod(index, axes.shape[1])
         axis = axes[row][col]
-        targets = np.asarray(extracted["targets"])[:, index]
+        targets = observed_targets(extracted)[:, index]
         pi = np.asarray(extracted["pi"])[:, index]
+        valid = np.isfinite(targets)
+        targets, pi = targets[valid], pi[valid]
         is_zero = (targets == 0.0).astype(np.float64)
         assignment = np.clip(np.digitize(pi, edges) - 1, 0, RELIABILITY_BINS - 1)
         centers: list[float] = []
@@ -446,7 +459,7 @@ def plot_hurdle_reliability(
             axis.scatter(
                 centers, observed, s=sizes, color="#c44e52", zorder=3, alpha=0.8
             )
-        brier = float(np.mean(np.square(pi - is_zero)))
+        brier = float(np.mean(np.square(pi - is_zero))) if targets.size else np.nan
         axis.set(
             title=f"{column} hurdle reliability (Brier={brier:.4f})",
             xlabel="Predicted pi",
@@ -461,7 +474,7 @@ def plot_hurdle_reliability(
 
 
 def plot_interval_coverage(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     target_columns: Sequence[str],
     epsilon: float,
     output_path: Path,
@@ -473,7 +486,7 @@ def plot_interval_coverage(
     the uncertainty maps overstate confidence; above means they are too wide.
 
     Args:
-        extracted (Mapping[str, np.ndarray]): Targets and parameter arrays.
+        extracted (Mapping[str, Any]): Targets and parameter arrays.
         target_columns (Sequence[str]): Ordered density target names.
         epsilon (float): Clamp applied before observed-value logits.
         output_path (Path): Destination PNG path.
@@ -510,7 +523,7 @@ def plot_interval_coverage(
 
 
 def run_calibration(
-    extracted: Mapping[str, np.ndarray],
+    extracted: Mapping[str, Any],
     target_columns: Sequence[str],
     batch_names: Sequence[str],
     split: str,
@@ -521,7 +534,7 @@ def run_calibration(
     """Write the complete calibration report for one split.
 
     Args:
-        extracted (Mapping[str, np.ndarray]): Targets, parameters, and batch codes.
+        extracted (Mapping[str, Any]): Targets, parameters, and batch codes.
         target_columns (Sequence[str]): Ordered density target names.
         batch_names (Sequence[str]): Display names indexed by batch code.
         split (str): Split name recorded in the tables.
@@ -546,22 +559,26 @@ def run_calibration(
     build_batch_metrics_frame(
         extracted, target_columns, batch_names, split, epsilon, coverage_levels
     ).to_csv(output_dir / "calibration_metrics_by_batch.csv", index=False)
+    display_columns = [
+        target_label(column, extracted.get("target_transform"))
+        for column in target_columns
+    ]
     plot_pit(
         extracted,
-        target_columns,
+        display_columns,
         epsilon,
         output_dir / "calibration_pit.png",
         config,
     )
     plot_hurdle_reliability(
         extracted,
-        target_columns,
+        display_columns,
         output_dir / "calibration_hurdle_reliability.png",
         config,
     )
     plot_interval_coverage(
         extracted,
-        target_columns,
+        display_columns,
         epsilon,
         output_dir / "calibration_interval_coverage.png",
         config,
@@ -573,7 +590,7 @@ def run_calibration(
 def load_extracted_from_frame(
     frame: pd.DataFrame,
     target_columns: Sequence[str],
-) -> tuple[dict[str, np.ndarray], list[str]]:
+) -> tuple[dict[str, Any], list[str]]:
     """Rebuild the arrays ``run_calibration`` needs from a saved wide table.
 
     Accepts the schema written by ``analyze.build_latent_umap_frame``, so the
@@ -585,7 +602,7 @@ def load_extracted_from_frame(
         target_columns (Sequence[str]): Ordered density target names.
 
     Returns:
-        tuple[dict[str, np.ndarray], list[str]]: Extracted arrays and batch names.
+        tuple[dict[str, Any], list[str]]: Extracted arrays and batch names.
     """
 
     required = ["batch_id", "batch"]
@@ -607,7 +624,7 @@ def load_extracted_from_frame(
     batch_names = ["" for _ in range(int(pairs["batch_id"].max()) + 1)]
     for batch_id, name in zip(pairs["batch_id"], pairs["batch"]):
         batch_names[int(batch_id)] = str(name)
-    extracted: dict[str, np.ndarray] = {"batches": batch_ids}
+    extracted: dict[str, Any] = {"batches": batch_ids}
     for key, prefix in (
         ("targets", ""),
         ("pi", "pi_"),
@@ -620,6 +637,23 @@ def load_extracted_from_frame(
                 for column in target_columns
             ]
         )
+    extracted["target_valid_mask"] = np.column_stack([
+        frame[f"valid_{column}"].to_numpy(dtype=bool) if f"valid_{column}" in frame
+        else np.isfinite(extracted["targets"][:, index])
+        for index, column in enumerate(target_columns)
+    ])
+    extracted["targets"] = observed_targets(extracted)
+    extracted["raw_targets"] = np.column_stack([
+        frame.get(f"raw_{column}", frame[column]).to_numpy(dtype=np.float64)
+        for column in target_columns
+    ])
+    if "target_transform_json" in frame and len(frame):
+        contracts = frame["target_transform_json"].drop_duplicates()
+        if len(contracts) != 1:
+            raise ValueError("Export contains inconsistent target transformation metadata.")
+        extracted["target_transform"] = json.loads(contracts.iloc[0])
+        if extracted["target_transform"]["target_columns"] != list(target_columns):
+            raise ValueError("Export target order disagrees with requested targets.")
     return extracted, batch_names
 
 

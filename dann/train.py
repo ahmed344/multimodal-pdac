@@ -19,6 +19,7 @@ from dann.config import apply_smoke_overrides, load_config, resolve_device, seed
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion
+from dann.targets import CD8, checkpoint_contract, target_contract
 
 
 @dataclass
@@ -135,6 +136,7 @@ def _empty_metrics() -> dict[str, float]:
 
     return {
         "samples": 0.0,
+        "biology_mass": 0.0,
         "total": 0.0,
         "biology": 0.0,
         "hurdle": 0.0,
@@ -155,11 +157,12 @@ def _finalize_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
     """
 
     samples = max(float(metrics["samples"]), 1.0)
+    biology_mass = max(float(metrics["biology_mass"]), 1e-12)
     return {
         "total_loss": metrics["total"] / samples,
-        "biology_loss": metrics["biology"] / samples,
-        "hurdle_loss": metrics["hurdle"] / samples,
-        "positive_loss": metrics["positive"] / samples,
+        "biology_loss": metrics["biology"] / biology_mass,
+        "hurdle_loss": metrics["hurdle"] / biology_mass,
+        "positive_loss": metrics["positive"] / biology_mass,
         "batch_loss": metrics["batch"] / samples,
         "batch_accuracy": metrics["batch_correct"] / samples,
     }
@@ -224,6 +227,7 @@ def run_epoch(
                 outputs["mu"],
                 outputs["sigma"],
                 batch["targets"],
+                batch.get("target_valid_mask"),
             )
             discriminator = F.cross_entropy(
                 outputs["batch_logits"], batch["batches"], weight=class_weights
@@ -242,15 +246,24 @@ def run_epoch(
             batch_size = int(batch["targets"].shape[0])
             metrics["samples"] += batch_size
             metrics["total"] += float(total.detach()) * batch_size
-            metrics["biology"] += float(biology.total.detach()) * batch_size
-            metrics["hurdle"] += float(biology.hurdle.detach()) * batch_size
-            metrics["positive"] += float(biology.positive.detach()) * batch_size
+            mass = (
+                float(biology.valid_weight_mass.detach())
+                if ziln_loss.reduction == "mean" else batch_size
+            )
+            metrics["biology_mass"] += mass
+            metrics["biology"] += float(biology.total.detach()) * mass
+            metrics["hurdle"] += float(biology.hurdle.detach()) * mass
+            metrics["positive"] += float(biology.positive.detach()) * mass
             metrics["batch"] += float(discriminator.detach()) * batch_size
             predictions = outputs["batch_logits"].argmax(dim=1)
             metrics["batch_correct"] += float(
                 (predictions == batch["batches"]).sum().detach()
             )
-    return _finalize_metrics(metrics)
+    finalized = _finalize_metrics(metrics)
+    finalized["total_loss"] = (
+        biology_weight * finalized["biology_loss"] + batch_weight * finalized["batch_loss"]
+    )
+    return finalized
 
 
 def save_checkpoint(
@@ -285,6 +298,7 @@ def save_checkpoint(
         "config": dict(config),
         "batch_names": bundle.metadata.batch_names,
         "target_columns": tuple(config["data"]["target_columns"]),
+        "target_transform": target_contract(config),
         "split_indices": bundle.split_indices,
         "best_validation_biology": float(best_validation_biology),
     }
@@ -298,6 +312,7 @@ def load_training_checkpoint(
     model: AdversarialLatentFusion,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    config: Mapping[str, Any],
 ) -> tuple[int, float]:
     """Restore model and optimizer state for resumed training.
 
@@ -306,17 +321,45 @@ def load_training_checkpoint(
         model (AdversarialLatentFusion): Model receiving saved parameters.
         optimizer (torch.optim.Optimizer): Optimizer receiving saved state.
         device (torch.device): Tensor map location.
+        config (Mapping[str, Any]): Requested training configuration to validate.
 
     Returns:
         tuple[int, float]: Next epoch index and prior best validation biology loss.
     """
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if checkpoint_contract(checkpoint) != target_contract(config):
+        raise ValueError("Resume target transformation or target order is incompatible with checkpoint.")
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     return int(checkpoint["epoch"]) + 1, float(
         checkpoint.get("best_validation_biology", math.inf)
     )
+
+
+def summarize_target_validity(bundle: DataBundle, config: Mapping[str, Any]) -> dict[str, Any]:
+    """Report exclusions and require usable normalized-CD8 supervision."""
+    contract = target_contract(config)
+    if not contract["cd8_normalization"]["enabled"]:
+        return {}
+    cd8 = contract["target_columns"].index(CD8)
+    metadata = bundle.metadata
+    summary = {}
+    for name, indices in bundle.split_indices.items():
+        valid = metadata.target_valid_mask[indices, cd8]
+        reasons = metadata.exclusion_reasons[indices]
+        summary[name] = {
+            "rows": int(indices.size), "valid_cd8": int(valid.sum()),
+            "positive_cd8": int(((metadata.targets[indices, cd8] > 0) & valid).sum()),
+            "excluded_low_non_tumor": int((reasons == 1).sum()),
+            "excluded_ratio_above_one": int((reasons == 2).sum()),
+        }
+    print("CD8 target validity: " + json.dumps(summary), flush=True)
+    if summary["train"]["valid_cd8"] == 0:
+        raise ValueError("Training has no valid CD8 observations after normalization.")
+    if summary["train"]["positive_cd8"] == 0:
+        raise ValueError("Training has no valid positive CD8 observations after normalization.")
+    return summary
 
 
 def train_model(config: Mapping[str, Any]) -> Path:
@@ -335,6 +378,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
     )
     device = resolve_device(str(training["device"]))
     bundle = create_data_bundle(config)
+    target_summary = summarize_target_validity(bundle, config)
     model = AdversarialLatentFusion.from_config(
         config,
         num_batches=len(bundle.metadata.batch_names),
@@ -357,7 +401,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
     resume = training.get("resume_checkpoint")
     if resume:
         start_epoch, prior_best = load_training_checkpoint(
-            Path(resume), model, optimizer, device
+            Path(resume), model, optimizer, device, config
         )
     stopper = EarlyStopping(
         patience=int(training["early_stopping_patience"]),
@@ -377,6 +421,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 ],
                 "batch_names": bundle.metadata.batch_names,
                 "target_columns": config["data"]["target_columns"],
+                "target_transform": target_contract(config),
+                "target_validity": target_summary,
                 "split_sizes": {
                     name: int(indices.size)
                     for name, indices in bundle.split_indices.items()

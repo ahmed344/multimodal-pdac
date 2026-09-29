@@ -12,6 +12,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from dann.targets import prepare_targets
+
 
 @dataclass(frozen=True)
 class AnnDataMetadata:
@@ -23,6 +25,9 @@ class AnnDataMetadata:
     mz_values: np.ndarray
     num_observations: int
     num_peaks: int
+    raw_targets: np.ndarray | None = None
+    target_valid_mask: np.ndarray | None = None
+    exclusion_reasons: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +63,7 @@ def load_anndata_metadata(
     target_columns: Sequence[str],
     batch_column: str,
     matrix_key: str = "X",
+    cd8_normalization: Mapping[str, Any] | None = None,
 ) -> AnnDataMetadata:
     """Read labels and feature metadata while leaving MSI values on disk.
 
@@ -66,6 +72,7 @@ def load_anndata_metadata(
         target_columns (Sequence[str]): Ordered density observation columns.
         batch_column (str): Categorical batch observation column.
         matrix_key (str): Sparse matrix source key.
+        cd8_normalization (Mapping | None): Target transformation settings.
 
     Returns:
         AnnDataMetadata: Validated labels, batches, m/z values, and dimensions.
@@ -78,13 +85,14 @@ def load_anndata_metadata(
         adata.file.close()
         raise KeyError(f"Missing required observation columns: {missing}")
 
-    targets = adata.obs[list(target_columns)].to_numpy(dtype=np.float32, copy=True)
-    if not np.isfinite(targets).all():
+    raw_targets = adata.obs[list(target_columns)].to_numpy(copy=True)
+    try:
+        targets, target_valid_mask, exclusion_reasons = prepare_targets(
+            raw_targets, target_columns, cd8_normalization
+        )
+    except (ValueError, TypeError):
         adata.file.close()
-        raise ValueError("Density targets contain non-finite values.")
-    if np.any((targets < 0.0) | (targets > 1.0)):
-        adata.file.close()
-        raise ValueError("Density targets must lie inside [0, 1].")
+        raise
 
     batch_series = adata.obs[batch_column].astype("category")
     if batch_series.isna().any():
@@ -119,6 +127,9 @@ def load_anndata_metadata(
         )
     return AnnDataMetadata(
         targets=targets,
+        raw_targets=raw_targets,
+        target_valid_mask=target_valid_mask,
+        exclusion_reasons=exclusion_reasons,
         batch_codes=batch_codes,
         batch_names=batch_names,
         mz_values=mz_values,
@@ -331,6 +342,15 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
             "peak_indices": peak_indices,
             "intensities": intensities,
             "targets": self.metadata.targets[row],
+            "raw_targets": (
+                self.metadata.raw_targets[row]
+                if self.metadata.raw_targets is not None else self.metadata.targets[row]
+            ),
+            "target_valid_mask": (
+                self.metadata.target_valid_mask[row]
+                if self.metadata.target_valid_mask is not None
+                else np.ones(self.metadata.targets.shape[1], dtype=bool)
+            ),
             "batch": int(self.metadata.batch_codes[row]),
             "row_id": row,
         }
@@ -407,6 +427,13 @@ def sparse_collate(samples: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tens
         "sample_indices": torch.from_numpy(sample_indices),
         "peak_counts": torch.from_numpy(lengths),
         "targets": torch.from_numpy(targets),
+        "raw_targets": torch.from_numpy(np.stack([
+            sample.get("raw_targets", sample["targets"]) for sample in samples
+        ])),
+        "target_valid_mask": torch.from_numpy(np.stack([
+            sample.get("target_valid_mask", np.ones_like(sample["targets"], dtype=bool))
+            for sample in samples
+        ])),
         "batches": torch.from_numpy(batches),
         "row_ids": torch.from_numpy(row_ids),
     }
@@ -452,6 +479,7 @@ def create_data_bundle(config: Mapping[str, Any]) -> DataBundle:
         data_config["target_columns"],
         data_config["batch_column"],
         data_config["matrix_key"],
+        data_config.get("cd8_normalization"),
     )
     if int(config["model"]["num_peaks"]) != metadata.num_peaks:
         raise ValueError(

@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import yaml
 
+from dann.targets import normalization_settings, target_contract
+
 
 def density_sampling_settings(analysis: Mapping[str, Any]) -> tuple[int, int]:
     """Resolve and validate Monte Carlo settings, including legacy defaults."""
@@ -82,6 +84,8 @@ def load_config(path: Path) -> dict[str, Any]:
     count, seed = density_sampling_settings(config["analysis"])
     config["analysis"].update(density_mc_samples=count, density_mc_seed=seed)
     config["latent_variance"] = latent_variance_settings(config.get("latent_variance"))
+    config["data"]["cd8_normalization"] = normalization_settings(config["data"].get("cd8_normalization"))
+    target_contract(config)
     return config
 
 

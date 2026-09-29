@@ -11,6 +11,9 @@ data:
   matrix_key: X  # Sparse MSI source: X or layers/<layer_name>.
   batch_column: batch  # Observation column used as the adversarial batch label.
   target_columns: [Density_CD8, Density_Tumor, Density_Collagen, Density_Stroma]  # Ordered IHC density targets.
+  cd8_normalization:
+    enabled: true  # CD8 density per non-tumor area; requires retraining.
+    min_non_tumor_fraction: 0.01  # Inclusive eligibility threshold; larger-than-one ratios are excluded.
   train_fraction: 0.80  # Batch-stratified fraction used for model fitting.
   validation_fraction: 0.10  # Batch-stratified fraction used for validation.
   test_fraction: 0.10  # Batch-stratified fraction reserved for final analysis.
