@@ -20,7 +20,8 @@ from dann.config import apply_smoke_overrides, load_config, resolve_device, seed
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion
-from dann.checkpoints import architecture_contract, validate_checkpoint
+from dann.checkpoints import (architecture_contract, validate_checkpoint, training_data_contract,
+                              validate_training_data_contract)
 from dann.tiles import row_identity
 from dann.targets import CD8, checkpoint_contract, target_contract
 
@@ -536,10 +537,12 @@ def save_checkpoint(
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
+    identity = row_identity(Path(config["data"]["path"]), config["data"])
     payload = {
         "architecture": architecture_contract(config),
         "optimizer_parameter_names": list(dict(model.named_parameters())),
-        "data_identity": row_identity(Path(config["data"]["path"]), config["data"]),
+        "data_identity": identity,
+        "training_data_contract": training_data_contract(config, identity),
         "selection_metric": "mean_valid_cd8_ziln",
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
@@ -580,6 +583,7 @@ def load_training_checkpoint(
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     if checkpoint_contract(checkpoint) != target_contract(config):
         raise ValueError("Resume target transformation or target order is incompatible with checkpoint.")
+    validate_training_data_contract(checkpoint, config)
     validate_checkpoint(checkpoint, config, model, optimizer=True)
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
@@ -630,6 +634,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
     device = resolve_device(str(training["device"]))
     resume_payload = (torch.load(training["resume_checkpoint"], map_location="cpu", weights_only=False)
                       if training.get("resume_checkpoint") else {})
+    if resume_payload:
+        validate_training_data_contract(resume_payload, config)
     bundle = create_data_bundle(config, resume_payload.get("split_indices"), resume_payload.get("data_identity"))
     if resume_payload and tuple(resume_payload["batch_names"]) != bundle.metadata.batch_names:
         raise ValueError("Resume batch order is incompatible.")

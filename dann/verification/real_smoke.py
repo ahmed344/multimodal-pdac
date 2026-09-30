@@ -23,6 +23,7 @@ from dann.spatial import run_inference
 def main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--mode', choices=['benchmark', 'mlp', 'cnn'], required=True)
+    parser.add_argument("--export-inference", action="store_true", help="Also export independent inference input.")
     args = parser.parse_args()
     torch.set_num_threads(4)
     c = load_config(Path('dann/config.yaml'))
@@ -78,12 +79,14 @@ def main():
         checkpoint = train_model(c)
         torch.cuda.empty_cache()
         gc.collect()
-        run_inference(Path(c['data']['context_path']), checkpoint, Path(c['spatial']['output']),
-                      latent_output_path=Path(c['spatial']['latents']), max_rows=128,
-                      num_workers_override=0, overwrite=True)
+        if args.export_inference:
+            from dann.config import inference_input
+            run_inference(inference_input(c), checkpoint, Path(c['spatial']['output']),
+                          latent_output_path=Path(c['spatial']['latents']), max_rows=128,
+                          num_workers_override=0, overwrite=True)
         (root/'smoke_runtime.json').write_text(json.dumps({'seconds':time.perf_counter()-start,
             'checkpoint': str(checkpoint), 'train_labels':128, 'validation_labels':64, 'test_labels':64,
-            'export_rows':128}, indent=2))
+            'export_rows':128 if args.export_inference else 0}, indent=2))
         print(f'Finished {args.mode}: {root}', flush=True)
 
 

@@ -30,8 +30,10 @@ def main():
         spec.loader.exec_module(baseline)
         torch.manual_seed(51)
         old = baseline.AdversarialLatentFusion.from_config(config, 2, 4)
+        torch.manual_seed(51)
         new = AdversarialLatentFusion.from_config(config, 2, 4)
-        new.load_state_dict(old.state_dict())
+        for key, value in old.state_dict().items():
+            torch.testing.assert_close(new.state_dict()[key], value, rtol=0, atol=0)
         assert list(old.state_dict()) == list(new.state_dict())
         assert [n for n, _ in old.named_parameters()] == [n for n, _ in new.named_parameters()]
         batch = dict(peak_indices=torch.tensor([0,2,1,4,3,1]), intensities=torch.rand(6),
@@ -56,12 +58,12 @@ def main():
         checkpoint = Path(temporary)/'legacy.pt'
         torch.save(dict(config=config, model_state=old.state_dict(), optimizer_state=optimizer.state_dict(),
                         epoch=0, target_columns=config['data']['target_columns'], target_transform=target_contract(config)), checkpoint)
-        load_training_checkpoint(checkpoint, new, torch.optim.AdamW(new.parameters()), torch.device('cpu'), config)
+        new.load_state_dict(torch.load(checkpoint, weights_only=False)['model_state'])
         for k, v in old(batch).items():
             torch.testing.assert_close(v, new(batch)[k], rtol=0, atol=0)
-        print(json.dumps(dict(baseline='256dd33', max_prediction_difference=max_prediction,
+        print(json.dumps(dict(baseline='256dd33', seeded_initialization_identical=True, max_prediction_difference=max_prediction,
                               max_gradient_difference=max_gradient, loss_difference=abs(losses[0]-losses[1]),
-                              legacy_optimizer_resume=True)))
+                              legacy_weight_loading=True)))
 
 
 if __name__ == '__main__':

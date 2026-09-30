@@ -1,4 +1,4 @@
-"""Sparse tissue tiles with explicit context, core supervision, and grid identities."""
+"""Sparse spatial tiles with explicit context, core supervision, and grid identities."""
 from __future__ import annotations
 
 import warnings
@@ -82,7 +82,20 @@ class SpatialTileDataset(Dataset):
         from dann.config import execution_settings
         from dann.spatial import SparseInferenceDataset
         self.data = config['data']
-        self.path = Path(input_path or self.data['context_path'])
+        if metadata is not None:
+            self.path = Path(self.data['path'])
+            if input_path is not None and Path(input_path).resolve() != self.path.resolve():
+                raise ValueError("Supervised spectra and context must come from data.path.")
+        else:
+            if input_path is None:
+                raise ValueError("Inference requires an explicit input path.")
+            self.path = Path(input_path)
+        stat = self.path.stat()
+        source_identity = (str(self.path.resolve()), stat.st_size, stat.st_mtime_ns,
+                           self.data['matrix_key'], self.data['batch_column'],
+                           self.data['x_column'], self.data['y_column'])
+        if geometry is not None and (len(geometry) != 5 or geometry[4] != source_identity):
+            raise ValueError("Cached geometry source identity differs from the input file.")
         if geometry is None:
             self.keys, features = read_grid(self.path, self.data)
             from dann.data_loader import _matrix_group_path
@@ -103,20 +116,15 @@ class SpatialTileDataset(Dataset):
         self.latent_radius = execution_settings(config)['latent_radius']
         self.biology_radius = execution_settings(config)['biology_radius']
         self.size = self.core_size + 2 * self.halo
-        if metadata is not None and geometry is None:
-            label_keys, label_features = read_grid(Path(self.data['path']), self.data)
-            if not np.array_equal(features, label_features):
-                raise ValueError("Context and labeled feature order differ.")
-            alignment = self.keys.get_indexer(label_keys)
-            if (alignment < 0).any():
-                raise ValueError("Every labeled row must align uniquely to a context grid row.")
-        elif metadata is not None:
-            alignment = geometry[3]
-        else:
-            alignment = None
-        selected_context = self.indices if alignment is None else alignment[self.indices]
+        if len(features) != config['model']['num_peaks']:
+            raise ValueError("Context feature width differs from configured num_peaks.")
+        if metadata is not None and metadata.num_observations != len(self.keys):
+            raise ValueError("Supervised metadata rows differ from labeled grid.")
+        if self.indices.ndim != 1 or np.any(self.indices < 0) or np.any(self.indices >= len(self.keys)):
+            raise ValueError("Selected rows are outside the source grid.")
+        selected_context = self.indices
         self.lookup = ({key: row for row, key in enumerate(self.keys)} if geometry is None else geometry[2])
-        self.geometry = (self.keys, features, self.lookup, alignment)
+        self.geometry = (self.keys, features, self.lookup, None, source_identity)
         groups = {}
         for output_row, context_row in zip(self.indices, selected_context):
             slide, x, y = self.keys[context_row]

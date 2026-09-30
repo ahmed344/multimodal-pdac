@@ -39,3 +39,31 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
             state = checkpoint['optimizer_state']['state'].get(index, {})
             if any(state[k].shape != parameter.shape for k in ('exp_avg', 'exp_avg_sq') if k in state):
                 raise ValueError('Cannot resume: optimizer parameter shapes are incompatible.')
+
+
+def training_data_contract(config: Mapping[str, Any], identity=None) -> dict[str, Any]:
+    """Record the labeled-only source and allowed held-out spectral context."""
+    from pathlib import Path
+    from dann.tiles import row_identity
+    return {
+        'version': 1,
+        'spectra_source': 'data.path',
+        'context_source': 'data.path',
+        'supervision': 'selected_split_core_labels_only',
+        'cross_split_spectral_context': 'all_occupied_labeled_file_rows',
+        'labeled_path': str(Path(config['data']['path']).resolve()),
+        'labeled_identity': identity if identity is not None else row_identity(Path(config['data']['path']), config['data']),
+    }
+
+
+def validate_training_data_contract(checkpoint: Mapping[str, Any], config: Mapping[str, Any]) -> None:
+    """Reject unknown or incompatible supervised provenance before loading weights."""
+    saved = checkpoint.get('training_data_contract')
+    if saved is None:
+        raise ValueError('Missing training_data_contract: legacy provenance is unknown; inference only.')
+    expected = training_data_contract(config)
+    # A relocated copy with identical ordered rows/features remains compatible.
+    if {k: v for k, v in saved.items() if k != 'labeled_path'} != {k: v for k, v in expected.items() if k != 'labeled_path'}:
+        raise ValueError('Incompatible training_data_contract for supervised training/analysis.')
+    if checkpoint.get('data_identity', saved['labeled_identity']) != saved['labeled_identity']:
+        raise ValueError('Checkpoint data identity and training_data_contract disagree.')

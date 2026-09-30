@@ -63,13 +63,25 @@ therefore use halo six and 44×44 input tiles. Each biology prediction sees a
 13×13 spectral-input neighborhood, and each exported latent sees 7×7. Both heads
 run before core rows are selected, so CNN heads retain their latent halo.
 
-Context comes from `data.context_path` (`adata_assembled_tissue.h5ad`), while
-supervision comes from `data.path` (`adata_assembled.h5ad`). `batch_column`,
-`x_column`, and `y_column` define unique integer grid identities. Feature order
-and labeled-to-context alignment are validated. Observation names may repeat.
-Coordinates are never compressed, interpolated, or joined across slides. Held-out
-and unlabeled MSI can provide context, but only the selected core rows contribute
-biology and batch losses. No edge rows are excluded.
+All supervised spectra, neighborhoods, labels, and masks come from `data.path`
+(`adata_assembled.h5ad`). `data.context_path` is a backward-compatible name for
+an **inference-only** input (`adata_assembled_tissue.h5ad`); training works when it
+is absent or nonexistent. Inference resolves explicit `--input` before the runtime
+`data.context_path`, never from a checkpoint or the training-file default.
+`batch_column`, `x_column`, and `y_column` define unique integer grid identities
+within each file independently. Coordinate matches across these files do not
+establish biological correspondence. Observation names may repeat. Coordinates
+are never compressed, interpolated, or joined across slides. All occupied
+labeled-file rows, including held-out spectra, may provide context; only selected
+split core labels contribute biology and batch losses. Native gaps remain masked,
+and no lesion filter or edge exclusion is applied.
+
+Checkpoints record a versioned `training_data_contract` separately from model
+architecture and preprocessing. Missing or incompatible provenance prevents
+training resume and supervised analysis. Legacy weights remain loadable for
+inference/inspection, with unknown provenance recorded in export metadata; saved
+splits may still initialize fresh experiments. Historical checkpoints are never
+rewritten.
 
 `model.spectral_peak_budget: 65536` limits spectral microbatches to complete
 spectra targeting that many active peaks. A single spectrum exceeding the budget
@@ -419,9 +431,9 @@ python -m dann.verification.real_smoke --mode cnn
 ```
 
 The baseline comparison loads the original model from Git commit `256dd33`, copies
-weights, and compares predictions, gradients, and legacy optimizer resume. Real
-smoke runs use 128 training, 64 validation, and 64 test labels, one epoch, and a
-128-row tissue export. They write under each combination's `verification/smoke/`.
+weights, and compares predictions, gradients, and legacy weight loading. Real
+smoke runs use 128 training, 64 validation, and 64 test labels and one epoch.
+An optional `--export-inference` adds a 128-row independent inference export. They write under each combination's `verification/smoke/`.
 The benchmark uses the uncapped training split with the full default logical
 spatial batch and records GPU memory, wall time, occupancy, and supervised counts.
 These checks validate execution and contracts; they do not compare converged fits.
@@ -440,7 +452,7 @@ python -m dann.verification.fit_diagnosis \
 This uses 64 saved training rows, balanced between zero and positive CD8 in four
 8×8 cores on two slides, retaining the full CNN halo. All four target masks and
 the configured biology loss are preserved. Both CNN and MLP fits use the same
-tissue spectra; any differences from the labeled file are recorded explicitly.
+labeled-file spectra; supervised core values are checked against direct labeled-file reads.
 The runner audits fresh/fitted variation, MSI sensitivity, biology gradients,
 and updates, then tries the three prescribed dropout-free, non-adversarial fits
 (up to 500 updates or five minutes each). A CNN gate pass triggers separate
@@ -464,3 +476,72 @@ python -m dann.verification.fit_stage_audit \
 
 This records its own timing and the combined experiment time in
 `layer_followup.json`. It retains the original loss and model parameters.
+
+### Full-epoch CNN isolation controls
+
+`python -m dann.verification.epoch_comparison` runs one isolated comparison in a
+**new** output directory. Use the staged all-MLP configuration and the preserved
+MLP checkpoint for its saved split and row/feature identity contract. For example:
+
+```bash
+python -m dann.verification.epoch_comparison \
+  --config dann/config.yaml \
+  --reference-checkpoint <preserved-MLP-model/best.pt> \
+  --output <new-diagnostic-directory>/A \
+  --input-source labeled --execution-path pixel --epoch-limit 3
+```
+
+Run controls sequentially and review each completed three-epoch trajectory before
+launching its successor. Corrected A uses `labeled/pixel`; C uses
+`labeled/flat-tiles`; D uses `labeled/spatial`. Tissue training is rejected. C and D retain exactly the same
+supervised tile-core row ordering and eight-tile logical batches. D copies the
+MLP into 1×1 convolutions and checks deterministic outputs, parameter gradients,
+and an AdamW update in float64 before training with configured dropout. Missing
+sites are masked after every layer. Spectral microbatching remains enabled in D.
+
+Progression requires epoch-three validation CD8 loss to improve over the
+training-fitted constant by at least `early_stopping_min_delta`, biology loss to
+beat its constant, and positive-CD8 R² to be positive. Report MSI shuffle
+sensitivity alongside this decision. Repeat a failed control once unchanged;
+stop downstream training on a second failure or disagreeing outcomes. The source
+correction does not authorize 3×3 controls, depth changes, learning-rate searches,
+or production fits.
+
+**Historical correction:** previous B/C comparisons used inappropriate tissue
+training spectra. They cannot establish tile-batching failure in the intended
+PDAC pipeline; tissue-trained CNN results do not validate the corrected pipeline.
+A's labeled-file measurements and the seeded-initialization fix remain relevant.
+See the correction notice in
+[`2026-09-30-dann-three-epoch-isolation.md`](../markdowns/2026-09-30-dann-three-epoch-isolation.md).
+
+The runner retains `training.epochs` as the GRL schedule horizon (300 for the
+staged reference); `--epoch-limit 3` stops after three complete epochs. It always
+uses the reference's 0.01 learning rate, never the spatial learning rate. No test
+evaluation, early stopping, sample caps, or tissue exports occur. Constants are
+fit exclusively on training labels and scored on validation labels. Stage,
+shuffle, and gradient audits use a recorded fixed validation batch, with no
+optimizer update and with training RNG state preserved. Full validation metrics
+and predictions are saved before training and after every epoch. Histories,
+source snapshots, split arrays, initial MLP weights, checkpoints, settings,
+update counts, row-order hashes, timings, and preservation checks remain under
+the new directory. Historical working-run metrics provide context; the old
+64-row overfit threshold is not used as a full-data gate.
+
+Pixel and flattened-tile checkpoints retain the production architecture schema;
+their source/batching protocol is recorded separately in `settings.json` and
+must be respected when reproducing training. Converted spatial controls use the
+explicit `diagnostic-spatial-v1` format and must be reconstructed using
+`spatial_control`, not passed to production inference/resume. Production
+checkpoint keys and parameter registration order have not changed. The encoder
+now preserves the original seeded initialization order: construct peak and
+aggregation MLPs before the final normal draw for the embedding table.
+
+Large flattened tile batches can fragment the CUDA allocator. Prefix the same
+command with `PYTORCH_ALLOC_CONF=expandable_segments:True` when needed; this is
+recorded in diagnostic settings and leaves logical batches and model numerics
+unchanged. The flat reader loads only supervised core spectra, with regression
+coverage against the full grid reader's core extraction.
+
+Corrected source-isolation tests and the required sequential comparisons are
+reported in [`2026-09-30-dann-labeled-source-correction.md`](../markdowns/2026-09-30-dann-labeled-source-correction.md).
+The two corrected A runs disagreed, so the stopping rule withheld C and D.

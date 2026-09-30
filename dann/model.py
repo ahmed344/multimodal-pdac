@@ -27,10 +27,13 @@ class IntensityWeightedPeakEncoder(DeepSetsEncoder):
                  aggregation_hidden_dims, latent_dim, activation="gelu", dropout=0.,
                  use_layer_norm=True, inference_peak_chunk_size=262144):
         super().__init__(num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
-                         activation, dropout, use_layer_norm, inference_peak_chunk_size)
+                         activation, dropout, use_layer_norm, inference_peak_chunk_size,
+                         initialize_embeddings=False)
         self.aggregation_mlp = MLPAggregation(
             peak_output_dim, aggregation_hidden_dims, latent_dim, activation=activation,
             dropout=dropout, use_layer_norm=use_layer_norm)
+        # Preserve the original seeded draw order: peak MLP, aggregation, embedding.
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
 
     def forward(self, *args, **kwargs):
         return self.aggregation_mlp(super().forward(*args, **kwargs))

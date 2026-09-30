@@ -18,6 +18,8 @@ class DeepSetsEncoder(nn.Module):
         dropout: float = 0.0,
         use_layer_norm: bool = True,
         inference_peak_chunk_size: int = 262_144,
+        *,
+        initialize_embeddings: bool = True,
     ) -> None:
         """Initialize the learnable peak dictionary and Deep Sets MLPs.
 
@@ -31,6 +33,8 @@ class DeepSetsEncoder(nn.Module):
             use_layer_norm (bool): Apply hidden LayerNorm.
             inference_peak_chunk_size (int): Maximum active peaks passed through
                 the per-peak MLP at once when gradients are disabled.
+            initialize_embeddings (bool): Defer the final embedding draw when a
+                compatibility wrapper must first construct aggregation layers.
 
         Returns:
             None: Module parameters are initialized.
@@ -51,7 +55,8 @@ class DeepSetsEncoder(nn.Module):
             dropout,
             use_layer_norm,
         )
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        if initialize_embeddings:
+            nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
 
     def forward(
         self,

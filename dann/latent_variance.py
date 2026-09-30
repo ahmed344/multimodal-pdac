@@ -259,7 +259,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     """Compute and write diagnostics without invoking a model or inference."""
     args = parse_args(argv)
-    settings = load_config(args.config)["latent_variance"]
+    config = load_config(args.config)
+    settings = config["latent_variance"]
+    from dann.config import inference_input
+    settings["input"] = str(inference_input(config, args.input))
     for key in ("latents", "input", "output_dir", "slide_column"):
         value = getattr(args, key)
         if value is not None:

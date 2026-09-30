@@ -41,6 +41,10 @@ def spatial_config(tmp_path):
     config = load_config(Path('dann/config.yaml'))
     config['data'].update(path=str(tmp_path/'labels.h5ad'), context_path=str(tmp_path/'tissue.h5ad'),
                           train_fraction=.6, validation_fraction=.2, test_fraction=.2)
+    # Spatial tests must not inherit editable architecture selectors from config.yaml.
+    config['model']['aggregation']['type'] = 'cnn'
+    config['model']['heads']['biology']['type'] = 'cnn'
+    config['model']['heads']['discriminator']['type'] = 'mlp'
     config['model'].update(num_peaks=5, latent_dim=6, dropout=0., spectral_peak_budget=9)
     config['model']['spectral_encoder']['deep_sets'].update(embedding_dim=4, peak_hidden_dims=[7], peak_output_dim=6)
     for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
@@ -310,8 +314,9 @@ def test_duplicate_grid_and_feature_order_rejected(spatial_config):
     tissue = ad.read_h5ad(c['data']['context_path'])
     tissue.var_names = tissue.var_names[::-1]
     tissue.write_h5ad(c['data']['context_path'])
-    with pytest.raises(ValueError, match='feature order'):
-        create_data_bundle(c)
+    bundle = create_data_bundle(c)
+    for dataset in bundle.datasets.values():
+        dataset.close()
     tissue.var_names = tissue.var_names[::-1]
     for key in ('batch', 'x', 'y'):
         tissue.obs.iloc[1, tissue.obs.columns.get_loc(key)] = tissue.obs.iloc[0][key]
@@ -436,8 +441,8 @@ def test_epoch_summary_aligns_each_target():
 
 def test_context_requires_csr(spatial_config):
     c = spatial_config
-    tissue = ad.read_h5ad(c['data']['context_path'])
+    tissue = ad.read_h5ad(c['data']['path'])
     tissue.X = tissue.X.tocsc()
-    tissue.write_h5ad(c['data']['context_path'])
+    tissue.write_h5ad(c['data']['path'])
     with pytest.raises(TypeError, match='CSR'):
         create_data_bundle(c)

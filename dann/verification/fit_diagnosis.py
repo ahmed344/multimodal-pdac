@@ -249,7 +249,9 @@ def run_fit(name, config, batch, num_batches, lr, adversarial, baseline, root, d
         out = model(batch, grl_strength=0.)
     np.savez(directory/'predictions.npz', row_ids=batch['row_ids'].cpu().numpy(),
              **{k: out[k].cpu().numpy() for k in ('pi', 'mu', 'sigma')})
-    torch.save({'model_state': model.cpu().state_dict(), 'config': config, 'diagnostic_only': True}, directory/'last.pt')
+    from dann.checkpoints import training_data_contract
+    torch.save({'model_state': model.cpu().state_dict(), 'config': config, 'diagnostic_only': True,
+                'training_data_contract': training_data_contract(config)}, directory/'last.pt')
     result = dict(name=name, final=history[-1], best_biology=best, updates=step,
                   seconds=time.monotonic()-start, mean_update_seconds=float(np.mean(step_times)) if step_times else 0.)
     save_json(directory/'summary.json', result)
@@ -270,6 +272,8 @@ def main():
     source_hash = hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
     config = copy.deepcopy(checkpoint['config'])
+    from dann.checkpoints import validate_training_data_contract
+    validate_training_data_contract(checkpoint, config)
     config['training']['core_size'] = 8
     seed = config['training']['seed']
     data = config['data']
@@ -291,7 +295,7 @@ def main():
     selected = cpu['row_ids'].numpy()
     identities = keys.to_frame(index=False).iloc[selected].copy()
     identities.insert(0, 'row_id', selected)
-    identities['context_row_id'] = tile_data.geometry[3][selected]
+    identities['context_row_id'] = selected
     for j, target in enumerate(data['target_columns']):
         identities[target+'_raw'] = metadata.raw_targets[selected, j]
         identities[target] = metadata.targets[selected, j]
@@ -317,9 +321,9 @@ def main():
             context_pixel_samples.append(dict(label, peak_indices=context['peak_indices'],
                                                intensities=context['intensities']))
             # Check the context reader independently against raw CSR disk entries.
-            context_row = int(tile_data.geometry[3][row])
+            context_row = int(row)
             from dann.data_loader import _matrix_group_path
-            with h5py.File(data['context_path'], 'r') as handle:
+            with h5py.File(data['path'], 'r') as handle:
                 matrix = handle[_matrix_group_path(data['matrix_key'])]
                 a, b = matrix['indptr'][context_row:context_row+2]
                 peaks = np.asarray(matrix['indices'][a:b], dtype=np.int64)

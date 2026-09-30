@@ -41,6 +41,8 @@ def latent_variance_settings(settings: Mapping[str, Any] | None = None) -> dict[
         raise ValueError("latent_variance must be a mapping.")
     resolved = {**defaults, **(settings or {})}
     for key in ("input", "latents", "output_dir", "slide_column"):
+        if key == "input" and resolved[key] is None:
+            continue  # Training configurations need no independent inference input.
         if not isinstance(resolved[key], str) or not resolved[key].strip():
             raise ValueError(f"latent_variance.{key} must be a nonempty string.")
     for key in ("chunk_size", "figure_dpi"):
@@ -227,7 +229,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         training.update(training[mode])
     if mode == "spatial":
         data = config["data"]
-        for key in ("context_path", "x_column", "y_column", "batch_column"):
+        for key in ("path", "x_column", "y_column", "batch_column"):
             if not isinstance(data.get(key), str) or not data[key]:
                 raise ValueError(f"Spatial execution requires data.{key}.")
         training.setdefault("core_size", 32)
@@ -260,7 +262,18 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         config["spatial"] = {"output": str(root / "analysis/spatial/spatial_predictions.parquet"),
                              "latents": str(root / "analysis/spatial/spatial_latent.parquet")}
         config.setdefault("latent_variance", {}).update(
-            input=config["data"].get("context_path", config["data"]["path"]),
+            input=config["data"].get("context_path"),
             latents=config["spatial"]["latents"], output_dir=str(root / "latent_variance"))
         result["run_dir"] = str(root)
     return config
+
+
+def inference_input(config: Mapping[str, Any], explicit: Path | None = None) -> Path:
+    """Resolve inference input independently of frozen training preprocessing."""
+    value = explicit if explicit is not None else config['data'].get('context_path')
+    if not value:
+        raise ValueError("Inference requires --input or runtime data.context_path.")
+    path = Path(value)
+    if not path.is_file():
+        raise FileNotFoundError(f"Inference input does not exist: {path}")
+    return path

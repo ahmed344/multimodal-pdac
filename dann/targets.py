@@ -59,7 +59,7 @@ def checkpoint_analysis_config(config: Mapping[str, Any], checkpoint: Mapping[st
     resolved = copy.deepcopy(dict(config))
     saved = checkpoint["config"]
     resolved["model"] = copy.deepcopy(saved["model"])
-    for key in ("matrix_key", "batch_column", "intensity_transform", "intensity_clip_max", "nonzero_threshold", "context_path", "x_column", "y_column"):
+    for key in ("matrix_key", "batch_column", "intensity_transform", "intensity_clip_max", "nonzero_threshold", "x_column", "y_column"):
         if key in saved["data"]:
             resolved["data"][key] = saved["data"][key]
     resolved["loss"]["logit_epsilon"] = saved["loss"]["logit_epsilon"]

@@ -607,11 +607,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         int: Process exit status, zero on success.
     """
 
+    from dann.config import inference_input
     args = parse_args(argv)
     from dann.config import load_config
     config = load_config(args.config)
     output_dir = run_spatial_heatmaps(
-        input_path=args.input or Path(config["data"]["context_path"]),
+        input_path=inference_input(config, args.input),
         predictions_path=args.predictions or Path(config["spatial"]["output"]),
         output_dir=args.output_dir or Path(config["analysis"]["output_dir"]) / "spatial/heatmaps",
         densities=args.densities,

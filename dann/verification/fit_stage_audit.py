@@ -49,6 +49,8 @@ def main():
     if elapsed >= 1200:
         raise RuntimeError('Insufficient remaining budget for the follow-up allocation.')
     checkpoint = torch.load(manifest['checkpoint'], map_location='cpu', weights_only=False)
+    from dann.checkpoints import validate_training_data_contract
+    validate_training_data_contract(checkpoint, checkpoint['config'])
     cached = torch.load(root/'batches.pt', map_location='cpu', weights_only=False)
     torch.set_num_threads(4)
     start = time.monotonic()

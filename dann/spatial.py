@@ -438,6 +438,7 @@ def validate_input_schema(
     matrix_key: str,
     target_columns: Sequence[str],
     num_peaks: int,
+    feature_order: Sequence[str] | None = None,
 ) -> int:
     """Validate tissue features and targets against checkpoint training data.
 
@@ -447,6 +448,8 @@ def validate_input_schema(
         matrix_key (str): Sparse matrix key used during training.
         target_columns (Sequence[str]): Ordered checkpoint target names.
         num_peaks (int): Checkpoint model feature count.
+        feature_order (Sequence[str] | None): Frozen feature order, when available;
+            legacy checkpoints without it use the saved training file schema.
 
     Returns:
         int: Number of tissue observations available for inference.
@@ -475,7 +478,8 @@ def validate_input_schema(
             f"Tissue has {shape[1]} features but checkpoint expects {num_peaks}."
         )
     tissue_features = read_axis_names(input_path, "var")
-    training_features = read_axis_names(training_path, "var")
+    training_features = (np.asarray(feature_order, dtype=str) if feature_order is not None
+                         else read_axis_names(training_path, "var"))
     if not np.array_equal(tissue_features, training_features):
         raise ValueError(
             "Tissue var_names do not exactly match checkpoint training feature order."
@@ -721,6 +725,7 @@ def load_checkpoint_model(
     if missing:
         raise KeyError(f"Checkpoint is missing required keys: {sorted(missing)}")
     config = copy.deepcopy(checkpoint["config"])
+    config["data"].pop("context_path", None)  # Inference input belongs to the runtime caller.
     config["data"]["cd8_normalization"] = checkpoint_contract(checkpoint)["cd8_normalization"]
     target_columns = tuple(str(value) for value in checkpoint["target_columns"])
     batch_names = tuple(str(value) for value in checkpoint["batch_names"])
@@ -831,6 +836,7 @@ def run_inference(
         matrix_key=str(data_config["matrix_key"]),
         target_columns=target_columns,
         num_peaks=int(config["model"]["num_peaks"]),
+        **({"feature_order": identity["feature_order"]} if identity is not None else {}),
     )
     if max_rows is None:
         selected_rows = total_rows
@@ -997,6 +1003,7 @@ def run_inference(
             os.replace(support_temporary, support_path)
         output_path.with_suffix(".provenance.json").write_text(json.dumps({
             "checkpoint": str(checkpoint_path), "input": str(input_path),
+            "training_data_contract": saved_checkpoint.get("training_data_contract", {"version": 0, "status": "unknown_legacy_provenance"}),
             "selected_rows": selected_rows, "context_rows": total_rows, "edge_exclusions": 0,
             "execution": config.get("execution", {"mode": "pixel"}),
         }, indent=2))
@@ -1199,15 +1206,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     from dann.config import load_config
     config = load_config(args.config)
-    if args.checkpoint is not None:
-        from dann.config import resolve_execution
-        saved = torch.load(args.checkpoint, map_location="cpu", weights_only=False)["config"]
-        saved.setdefault("results", config["results"])
-        saved["data"].setdefault("context_path", config["data"]["context_path"])
-        config = resolve_execution(saved)
+    from dann.config import inference_input
     args.latent_output = args.latent_output or Path(config["spatial"]["latents"])
     output = run_inference(
-        input_path=args.input or Path(config["data"]["context_path"]),
+        input_path=inference_input(config, args.input),
         checkpoint_path=args.checkpoint or Path(config["analysis"]["checkpoint"]),
         output_path=args.output or Path(config["spatial"]["output"]),
         latent_output_path=args.latent_output,

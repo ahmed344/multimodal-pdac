@@ -117,7 +117,8 @@ def load_model(
         num_batches=len(bundle.metadata.batch_names),
         num_targets=len(config["data"]["target_columns"]),
     ).to(device)
-    from dann.checkpoints import validate_checkpoint
+    from dann.checkpoints import validate_checkpoint, validate_training_data_contract
+    validate_training_data_contract(checkpoint, config)
     validate_checkpoint(checkpoint, config)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -1197,6 +1198,8 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     )
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint_analysis_config(config, checkpoint)
+    from dann.checkpoints import validate_training_data_contract
+    validate_training_data_contract(checkpoint, config)
     bundle = create_data_bundle(config, checkpoint.get("split_indices"), checkpoint.get("data_identity"))
     if tuple(checkpoint["batch_names"]) != bundle.metadata.batch_names:
         raise ValueError("Analysis batch order differs from checkpoint.")
