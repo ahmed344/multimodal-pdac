@@ -59,12 +59,24 @@ def checkpoint_analysis_config(config: Mapping[str, Any], checkpoint: Mapping[st
     resolved = copy.deepcopy(dict(config))
     saved = checkpoint["config"]
     resolved["model"] = copy.deepcopy(saved["model"])
-    for key in ("matrix_key", "batch_column", "intensity_transform", "intensity_clip_max", "nonzero_threshold"):
+    for key in ("matrix_key", "batch_column", "intensity_transform", "intensity_clip_max", "nonzero_threshold", "context_path", "x_column", "y_column"):
         if key in saved["data"]:
             resolved["data"][key] = saved["data"][key]
     resolved["loss"]["logit_epsilon"] = saved["loss"]["logit_epsilon"]
     contract = checkpoint_contract(checkpoint)
     resolved["data"].update({key: contract[key] for key in ("target_columns", "cd8_normalization")})
+    for key in ("core_size", "tiles_per_batch", "batch_size", "validation_batch_size"):
+        if key in saved.get("training", {}):
+            resolved["training"][key] = saved["training"][key]
+    if "results" in resolved:
+        from dann.config import resolve_execution
+        if "results" in saved:
+            resolved["results"] = copy.deepcopy(saved["results"])
+        for key in ("pixel", "spatial"):
+            if key in saved.get("training", {}):
+                resolved["training"][key] = copy.deepcopy(saved["training"][key])
+        resolve_execution(resolved)
+        resolved["training"]["num_workers"] = int(resolved["analysis"]["num_workers"])
     return resolved
 
 

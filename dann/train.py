@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 import torch
 import yaml
@@ -19,6 +20,8 @@ from dann.config import apply_smoke_overrides, load_config, resolve_device, seed
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion
+from dann.checkpoints import architecture_contract, validate_checkpoint
+from dann.tiles import row_identity
 from dann.targets import CD8, checkpoint_contract, target_contract
 
 
@@ -124,17 +127,52 @@ def grl_strength(
     return float(maximum * scale)
 
 
-def _empty_metrics() -> dict[str, float]:
+def _metric_suffix(target_name: str) -> str:
+    """Create a lowercase history suffix from one target column name.
+
+    Args:
+        target_name (str): Configured target column, optionally prefixed by ``Density_``.
+
+    Returns:
+        str: Lowercase name with a leading ``Density_`` prefix removed.
+    """
+
+    prefix = "Density_"
+    short_name = target_name[len(prefix) :] if target_name.startswith(prefix) else target_name
+    return short_name.lower()
+
+
+def _target_display_name(target_name: str) -> str:
+    """Create the bracket label for one target column.
+
+    Args:
+        target_name (str): Configured target column, optionally prefixed by ``Density_``.
+
+    Returns:
+        str: Display name with a leading ``Density_`` prefix removed.
+    """
+
+    prefix = "Density_"
+    if target_name.startswith(prefix):
+        return target_name[len(prefix) :]
+    return target_name
+
+
+def _empty_metrics(num_targets: int) -> dict[str, Any]:
     """Create metric accumulators for one epoch.
 
     Args:
-        None.
+        num_targets (int): Number of ordered biology targets.
 
     Returns:
-        dict[str, float]: Zero-initialized sums and counts.
+        dict[str, Any]: Zero-initialized loss sums and per-target fit counts.
     """
 
+    if num_targets <= 0:
+        raise ValueError("num_targets must be positive.")
     return {
+        "cd8_sum": 0.0,
+        "cd8_count": 0.0,
         "samples": 0.0,
         "biology_mass": 0.0,
         "total": 0.0,
@@ -143,22 +181,99 @@ def _empty_metrics() -> dict[str, float]:
         "positive": 0.0,
         "batch": 0.0,
         "batch_correct": 0.0,
+        "zero_correct": np.zeros(num_targets, dtype=np.float64),
+        "positive_correct": np.zeros(num_targets, dtype=np.float64),
+        "zero_count": np.zeros(num_targets, dtype=np.float64),
+        "positive_count": np.zeros(num_targets, dtype=np.float64),
+        "logit_sum": np.zeros(num_targets, dtype=np.float64),
+        "logit_sum_squares": np.zeros(num_targets, dtype=np.float64),
+        "logit_residual_sum_squares": np.zeros(num_targets, dtype=np.float64),
     }
 
 
-def _finalize_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
+def _update_fit_statistics(
+    metrics: dict[str, Any],
+    outputs: Mapping[str, torch.Tensor],
+    batch: Mapping[str, torch.Tensor],
+    logit_epsilon: float,
+) -> None:
+    """Accumulate hurdle decisions and positive-logit regression sums.
+
+    Args:
+        metrics (dict[str, Any]): Mutable epoch accumulators.
+        outputs (Mapping[str, torch.Tensor]): Model outputs for one batch.
+        batch (Mapping[str, torch.Tensor]): Device-resident target tensors.
+        logit_epsilon (float): Clamp used before positive-value logits.
+
+    Returns:
+        None: ``metrics`` is updated in place.
+    """
+
+    targets = batch["targets"]
+    valid = batch.get("target_valid_mask")
+    if valid is None:
+        valid = torch.ones_like(targets, dtype=torch.bool)
+    observed = valid & torch.isfinite(targets)
+    zero_mask = observed & (targets == 0.0)
+    positive_mask = observed & (targets > 0.0)
+    predicted_zero = outputs["pi_logits"] >= 0.0
+    safe_targets = targets.clamp(logit_epsilon, 1.0 - logit_epsilon)
+    logits = torch.logit(safe_targets)
+    residual = outputs["mu"] - logits
+    updates = {
+        "zero_correct": (predicted_zero & zero_mask).sum(dim=0),
+        "positive_correct": ((~predicted_zero) & positive_mask).sum(dim=0),
+        "zero_count": zero_mask.sum(dim=0),
+        "positive_count": positive_mask.sum(dim=0),
+        "logit_sum": torch.where(positive_mask, logits, torch.zeros_like(logits)).sum(dim=0),
+        "logit_sum_squares": torch.where(
+            positive_mask, logits.square(), torch.zeros_like(logits)
+        ).sum(dim=0),
+        "logit_residual_sum_squares": torch.where(
+            positive_mask, residual.square(), torch.zeros_like(residual)
+        ).sum(dim=0),
+    }
+    for key, value in updates.items():
+        accumulator = metrics[key]
+        if not isinstance(accumulator, np.ndarray):
+            raise TypeError(f"Metric accumulator {key!r} must be an array.")
+        accumulator += value.detach().to(dtype=torch.float64, device="cpu").numpy()
+
+
+def _finalize_metrics(
+    metrics: Mapping[str, Any],
+    target_columns: Sequence[str],
+) -> dict[str, float]:
     """Convert sample-weighted accumulators to epoch means.
 
     Args:
-        metrics (Mapping[str, float]): Raw epoch sums.
+        metrics (Mapping[str, Any]): Raw epoch sums and per-target counts.
+        target_columns (Sequence[str]): Ordered target names for per-target keys.
 
     Returns:
-        dict[str, float]: Mean losses and batch accuracy.
+        dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
     """
 
     samples = max(float(metrics["samples"]), 1.0)
     biology_mass = max(float(metrics["biology_mass"]), 1e-12)
-    return {
+    count_keys = (
+        "zero_correct",
+        "positive_correct",
+        "zero_count",
+        "positive_count",
+        "logit_sum",
+        "logit_sum_squares",
+        "logit_residual_sum_squares",
+    )
+    arrays = {key: np.asarray(metrics[key], dtype=np.float64) for key in count_keys}
+    target_count = len(target_columns)
+    if target_count == 0 or any(value.shape != (target_count,) for value in arrays.values()):
+        raise ValueError("Target names must match the metric accumulator dimensions.")
+    suffixes = [_metric_suffix(name) for name in target_columns]
+    if len(suffixes) != len(set(suffixes)):
+        raise ValueError("Target metric suffixes must be unique.")
+    result = {
+        "cd8_loss": metrics["cd8_sum"] / metrics["cd8_count"] if metrics["cd8_count"] else math.nan,
         "total_loss": metrics["total"] / samples,
         "biology_loss": metrics["biology"] / biology_mass,
         "hurdle_loss": metrics["hurdle"] / biology_mass,
@@ -166,6 +281,112 @@ def _finalize_metrics(metrics: Mapping[str, float]) -> dict[str, float]:
         "batch_loss": metrics["batch"] / samples,
         "batch_accuracy": metrics["batch_correct"] / samples,
     }
+    balanced_accuracies: list[float] = []
+    mean_r2_values: list[float] = []
+    for index, suffix in enumerate(suffixes):
+        recalls: list[float] = []
+        if arrays["zero_count"][index] > 0.0:
+            recalls.append(arrays["zero_correct"][index] / arrays["zero_count"][index])
+        if arrays["positive_count"][index] > 0.0:
+            recalls.append(arrays["positive_correct"][index] / arrays["positive_count"][index])
+        balanced_accuracy = float(np.mean(recalls)) if recalls else math.nan
+        positive_count = arrays["positive_count"][index]
+        logit_sum = arrays["logit_sum"][index]
+        total_sum_squares = (
+            arrays["logit_sum_squares"][index] - logit_sum * logit_sum / positive_count
+            if positive_count > 0.0
+            else 0.0
+        )
+        mean_r2 = (
+            1.0 - arrays["logit_residual_sum_squares"][index] / total_sum_squares
+            if positive_count >= 2.0 and total_sum_squares > np.finfo(np.float64).eps
+            else math.nan
+        )
+        result[f"hurdle_acc_{suffix}"] = balanced_accuracy
+        result[f"mean_r2_{suffix}"] = float(mean_r2)
+        balanced_accuracies.append(balanced_accuracy)
+        mean_r2_values.append(float(mean_r2))
+    finite_balanced = [value for value in balanced_accuracies if math.isfinite(value)]
+    finite_r2 = [value for value in mean_r2_values if math.isfinite(value)]
+    result["hurdle_acc"] = float(np.mean(finite_balanced)) if finite_balanced else math.nan
+    result["mean_r2"] = float(np.mean(finite_r2)) if finite_r2 else math.nan
+    return result
+
+
+def _format_pair(train_value: float, validation_value: float, decimals: int) -> str:
+    """Format one train, validation metric pair.
+
+    Args:
+        train_value (float): Training metric.
+        validation_value (float): Validation metric.
+        decimals (int): Digits after the decimal point.
+
+    Returns:
+        str: ``"{train}, {validation}"``, with non-finite values written as ``nan``.
+    """
+
+    rendered = []
+    for value in (train_value, validation_value):
+        rendered.append(f"{value:.{decimals}f}" if math.isfinite(value) else "nan")
+    return f"{rendered[0]}, {rendered[1]}"
+
+
+def _format_epoch_summary(
+    epoch: int,
+    epochs: int,
+    train_metrics: Mapping[str, float],
+    validation_metrics: Mapping[str, float],
+    target_columns: Sequence[str],
+) -> str:
+    """Build the epoch log with one aligned line per IHC target.
+
+    Args:
+        epoch (int): Completed one-based epoch number.
+        epochs (int): Configured maximum epoch count.
+        train_metrics (Mapping[str, float]): Finalized training metrics.
+        validation_metrics (Mapping[str, float]): Finalized validation metrics.
+        target_columns (Sequence[str]): Ordered target column names.
+
+    Returns:
+        str: Loss line, macro fit line, and one ``[Name]`` line per target.
+    """
+
+    loss_parts = (
+        ("biology_loss", "biology_loss", 6),
+        ("batch_loss", "batch_loss", 6),
+        ("hurdle_loss", "hurdle_loss", 6),
+        ("mean_loss", "positive_loss", 6),
+        ("cd8_loss", "cd8_loss", 6),
+    )
+    fit_parts = (
+        ("batch_acc", "batch_accuracy", 4),
+        ("hurdle_acc", "hurdle_acc", 4),
+        ("mean_r2", "mean_r2", 4),
+    )
+    loss_text = " | ".join(
+        f"{label} = {_format_pair(train_metrics[key], validation_metrics[key], decimals)}"
+        for label, key, decimals in loss_parts
+    )
+    fit_text = " | ".join(
+        f"{label} = {_format_pair(train_metrics[key], validation_metrics[key], decimals)}"
+        for label, key, decimals in fit_parts
+    )
+    displays = [_target_display_name(name) for name in target_columns]
+    width = max(len(f"[{name}]") for name in displays)
+    lines = [
+        f"epoch={epoch}/{epochs} | {loss_text}",
+        f"  {fit_text}",
+    ]
+    for name, column in zip(displays, target_columns, strict=True):
+        suffix = _metric_suffix(column)
+        label = f"[{name}]".ljust(width)
+        lines.append(
+            f"  {label} hurdle_acc = "
+            f"{_format_pair(train_metrics[f'hurdle_acc_{suffix}'], validation_metrics[f'hurdle_acc_{suffix}'], 4)}"
+            f" | mean_r2 = "
+            f"{_format_pair(train_metrics[f'mean_r2_{suffix}'], validation_metrics[f'mean_r2_{suffix}'], 4)}"
+        )
+    return "\n".join(lines)
 
 
 def run_epoch(
@@ -183,6 +404,8 @@ def run_epoch(
     grl_max_lambda: float,
     grl_gamma: float,
     gradient_clip_norm: float | None,
+    cd8_index: int = 0,
+    target_columns: Sequence[str] | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -201,14 +424,26 @@ def run_epoch(
         grl_max_lambda (float): Maximum reversal strength.
         grl_gamma (float): Logistic schedule steepness.
         gradient_clip_norm (float | None): Optional global clipping threshold.
+        cd8_index (int): Column of the CD8 target inside ``target_columns``.
+        target_columns (Sequence[str] | None): Ordered target names. Defaults to
+            ``target_{index}`` suffixes when omitted.
 
     Returns:
-        dict[str, float]: Mean total/component losses and batch accuracy.
+        dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
     """
 
     training = optimizer is not None
     model.train(training)
-    metrics = _empty_metrics()
+    num_targets = int(ziln_loss.target_weights.numel())
+    if target_columns is None:
+        target_columns = [f"target_{index}" for index in range(num_targets)]
+    elif len(target_columns) != num_targets:
+        raise ValueError(
+            f"Expected {num_targets} target columns, received {len(target_columns)}."
+        )
+    metrics = _empty_metrics(num_targets)
+    cd8_loss = ZILNLoss([1.0], ziln_loss.logit_epsilon, "sum",
+                        ziln_loss.include_normal_constant).to(device)
     steps_per_epoch = max(len(loader), 1)
     with torch.set_grad_enabled(training):
         for step, cpu_batch in enumerate(loader):
@@ -229,6 +464,16 @@ def run_epoch(
                 batch["targets"],
                 batch.get("target_valid_mask"),
             )
+            with torch.no_grad():
+                selected = slice(cd8_index, cd8_index + 1)
+                mask = batch.get("target_valid_mask", torch.ones_like(batch["targets"], dtype=torch.bool))[:, selected]
+                cd8 = cd8_loss(outputs["pi_logits"][:, selected], outputs["mu"][:, selected],
+                               outputs["sigma"][:, selected], batch["targets"][:, selected], mask)
+                metrics["cd8_sum"] += float(cd8.total)
+                metrics["cd8_count"] += int(mask.sum())
+                _update_fit_statistics(
+                    metrics, outputs, batch, ziln_loss.logit_epsilon
+                )
             discriminator = F.cross_entropy(
                 outputs["batch_logits"], batch["batches"], weight=class_weights
             )
@@ -259,7 +504,7 @@ def run_epoch(
             metrics["batch_correct"] += float(
                 (predictions == batch["batches"]).sum().detach()
             )
-    finalized = _finalize_metrics(metrics)
+    finalized = _finalize_metrics(metrics, target_columns)
     finalized["total_loss"] = (
         biology_weight * finalized["biology_loss"] + batch_weight * finalized["batch_loss"]
     )
@@ -292,6 +537,10 @@ def save_checkpoint(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "architecture": architecture_contract(config),
+        "optimizer_parameter_names": list(dict(model.named_parameters())),
+        "data_identity": row_identity(Path(config["data"]["path"]), config["data"]),
+        "selection_metric": "mean_valid_cd8_ziln",
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "epoch": int(epoch),
@@ -301,6 +550,7 @@ def save_checkpoint(
         "target_transform": target_contract(config),
         "split_indices": bundle.split_indices,
         "best_validation_biology": float(best_validation_biology),
+        "best_validation_cd8": float(best_validation_biology),
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -330,10 +580,11 @@ def load_training_checkpoint(
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     if checkpoint_contract(checkpoint) != target_contract(config):
         raise ValueError("Resume target transformation or target order is incompatible with checkpoint.")
+    validate_checkpoint(checkpoint, config, model, optimizer=True)
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     return int(checkpoint["epoch"]) + 1, float(
-        checkpoint.get("best_validation_biology", math.inf)
+        checkpoint.get("best_validation_biology", math.inf) if checkpoint.get("selection_metric") == "mean_valid_cd8_ziln" else math.inf
     )
 
 
@@ -377,7 +628,11 @@ def train_model(config: Mapping[str, Any]) -> Path:
         int(training["seed"]), bool(training["deterministic_algorithms"])
     )
     device = resolve_device(str(training["device"]))
-    bundle = create_data_bundle(config)
+    resume_payload = (torch.load(training["resume_checkpoint"], map_location="cpu", weights_only=False)
+                      if training.get("resume_checkpoint") else {})
+    bundle = create_data_bundle(config, resume_payload.get("split_indices"), resume_payload.get("data_identity"))
+    if resume_payload and tuple(resume_payload["batch_names"]) != bundle.metadata.batch_names:
+        raise ValueError("Resume batch order is incompatible.")
     target_summary = summarize_target_validity(bundle, config)
     model = AdversarialLatentFusion.from_config(
         config,
@@ -436,6 +691,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
     epochs = int(training["epochs"])
     clip = training.get("gradient_clip_norm")
     gradient_clip_norm = None if clip is None else float(clip)
+    target_columns = list(config["data"]["target_columns"])
     for epoch in range(start_epoch, epochs):
         train_metrics = run_epoch(
             model=model,
@@ -452,6 +708,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
             grl_max_lambda=float(training["grl_max_lambda"]),
             grl_gamma=float(training["grl_gamma"]),
             gradient_clip_norm=gradient_clip_norm,
+            cd8_index=target_columns.index(CD8),
+            target_columns=target_columns,
         )
         validation_metrics = run_epoch(
             model=model,
@@ -468,6 +726,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
             grl_max_lambda=float(training["grl_max_lambda"]),
             grl_gamma=float(training["grl_gamma"]),
             gradient_clip_norm=None,
+            cd8_index=target_columns.index(CD8),
+            target_columns=target_columns,
         )
         row: dict[str, float] = {"epoch": float(epoch + 1)}
         row.update({f"train_{key}": value for key, value in train_metrics.items()})
@@ -476,7 +736,9 @@ def train_model(config: Mapping[str, Any]) -> Path:
         )
         history.append(row)
         pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
-        improved, should_stop = stopper.update(validation_metrics["biology_loss"])
+        if not math.isfinite(validation_metrics["cd8_loss"]):
+            raise ValueError("Validation requires valid CD8 observations for checkpoint selection.")
+        improved, should_stop = stopper.update(validation_metrics["cd8_loss"])
         if improved:
             save_checkpoint(
                 output_dir / "best.pt",
@@ -498,10 +760,13 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 stopper.best,
             )
         print(
-            f"epoch={epoch + 1}/{epochs} "
-            f"train_bio={train_metrics['biology_loss']:.6f} "
-            f"validation_bio={validation_metrics['biology_loss']:.6f} "
-            f"validation_batch_acc={validation_metrics['batch_accuracy']:.4f}",
+            _format_epoch_summary(
+                epoch + 1,
+                epochs,
+                train_metrics,
+                validation_metrics,
+                target_columns,
+            ),
             flush=True,
         )
         if should_stop:

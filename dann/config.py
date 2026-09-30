@@ -86,7 +86,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config["latent_variance"] = latent_variance_settings(config.get("latent_variance"))
     config["data"]["cd8_normalization"] = normalization_settings(config["data"].get("cd8_normalization"))
     target_contract(config)
-    return config
+    return resolve_execution(config)
 
 
 def apply_smoke_overrides(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -111,10 +111,20 @@ def apply_smoke_overrides(config: Mapping[str, Any]) -> dict[str, Any]:
     updated["analysis"]["max_samples"] = int(training["smoke_test_samples"])
     updated["analysis"]["num_workers"] = int(training["smoke_num_workers"])
     updated["analysis"]["activity_max_nonzeros"] = 5_000_000
-    output_dir = Path(training["output_dir"]) / "smoke"
-    training["output_dir"] = str(output_dir)
-    updated["analysis"]["output_dir"] = str(output_dir / "analysis")
-    updated["analysis"]["checkpoint"] = str(output_dir / "best.pt")
+    if "results" in updated:
+        updated["results"]["smoke"] = True
+        mode = execution_settings(updated)["mode"]
+        if mode in training:
+            training[mode]["num_workers"] = training["smoke_num_workers"]
+        if mode == "spatial":
+            training["spatial"].update(core_size=training.get("smoke_core_size", 8),
+                                      tiles_per_batch=training.get("smoke_tiles_per_batch", 2))
+        resolve_execution(updated)
+    else:
+        output_dir = Path(training["output_dir"]) / "smoke"
+        training["output_dir"] = str(output_dir)
+        updated["analysis"]["output_dir"] = str(output_dir / "analysis")
+        updated["analysis"]["checkpoint"] = str(output_dir / "best.pt")
     return updated
 
 
@@ -153,3 +163,104 @@ def seed_everything(seed: int, deterministic: bool = False) -> None:
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     torch.use_deterministic_algorithms(deterministic, warn_only=True)
+
+
+def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve flat legacy architecture as all-MLP, or validate explicit selectors."""
+    if "spectral_encoder" not in model:
+        settings = {
+            "spectral_encoder": {"type": "deep_sets", "deep_sets": {
+                key: model[key] for key in ("embedding_dim", "peak_hidden_dims", "peak_output_dim")}},
+            "aggregation": {"type": "mlp", "mlp": {"hidden_dims": model["aggregation_hidden_dims"]}},
+            "heads": {name: {"type": "mlp", "mlp": {"hidden_dims": model[f"{name}_hidden_dims"]}}
+                      for name in ("biology", "discriminator")},
+        }
+    else:
+        flat = {"embedding_dim", "peak_hidden_dims", "peak_output_dim", "aggregation_hidden_dims",
+                "biology_hidden_dims", "discriminator_hidden_dims"}.intersection(model)
+        if flat:
+            raise ValueError(f"Cannot mix legacy flat and component settings: {sorted(flat)}")
+        settings = copy.deepcopy({key: model[key] for key in ("spectral_encoder", "aggregation", "heads")})
+    if settings["spectral_encoder"]["type"] != "deep_sets":
+        raise ValueError("model.spectral_encoder.type must be deep_sets.")
+    if set(settings["heads"]) != {"biology", "discriminator"}:
+        raise ValueError("model.heads must contain exactly biology and discriminator.")
+    spectral = settings["spectral_encoder"]["deep_sets"]
+    positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
+                spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
+                model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144)]
+    for group in (settings["aggregation"], *settings["heads"].values()):
+        if group["type"] not in {"mlp", "cnn"}:
+            raise ValueError("Component type must be mlp or cnn.")
+        group.setdefault("mlp", {"hidden_dims": [512, 512]})
+        group["cnn"] = {"channels": 128, "depth": 3, "dropout": .10, **group.get("cnn", {})}
+        positive.extend([*group["mlp"]["hidden_dims"], group["cnn"]["channels"], group["cnn"]["depth"]])
+        if not 0 <= group["cnn"]["dropout"] < 1:
+            raise ValueError("CNN dropout must be in [0, 1).")
+    if any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in positive):
+        raise ValueError("Model widths, depths, and peak budgets must be positive integers.")
+    if not isinstance(model.get("spectral_checkpointing", True), bool):
+        raise ValueError("model.spectral_checkpointing must be boolean.")
+    if not 0 <= model["dropout"] < 1 or model["sigma_min"] <= 0:
+        raise ValueError("Invalid model dropout or sigma_min.")
+    return settings
+
+
+def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Derive execution mode and combined halo from the selected components."""
+    settings = component_settings(config["model"])
+    groups = [settings["aggregation"], settings["heads"]["biology"], settings["heads"]["discriminator"]]
+    radii = [g["cnn"]["depth"] if g["type"] == "cnn" else 0 for g in groups]
+    return {"mode": "spatial" if any(radii) else "pixel", "halo": radii[0] + max(radii[1:]),
+            "latent_radius": radii[0], "biology_radius": radii[0] + radii[1],
+            "combination": "deep_sets__agg-{}__bio-{}__disc-{}".format(*(g["type"] for g in groups))}
+
+
+def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve mode-specific settings and all run paths once, without overrides."""
+    execution = execution_settings(config)
+    training = config["training"]
+    mode = execution["mode"]
+    if "pixel" in training:
+        training.update(training["pixel"])
+    if mode in training:
+        training.update(training[mode])
+    if mode == "spatial":
+        data = config["data"]
+        for key in ("context_path", "x_column", "y_column", "batch_column"):
+            if not isinstance(data.get(key), str) or not data[key]:
+                raise ValueError(f"Spatial execution requires data.{key}.")
+        training.setdefault("core_size", 32)
+        training.setdefault("tiles_per_batch", 8)
+        training["batch_size"] = training["tiles_per_batch"]
+        training["validation_batch_size"] = training["tiles_per_batch"]
+    for key in ("batch_size", "validation_batch_size", "prefetch_factor"):
+        value = training[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"training.{key} must be a positive integer.")
+    for key in ("core_size", "tiles_per_batch") if mode == "spatial" else ():
+        if not isinstance(training[key], int) or isinstance(training[key], bool) or training[key] <= 0:
+            raise ValueError(f"training.{key} must be a positive integer.")
+    if (isinstance(training["num_workers"], bool) or not isinstance(training["num_workers"], int)
+            or training["num_workers"] < 0 or not np.isfinite(training["learning_rate"])
+            or training["learning_rate"] <= 0):
+        raise ValueError("Invalid worker count or learning rate.")
+    config["execution"] = {**execution, **{key: training[key] for key in
+        ("batch_size", "validation_batch_size", "num_workers", "prefetch_factor", "learning_rate")}}
+    if mode == "spatial":
+        config["execution"].update(core_size=training["core_size"], tiles_per_batch=training["tiles_per_batch"])
+    if "results" in config:
+        result = config["results"]
+        root = Path(result["root"]) / execution["combination"] / result.get("run_name", "fit")
+        if result.get("smoke", False):
+            root /= "smoke"
+        training["output_dir"] = str(root / "model")
+        config["analysis"]["output_dir"] = str(root / "analysis")
+        config["analysis"]["checkpoint"] = str(root / "model" / "best.pt")
+        config["spatial"] = {"output": str(root / "analysis/spatial/spatial_predictions.parquet"),
+                             "latents": str(root / "analysis/spatial/spatial_latent.parquet")}
+        config.setdefault("latent_variance", {}).update(
+            input=config["data"].get("context_path", config["data"]["path"]),
+            latents=config["spatial"]["latents"], output_dir=str(root / "latent_variance"))
+        result["run_dir"] = str(root)
+    return config

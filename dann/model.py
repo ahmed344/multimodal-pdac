@@ -1,246 +1,57 @@
-"""Neural modules for sparse adversarial latent fusion."""
-
+"""Composition, stable ZILN transformation, and adversarial gradient reversal."""
 from __future__ import annotations
-
 from typing import Any, Mapping, Sequence
-
 import torch
 from torch import nn
 from torch.nn import functional as F
+from dann.model_components.layers import build_activation, build_mlp
+from dann.model_components.deep_sets import DeepSetsEncoder
+from dann.model_components.aggregation_mlp import MLPAggregation
+from dann.model_components.aggregation_cnn import CNNAggregation
+from dann.model_components.biology_mlp import MLPBiology
+from dann.model_components.biology_cnn import CNNBiology
+from dann.model_components.discriminator_mlp import MLPDiscriminator
+from dann.model_components.discriminator_cnn import CNNDiscriminator
 
 
-def build_activation(name: str) -> nn.Module:
-    """Construct an activation module by configuration name.
-
-    Args:
-        name (str): Activation name.
-
-    Returns:
-        nn.Module: Stateless activation module.
-    """
-
-    activations: dict[str, type[nn.Module]] = {
-        "relu": nn.ReLU,
-        "gelu": nn.GELU,
-        "silu": nn.SiLU,
-        "leaky_relu": nn.LeakyReLU,
-    }
-    if name not in activations:
-        raise ValueError(f"Unknown activation {name!r}; choose from {sorted(activations)}.")
-    return activations[name]()
+def transform_biology(raw: torch.Tensor, num_targets: int, sigma_min: float) -> dict[str, torch.Tensor]:
+    """Apply the same ZILN parameterization to either biology component."""
+    raw = raw.reshape(-1, num_targets, 3)
+    return {"pi_logits": raw[..., 0], "pi": raw[..., 0].sigmoid(),
+            "mu": raw[..., 1], "sigma": F.softplus(raw[..., 2]) + sigma_min}
 
 
-def build_mlp(
-    input_dim: int,
-    hidden_dims: Sequence[int],
-    output_dim: int,
-    activation: str,
-    dropout: float,
-    use_layer_norm: bool,
-) -> nn.Sequential:
-    """Build an MLP with normalized, activated hidden layers.
+class IntensityWeightedPeakEncoder(DeepSetsEncoder):
+    """Compatibility wrapper around spectral pooling and MLP aggregation."""
+    def __init__(self, num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
+                 aggregation_hidden_dims, latent_dim, activation="gelu", dropout=0.,
+                 use_layer_norm=True, inference_peak_chunk_size=262144):
+        super().__init__(num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
+                         activation, dropout, use_layer_norm, inference_peak_chunk_size)
+        self.aggregation_mlp = MLPAggregation(
+            peak_output_dim, aggregation_hidden_dims, latent_dim, activation=activation,
+            dropout=dropout, use_layer_norm=use_layer_norm)
 
-    Args:
-        input_dim (int): Input feature width.
-        hidden_dims (Sequence[int]): Hidden layer widths.
-        output_dim (int): Linear output width.
-        activation (str): Hidden activation name.
-        dropout (float): Hidden dropout probability.
-        use_layer_norm (bool): Add LayerNorm after each hidden linear layer.
-
-    Returns:
-        nn.Sequential: Configured feed-forward network.
-    """
-
-    layers: list[nn.Module] = []
-    previous = input_dim
-    for width in hidden_dims:
-        layers.append(nn.Linear(previous, int(width)))
-        if use_layer_norm:
-            layers.append(nn.LayerNorm(int(width)))
-        layers.append(build_activation(activation))
-        if dropout > 0.0:
-            layers.append(nn.Dropout(dropout))
-        previous = int(width)
-    layers.append(nn.Linear(previous, output_dim))
-    return nn.Sequential(*layers)
+    def forward(self, *args, **kwargs):
+        return self.aggregation_mlp(super().forward(*args, **kwargs))
 
 
-class IntensityWeightedPeakEncoder(nn.Module):
-    """PDF-defined Deep Sets encoder over only active MSI peaks."""
+class BiologyPredictor(MLPBiology):
+    """Legacy public pointwise predictor, including shared transformation."""
+    def __init__(self, latent_dim, hidden_dims, num_targets, sigma_min,
+                 activation, dropout, use_layer_norm):
+        super().__init__(latent_dim, hidden_dims, num_targets * 3,
+                         activation=activation, dropout=dropout, use_layer_norm=use_layer_norm)
+        self.num_targets, self.sigma_min = num_targets, sigma_min
 
-    def __init__(
-        self,
-        num_peaks: int,
-        embedding_dim: int,
-        peak_hidden_dims: Sequence[int],
-        peak_output_dim: int,
-        aggregation_hidden_dims: Sequence[int],
-        latent_dim: int,
-        activation: str = "gelu",
-        dropout: float = 0.0,
-        use_layer_norm: bool = True,
-        inference_peak_chunk_size: int = 262_144,
-    ) -> None:
-        """Initialize the learnable peak dictionary and Deep Sets MLPs.
-
-        Args:
-            num_peaks (int): Number of aligned m/z bins.
-            embedding_dim (int): Peak dictionary width.
-            peak_hidden_dims (Sequence[int]): Per-peak MLP hidden widths.
-            peak_output_dim (int): Per-peak output width.
-            aggregation_hidden_dims (Sequence[int]): Post-pooling hidden widths.
-            latent_dim (int): Shared latent width.
-            activation (str): Hidden activation name.
-            dropout (float): Hidden dropout probability.
-            use_layer_norm (bool): Apply hidden LayerNorm.
-            inference_peak_chunk_size (int): Maximum active peaks passed through
-                the per-peak MLP at once when gradients are disabled.
-
-        Returns:
-            None: Module parameters are initialized.
-        """
-
-        super().__init__()
-        self.num_peaks = int(num_peaks)
-        self.embedding_dim = int(embedding_dim)
-        self.inference_peak_chunk_size = int(inference_peak_chunk_size)
-        if self.inference_peak_chunk_size <= 0:
-            raise ValueError("inference_peak_chunk_size must be positive.")
-        self.embedding = nn.Embedding(self.num_peaks, self.embedding_dim)
-        self.peak_mlp = build_mlp(
-            self.embedding_dim,
-            peak_hidden_dims,
-            peak_output_dim,
-            activation,
-            dropout,
-            use_layer_norm,
-        )
-        self.aggregation_mlp = build_mlp(
-            peak_output_dim,
-            aggregation_hidden_dims,
-            latent_dim,
-            activation,
-            dropout,
-            use_layer_norm,
-        )
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
-
-    def forward(
-        self,
-        peak_indices: torch.Tensor,
-        intensities: torch.Tensor,
-        sample_indices: torch.Tensor,
-        peak_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        """Encode concatenated sparse peaks into one latent vector per pixel.
-
-        Args:
-            peak_indices (torch.Tensor): Flattened peak dictionary indices.
-            intensities (torch.Tensor): Flattened nonnegative peak intensities.
-            sample_indices (torch.Tensor): Pixel membership for each flattened peak.
-            peak_counts (torch.Tensor): Number of active peaks in each pixel.
-
-        Returns:
-            torch.Tensor: Latent matrix with shape ``[batch, latent_dim]``.
-        """
-
-        batch_size = int(peak_counts.numel())
-        if peak_indices.numel() == 0:
-            pooled = self.embedding.weight.new_zeros(
-                (batch_size, self.peak_mlp[-1].out_features)
-            )
-        elif (
-            torch.is_grad_enabled()
-            or peak_indices.numel() <= self.inference_peak_chunk_size
-        ):
-            weighted_embeddings = self.embedding(peak_indices) * intensities.unsqueeze(-1)
-            peak_features = self.peak_mlp(weighted_embeddings)
-            pooled = peak_features.new_zeros((batch_size, peak_features.shape[-1]))
-            pooled.index_add_(0, sample_indices, peak_features)
-        else:
-            pooled = self.embedding.weight.new_zeros(
-                (batch_size, self.peak_mlp[-1].out_features)
-            )
-            for start in range(0, peak_indices.numel(), self.inference_peak_chunk_size):
-                stop = min(
-                    start + self.inference_peak_chunk_size,
-                    peak_indices.numel(),
-                )
-                weighted_embeddings = self.embedding(peak_indices[start:stop])
-                weighted_embeddings = (
-                    weighted_embeddings * intensities[start:stop].unsqueeze(-1)
-                )
-                peak_features = self.peak_mlp(weighted_embeddings)
-                pooled.index_add_(
-                    0,
-                    sample_indices[start:stop],
-                    peak_features,
-                )
-        pooled = pooled / peak_counts.clamp_min(1).to(pooled.dtype).unsqueeze(-1)
-        return self.aggregation_mlp(pooled)
+    def forward(self, latent):
+        return transform_biology(super().forward(latent), self.num_targets, self.sigma_min)
 
 
-class BiologyPredictor(nn.Module):
-    """Predict four zero-inflated logit-normal parameter triplets."""
-
-    def __init__(
-        self,
-        latent_dim: int,
-        hidden_dims: Sequence[int],
-        num_targets: int,
-        sigma_min: float,
-        activation: str,
-        dropout: float,
-        use_layer_norm: bool,
-    ) -> None:
-        """Initialize the biology prediction head.
-
-        Args:
-            latent_dim (int): Shared latent input width.
-            hidden_dims (Sequence[int]): Predictor hidden widths.
-            num_targets (int): Number of density targets.
-            sigma_min (float): Positive standard-deviation floor.
-            activation (str): Hidden activation name.
-            dropout (float): Hidden dropout probability.
-            use_layer_norm (bool): Apply hidden LayerNorm.
-
-        Returns:
-            None: Module parameters are initialized.
-        """
-
-        super().__init__()
-        self.num_targets = int(num_targets)
-        self.sigma_min = float(sigma_min)
-        self.network = build_mlp(
-            latent_dim,
-            hidden_dims,
-            self.num_targets * 3,
-            activation,
-            dropout,
-            use_layer_norm,
-        )
-
-    def forward(self, latent: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Map latent vectors to stable ZILN parameters.
-
-        Args:
-            latent (torch.Tensor): Shared latent matrix.
-
-        Returns:
-            dict[str, torch.Tensor]: ``pi_logits``, ``pi``, ``mu``, ``sigma``.
-        """
-
-        raw = self.network(latent).reshape(-1, self.num_targets, 3)
-        pi_logits = raw[..., 0]
-        mu = raw[..., 1]
-        sigma = F.softplus(raw[..., 2]) + self.sigma_min
-        return {
-            "pi_logits": pi_logits,
-            "pi": torch.sigmoid(pi_logits),
-            "mu": mu,
-            "sigma": sigma,
-        }
+class BatchDiscriminator(MLPDiscriminator):
+    def __init__(self, latent_dim, hidden_dims, num_batches, activation, dropout, use_layer_norm):
+        super().__init__(latent_dim, hidden_dims, num_batches, activation=activation,
+                         dropout=dropout, use_layer_norm=use_layer_norm)
 
 
 class _GradientReversalFunction(torch.autograd.Function):
@@ -294,169 +105,100 @@ class GradientReversal(nn.Module):
         return _GradientReversalFunction.apply(inputs, strength)
 
 
-class BatchDiscriminator(nn.Module):
-    """Predict slide/batch identity from gradient-reversed latents."""
-
-    def __init__(
-        self,
-        latent_dim: int,
-        hidden_dims: Sequence[int],
-        num_batches: int,
-        activation: str,
-        dropout: float,
-        use_layer_norm: bool,
-    ) -> None:
-        """Initialize the batch classification MLP.
-
-        Args:
-            latent_dim (int): Shared latent width.
-            hidden_dims (Sequence[int]): Discriminator hidden widths.
-            num_batches (int): Number of batch classes.
-            activation (str): Hidden activation name.
-            dropout (float): Hidden dropout probability.
-            use_layer_norm (bool): Apply hidden LayerNorm.
-
-        Returns:
-            None: Module parameters are initialized.
-        """
-
-        super().__init__()
-        self.network = build_mlp(
-            latent_dim,
-            hidden_dims,
-            num_batches,
-            activation,
-            dropout,
-            use_layer_norm,
-        )
-
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """Produce unnormalized batch logits.
-
-        Args:
-            latent (torch.Tensor): Gradient-reversed latent matrix.
-
-        Returns:
-            torch.Tensor: Batch logits with shape ``[batch, num_batches]``.
-        """
-
-        return self.network(latent)
-
-
 class AdversarialLatentFusion(nn.Module):
-    """Shared sparse encoder with competing biology and batch heads."""
-
-    def __init__(
-        self,
-        encoder: IntensityWeightedPeakEncoder,
-        biology_predictor: BiologyPredictor,
-        batch_discriminator: BatchDiscriminator,
-    ) -> None:
-        """Compose the encoder and two prediction branches.
-
-        Args:
-            encoder (IntensityWeightedPeakEncoder): Sparse Deep Sets encoder.
-            biology_predictor (BiologyPredictor): Four-target ZILN head.
-            batch_discriminator (BatchDiscriminator): Adversarial batch head.
-
-        Returns:
-            None: Child modules are registered.
-        """
-
+    """Deep Sets, selectable aggregation, and two independently selected heads."""
+    def __init__(self, encoder, biology_predictor, batch_discriminator):
         super().__init__()
         self.encoder = encoder
         self.biology_predictor = biology_predictor
         self.batch_discriminator = batch_discriminator
         self.gradient_reversal = GradientReversal()
+        self.spatial = False
+        self.peak_budget = 65536
+        self.checkpointing = True
 
     @classmethod
-    def from_config(
-        cls,
-        config: Mapping[str, Any],
-        num_batches: int,
-        num_targets: int,
-    ) -> "AdversarialLatentFusion":
-        """Construct the complete model from YAML-derived configuration.
-
-        Args:
-            config (Mapping[str, Any]): Complete DANN configuration.
-            num_batches (int): Number of encoded batch classes.
-            num_targets (int): Number of IHC density targets.
-
-        Returns:
-            AdversarialLatentFusion: Configured model.
-        """
-
+    def from_config(cls, config: Mapping[str, Any], num_batches: int,
+                    num_targets: int) -> "AdversarialLatentFusion":
+        """Construct selected components, interpreting flat legacy settings as MLPs."""
+        from dann.config import component_settings
         values = config["model"]
-        common = {
-            "activation": values["activation"],
-            "dropout": float(values["dropout"]),
-            "use_layer_norm": bool(values["use_layer_norm"]),
-        }
+        settings = component_settings(values)
+        common = {"activation": values["activation"], "dropout": float(values["dropout"]),
+                  "use_layer_norm": bool(values["use_layer_norm"])}
+        spectral = settings["spectral_encoder"]["deep_sets"]
         encoder = IntensityWeightedPeakEncoder(
-            num_peaks=int(values["num_peaks"]),
-            embedding_dim=int(values["embedding_dim"]),
-            peak_hidden_dims=values["peak_hidden_dims"],
-            peak_output_dim=int(values["peak_output_dim"]),
-            aggregation_hidden_dims=values["aggregation_hidden_dims"],
-            latent_dim=int(values["latent_dim"]),
-            inference_peak_chunk_size=int(
-                values.get("inference_peak_chunk_size", 262_144)
-            ),
-            **common,
-        )
-        biology_predictor = BiologyPredictor(
-            latent_dim=int(values["latent_dim"]),
-            hidden_dims=values["biology_hidden_dims"],
-            num_targets=num_targets,
-            sigma_min=float(values["sigma_min"]),
-            **common,
-        )
-        discriminator = BatchDiscriminator(
-            latent_dim=int(values["latent_dim"]),
-            hidden_dims=values["discriminator_hidden_dims"],
-            num_batches=num_batches,
-            **common,
-        )
-        return cls(encoder, biology_predictor, discriminator)
+            int(values["num_peaks"]), **spectral,
+            aggregation_hidden_dims=settings["aggregation"]["mlp"]["hidden_dims"],
+            latent_dim=values["latent_dim"],
+            inference_peak_chunk_size=values.get("inference_peak_chunk_size", 262144), **common)
+        if settings["aggregation"]["type"] == "cnn":
+            encoder.aggregation_mlp = CNNAggregation(spectral["peak_output_dim"],
+                values["latent_dim"], **settings["aggregation"]["cnn"])
+        bio = settings["heads"]["biology"]
+        disc = settings["heads"]["discriminator"]
+        biology = (BiologyPredictor(values["latent_dim"], bio["mlp"]["hidden_dims"],
+                   num_targets, values["sigma_min"], **common) if bio["type"] == "mlp"
+                   else CNNBiology(values["latent_dim"], num_targets * 3, **bio["cnn"]))
+        discriminator = (BatchDiscriminator(values["latent_dim"], disc["mlp"]["hidden_dims"],
+                         num_batches, **common) if disc["type"] == "mlp" else
+                         CNNDiscriminator(values["latent_dim"], num_batches, **disc["cnn"]))
+        model = cls(encoder, biology, discriminator)
+        model.num_targets, model.sigma_min = num_targets, values["sigma_min"]
+        model.latent_dim = int(values["latent_dim"])
+        model.spatial = any(x["type"] == "cnn" for x in (settings["aggregation"], bio, disc))
+        model.peak_budget = values.get("spectral_peak_budget", 65536)
+        model.checkpointing = values.get("spectral_checkpointing", True)
+        model.halo = encoder.aggregation_mlp.radius + max(biology.radius, discriminator.radius)
+        return model
+
+    @staticmethod
+    def _on_map(component, value, mask):
+        if component.radius:
+            return component(value, mask)
+        result = component(value.movedim(1, -1))
+        return result.movedim(-1, 1) * mask
+
+    def _latent_map(self, batch):
+        if "occupancy" not in batch:
+            raise ValueError("CNN components require spatial tiles with occupancy and core indices.")
+        args = [batch[key] for key in ("peak_indices", "intensities", "sample_indices", "peak_counts")]
+        pooled = self.encoder.microbatched(*args, peak_budget=self.peak_budget,
+                                          checkpointing=self.checkpointing)
+        mask = batch["occupancy"]
+        n, _, h, w = mask.shape
+        flat = pooled.new_zeros((n*h*w, pooled.shape[-1]))
+        flat = flat.index_copy(0, batch["spatial_positions"], pooled)
+        grid = flat.reshape(n, h, w, -1).movedim(-1, 1)
+        return self._on_map(self.encoder.aggregation_mlp, grid, mask)
+
+    @staticmethod
+    def _select(grid, batch):
+        return grid.movedim(1, -1).reshape(-1, grid.shape[1])[batch["core_positions"]]
 
     def encode(self, batch: Mapping[str, torch.Tensor]) -> torch.Tensor:
-        """Encode one collated sparse batch.
+        """Return core aggregation latents, preserving context during aggregation."""
+        if self.spatial:
+            return self._select(self._latent_map(batch), batch)
+        return self.encoder(*[batch[key] for key in
+                            ("peak_indices", "intensities", "sample_indices", "peak_counts")])
 
-        Args:
-            batch (Mapping[str, torch.Tensor]): Sparse collator output.
-
-        Returns:
-            torch.Tensor: Shared latent matrix.
-        """
-
-        return self.encoder(
-            batch["peak_indices"],
-            batch["intensities"],
-            batch["sample_indices"],
-            batch["peak_counts"],
-        )
-
-    def forward(
-        self,
-        batch: Mapping[str, torch.Tensor],
-        grl_strength: float = 1.0,
-    ) -> dict[str, torch.Tensor]:
-        """Run encoder, ZILN head, and adversarial discriminator.
-
-        Args:
-            batch (Mapping[str, torch.Tensor]): Sparse collator output.
-            grl_strength (float): Encoder-bound discriminator gradient multiplier.
-
-        Returns:
-            dict[str, torch.Tensor]: Latent, biology parameters, and batch logits.
-        """
-
-        latent = self.encode(batch)
-        biology = self.biology_predictor(latent)
-        reversed_latent = self.gradient_reversal(latent, grl_strength)
-        return {
-            "latent": latent,
-            **biology,
-            "batch_logits": self.batch_discriminator(reversed_latent),
-        }
+    def forward(self, batch: Mapping[str, torch.Tensor],
+                grl_strength: float = 1.0) -> dict[str, torch.Tensor]:
+        """Predict aligned core outputs, retaining spatial context for both heads."""
+        if not self.spatial:
+            latent = self.encode(batch)
+            return {"latent": latent, **self.biology_predictor(latent),
+                    "batch_logits": self.batch_discriminator(self.gradient_reversal(latent, grl_strength))}
+        grid = self._latent_map(batch)
+        mask = batch["occupancy"]
+        latent = self._select(grid, batch)
+        # Keep the latent halo until both heads have consumed their neighborhoods.
+        if self.biology_predictor.radius:
+            biology = transform_biology(self._select(self.biology_predictor(grid, mask), batch),
+                                        self.num_targets, self.sigma_min)
+        else:
+            biology = self.biology_predictor(latent)
+        reversed_grid = self.gradient_reversal(grid, grl_strength)
+        logits = self._select(self._on_map(self.batch_discriminator, reversed_grid, mask), batch)
+        return {"latent": latent, **biology, "batch_logits": logits}

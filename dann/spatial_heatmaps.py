@@ -76,9 +76,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--predictions", type=Path, default=DEFAULT_PREDICTIONS)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--config", type=Path, default=Path("dann/config.yaml"))
+    parser.add_argument("--input", type=Path, default=None)
+    parser.add_argument("--predictions", type=Path, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument(
         "--densities",
         nargs="+",
@@ -607,10 +608,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
 
     args = parse_args(argv)
+    from dann.config import load_config
+    config = load_config(args.config)
     output_dir = run_spatial_heatmaps(
-        input_path=args.input,
-        predictions_path=args.predictions,
-        output_dir=args.output_dir,
+        input_path=args.input or Path(config["data"]["context_path"]),
+        predictions_path=args.predictions or Path(config["spatial"]["output"]),
+        output_dir=args.output_dir or Path(config["analysis"]["output_dir"]) / "spatial/heatmaps",
         densities=args.densities,
         logit_epsilon=args.logit_epsilon,
         dpi=args.dpi,

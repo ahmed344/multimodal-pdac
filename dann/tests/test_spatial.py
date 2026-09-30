@@ -350,6 +350,12 @@ def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch, no
     config["data"]["cd8_normalization"] = {"enabled": normalized}
 
     class FixedModel:
+        spatial = False
+
+        def __call__(self, batch, grl_strength=0.):
+            latent = self.encode(batch)
+            return {"latent": latent, **self.biology_predictor(latent)}
+
         def encode(self, batch):
             return torch.zeros((len(batch["peak_counts"]), 2))
 
@@ -371,12 +377,11 @@ def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch, no
     contract = json.loads(table.schema.metadata[b"dann_target_transform"])
     assert contract["cd8_normalization"]["enabled"] == normalized
     assert contract["target_columns"] == list(TARGETS)
-    rng = np.random.default_rng(0)
     expected = np.concatenate([
         ziln.sampled_density_mean(
-            np.full((size, 4), .25), np.zeros((size, 4)), np.ones((size, 4)),
-            num_samples=17, rng=rng,
-        ) for size in (2, 1)
+            np.full((1, 4), .25), np.zeros((1, 4)), np.ones((1, 4)),
+            num_samples=17, rng=np.random.default_rng([0, row]),
+        ) for row in range(3)
     ]).astype(np.float32)
     for index, target in enumerate(TARGETS):
         np.testing.assert_array_equal(table[f"density_mean_{target}"], expected[:, index])

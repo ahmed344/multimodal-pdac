@@ -1,106 +1,176 @@
+# DANN configuration. Keep editable settings here; resolved_config.yaml records
+# the selected execution mode, effective settings, and derived output paths.
+# All-MLP aggregation/heads select pixel mode; any CNN selects spatial mode.
+
 latent_variance:
-  input: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled_tissue.h5ad  # Exact AnnData used for spatial inference; only observation metadata is read.
-  latents: /workspaces/multimodal-pdac/data/PDAC/Results/dann/analysis/spatial/spatial_latent.parquet  # Required existing inference export.
-  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/dann/latent_variance  # Standalone variance tables and figure.
-  slide_column: batch  # Observation field defining slides.
-  chunk_size: 8192  # Latent rows read at once; covariance is accumulated in float64.
+  # Reads existing spatial latents; input and output paths follow the selected run.
+  slide_column: batch  # Observation column defining slides for variance decomposition.
+  chunk_size: 8192  # Exported latent rows read per chunk; covariance uses float64.
   figure_dpi: 300  # Resolution of the explained-variance PNG.
 
 data:
-  path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled.h5ad  # Input AnnData file.
-  matrix_key: X  # Sparse MSI source: X or layers/<layer_name>.
-  batch_column: batch  # Observation column used as the adversarial batch label.
-  target_columns: [Density_CD8, Density_Tumor, Density_Collagen, Density_Stroma]  # Ordered IHC density targets.
+  path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled.h5ad  # Labeled MSI rows used for seeded train/validation/test splits.
+  context_path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled_tissue.h5ad  # Full tissue MSI context for spatial mode and tissue inference.
+  matrix_key: X  # CSR source: X or layers/<layer_name>; feature order must match across files.
+  batch_column: batch  # Slide identity for splitting, grid alignment, and adversarial labels; never a model input.
+  x_column: x  # Integer grid coordinate; (batch, x, y) must be unique in each file.
+  y_column: y  # Integer grid coordinate; gaps and missing tissue are preserved.
+  target_columns: [Density_CD8, Density_Tumor, Density_Collagen, Density_Stroma]  # Target order also defines loss-weight and output-column order.
   cd8_normalization:
-    enabled: true  # CD8 density per non-tumor area; requires retraining.
-    min_non_tumor_fraction: 0.01  # Inclusive eligibility threshold; larger-than-one ratios are excluded.
-  train_fraction: 0.80  # Batch-stratified fraction used for model fitting.
-  validation_fraction: 0.10  # Batch-stratified fraction used for validation.
-  test_fraction: 0.10  # Batch-stratified fraction reserved for final analysis.
-  intensity_transform: log1p  # Log-transform every nonzero MSI intensity before model input.
+    enabled: true  # Divide CD8 density by non-tumor area; other targets are unchanged.
+    min_non_tumor_fraction: 0.01  # Inclusive eligibility threshold; ratios above one also lose CD8 supervision.
+  train_fraction: 0.80  # Seeded within-slide training fraction.
+  validation_fraction: 0.10  # Withheld labels used for checkpoint selection.
+  test_fraction: 0.10  # Withheld labels reserved for final analysis; never refitted.
+  intensity_transform: log1p  # Transform stored MSI intensities: none, log1p, or sqrt.
   intensity_clip_max: null  # Optional upper clip after transformation; null disables clipping.
-  nonzero_threshold: 0.0  # Values at or below this threshold are excluded.
-  max_train_samples: null  # Optional stratified training cap; null uses every row.
-  max_validation_samples: null  # Optional stratified validation cap for practical evaluation.
-  max_test_samples: null  # Optional stratified test cap for practical analysis.
+  nonzero_threshold: 0.0  # A positive threshold filters raw intensities before transformation; zero preserves original stored-entry handling.
+  max_train_samples: null  # Optional stratified cap on training labels; spatial context remains complete.
+  max_validation_samples: null  # Optional stratified cap on validation labels.
+  max_test_samples: null  # Optional stratified cap on test labels.
 
 model:
-  num_peaks: 5808  # Number of aligned m/z bins.
-  embedding_dim: 256  # Width of each learned peak embedding.
-  peak_hidden_dims: [512, 512]  # Hidden widths of the per-peak MLP.
-  peak_output_dim: 512  # Per-peak representation width before mean pooling.
-  aggregation_hidden_dims: [512, 512]  # Hidden widths after permutation-invariant pooling.
-  latent_dim: 512  # Shared biology-predictive, batch-invariant latent width.
-  biology_hidden_dims: [512, 256, 128]  # Hidden widths of the ZILN biology predictor.
-  discriminator_hidden_dims: [512, 256, 128]  # Hidden widths of the batch discriminator.
+  num_peaks: 5808  # Number of aligned m/z bins in both MSI files.
+  latent_dim: 256  # Aggregation output width; this is the exported latent before either head.
+
+  # 1. Per-pixel spectral processing: learned embeddings -> intensity weighting
+  #    -> per-peak MLP -> mean pooling over active peaks. Empty spectra pool to zero.
+  spectral_encoder:
+    type: deep_sets  # Supported spectral encoder: deep_sets.
+    deep_sets:
+      embedding_dim: 128  # Width of each learned peak embedding.
+      peak_hidden_dims: [256, 256]  # Hidden widths of the original per-peak MLP.
+      peak_output_dim: 256  # Pooled pixel width passed to the aggregation component.
+
+  # 2. Latent aggregation: choose the original pointwise MLP or local spatial CNN.
+  aggregation:
+    type: cnn  # Choices: mlp, cnn. Only the selected component's settings are used.
+    mlp:
+      hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
+    cnn:
+      channels: 128  # Pointwise input projection and hidden convolution width.
+      depth: 3  # Number of 3x3, stride-one convolutions; spatial radius equals depth.
+      dropout: 0.10  # Hidden dropout after per-pixel channel LayerNorm and GELU.
+
+  # 3. Prediction heads: choices are independent; both consume aggregation latents.
+  heads:
+    biology:
+      type: mlp  # Choices: mlp, cnn. Emits three raw ZILN parameters per target.
+      mlp:
+        hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
+      cnn:
+        channels: 128  # Hidden spatial width; final pointwise projection emits target parameters.
+        depth: 3  # Neighborhood radius in latent-grid pixels.
+        dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
+
+    discriminator:
+      type: mlp  # Choices: mlp, cnn. Predicts batch class from gradient-reversed latents.
+      mlp:
+        hidden_dims: [256, 128, 64]  # Original batch-discriminator hidden widths.
+      cnn:
+        channels: 128  # Hidden spatial width; final projection emits batch-class logits.
+        depth: 3  # Neighborhood radius; included when deriving the required halo.
+        dropout: 0.10  # Hidden dropout; missing tissue is masked throughout every CNN.
+
+  # Shared MLP numerics and ZILN output transformation; CNN settings are above.
   activation: gelu  # MLP activation: relu, gelu, silu, or leaky_relu.
-  dropout: 0.10  # Dropout probability in all hidden MLP layers.
-  use_layer_norm: true  # Apply LayerNorm after hidden linear layers.
-  inference_peak_chunk_size: 262144  # Active peaks processed per encoder chunk when gradients are disabled, bounding GPU inference memory.
-  sigma_min: 0.0001  # Positive floor added to predicted ZILN standard deviations.
+  dropout: 0.10  # Hidden dropout in Deep Sets and every selected MLP component.
+  use_layer_norm: true  # LayerNorm after each hidden MLP linear layer.
+  sigma_min: 0.0001  # Positive floor in sigma = softplus(raw_sigma) + sigma_min.
+
+  # Execution controls change memory use, not the selected architecture.
+  spectral_peak_budget: 65536  # Spatial spectral microbatch budget in active peaks; complete spectra stay together.
+  spectral_checkpointing: true  # Recompute spectral activations during spatial backward, preserving dropout RNG.
+  inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
 
 loss:
-  ziln_reduction: mean  # Reduction over pixels and targets: mean or sum.
-  target_weights: [8.0, 4.0, 2.0, 1.0]  # Relative weights in target_columns order.
-  logit_epsilon: 0.00001  # Clamp for positive targets before the logit transform.
-  include_normal_constant: false  # Keep false to match the prior PDF-exact loss scale; the normal constant is omitted.
-  biology_weight: 5.0  # Multiplier for the complete four-target ZILN loss.
+  ziln_reduction: mean  # Reduction over valid weighted target entries: mean or sum.
+  target_weights: [8.0, 4.0, 2.0, 1.0]  # Relative weights in data.target_columns order.
+  logit_epsilon: 0.00001  # Clamp positive target densities before taking their logits.
+  include_normal_constant: false  # Preserve the original loss scale by omitting the normal-density constant.
+  biology_weight: 5.0  # Multiplier for the complete weighted four-target ZILN objective.
   batch_weight: 1.0  # Multiplier for discriminator cross-entropy.
-  balance_batch_classes: true  # Use inverse-frequency discriminator class weights.
+  balance_batch_classes: true  # Mean-one inverse-frequency weights from selected training rows.
 
 training:
-  seed: 20260719  # Global NumPy/PyTorch split and initialization seed.
+  seed: 20260719  # Seed for data splits, initialization, and loader shuffling.
   device: cuda  # Runtime device: auto, cpu, cuda, or cuda:<index>.
-  epochs: 1000  # Maximum training epochs.
-  batch_size: 1024  # Number of sparse pixels per optimizer step.
-  validation_batch_size: 4096  # Number of sparse pixels per validation step.
-  num_workers: 20  # DataLoader workers; each opens its own read-only HDF5 handle.
-  prefetch_factor: 4  # Batches prefetched by each worker.
-  pin_memory: true  # Pin host tensors when CUDA is available.
-  learning_rate: 0.01  # AdamW learning rate.
+  epochs: 300  # Maximum fitting epochs; validation/test labels are never included in a final refit.
+
+  # Automatically selected execution settings. Edit these blocks rather than
+  # adding competing top-level batch_size, learning_rate, or worker overrides.
+  pixel:  # Used only when aggregation and both prediction heads are MLPs.
+    batch_size: 1024  # Supervised sparse pixels per optimizer step.
+    validation_batch_size: 4096  # Supervised sparse pixels per validation step.
+    learning_rate: 0.01  # AdamW learning rate for pixel mode.
+    num_workers: 20  # Read-only, process-local HDF5 data-loader workers.
+    prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
+
+  spatial:  # Used when any selected aggregation/head component is a CNN.
+    core_size: 32  # Core side length in grid pixels; no edge pixels are discarded.
+    tiles_per_batch: 32  # Logical tiles per optimizer step, not pixels; at most 8192 core positions.
+    # This is independent of spectral_peak_budget: more tiles do not enlarge spectral microbatches.
+    # Larger batches reduce optimizer steps per epoch; GPU memory headroom alone is not a reason to increase them.
+    learning_rate: 0.01  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
+    num_workers: 20  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
+    prefetch_factor: 4  # Tile batches prefetched per worker; larger batches also increase host-memory use.
+    # Halo is derived: aggregation radius + max(biology radius, discriminator radius).
+    # Default radii give halo 6, a 44x44 input, 13x13 biology support, and 7x7 latent support.
+    # Only occupied, selected core rows supply labels; all occupied halo MSI remains context.
+
+  # Shared optimization and adversarial schedule.
+  pin_memory: true  # Pin loader tensors for host-to-CUDA transfers.
   weight_decay: 0.00001  # AdamW decoupled weight decay.
   beta1: 0.9  # AdamW first-moment coefficient.
   beta2: 0.999  # AdamW second-moment coefficient.
   gradient_clip_norm: 5.0  # Maximum global gradient norm; null disables clipping.
   grl_max_lambda: 0.25  # Maximum encoder-bound gradient reversal strength.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
-  grl_gamma: 10.0  # Steepness of the DANN logistic GRL schedule.
-  early_stopping_patience: 20  # Epochs without validation biology improvement before stopping.
-  early_stopping_min_delta: 0.0001  # Required validation biology improvement.
-  checkpoint_every: 1  # Save a latest checkpoint every this many epochs.
-  resume_checkpoint: null  # Optional checkpoint path from which to resume.
+  grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
+  early_stopping_patience: 5  # Epochs without improvement in mean validation CD8 ZILN loss over valid CD8 rows.
+  early_stopping_min_delta: 0.001  # Minimum improvement in that selection metric; training still uses all four targets.
+  checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
+  resume_checkpoint: null  # Optional checkpoint path; incompatible targets, components, or optimizer ordering are rejected.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
-  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/dann/model  # Checkpoints, histories, and loss curves.
-  smoke_train_samples: 2048  # Real-data training rows used by --smoke-test.
-  smoke_validation_samples: 512  # Real-data validation rows used by --smoke-test.
-  smoke_test_samples: 512  # Real-data test rows used by --smoke-test.
-  smoke_epochs: 1  # Epoch count used by --smoke-test.
-  smoke_num_workers: 0  # Worker count used by --smoke-test for portability.
+
+  # --smoke-test overrides, recorded in resolved_config.yaml under a separate smoke/ run directory.
+  smoke_train_samples: 2048  # Stratified cap on training labels; full tissue MSI context is retained.
+  smoke_validation_samples: 512  # Stratified validation-label cap.
+  smoke_test_samples: 512  # Stratified test-label and analysis cap.
+  smoke_epochs: 1  # Epoch count for smoke training.
+  smoke_num_workers: 0  # Worker count for smoke training and analysis.
+  smoke_core_size: 8  # Spatial smoke core side length; the halo is still derived from component radii.
+  smoke_tiles_per_batch: 2  # Logical tiles per spatial smoke optimizer step.
 
 analysis:
-  density_mc_samples: 1000  # Full hurdle draws per pixel/target; retain only their density-scale mean.
-  density_mc_seed: 20260719  # Isolated Monte Carlo seed (nonnegative integer).
-  checkpoint: null  # Checkpoint to analyze; null selects training.output_dir/best.pt.
-  split: test  # Data split used for latent and prediction plots.
-  ziln_scatter_split: validation  # Held-out split used for the ZILN density validation scatter.
-  max_samples: null  # null analyzes every row of the selected splits.
-  batch_size: 4096  # Sparse pixels per inference step.
-  num_workers: 4  # DataLoader workers used during inference.
+  split: test  # Saved checkpoint split used for latent/prediction analysis.
+  ziln_scatter_split: validation  # Saved held-out split used for prediction scatter and additional calibration.
+  max_samples: null  # Optional stratified cap within saved splits; null uses all saved rows.
+  batch_size: 4096  # Pixel-mode tissue inference batch size; CNN inference uses the saved tiles_per_batch.
+  num_workers: 4  # Analysis and tissue-inference workers; does not change training workers.
+  density_mc_samples: 1000  # Hurdle draws per pixel/target, averaged to estimate unconditional density.
+  density_mc_seed: 20260719  # Isolated Monte Carlo seed; tissue exports use row-keyed streams for cap invariance.
   umap_neighbors: 30  # UMAP neighborhood size.
   umap_min_dist: 0.30  # UMAP minimum-distance parameter.
-  umap_metric: cosine  # Distance metric used by UMAP.
+  umap_metric: cosine  # Distance metric used for latent UMAP.
   umap_random_state: 20260719  # UMAP reproducibility seed.
-  activity_chunk_size: 5000000  # Sparse values processed per peak-activity chunk.
-  activity_max_nonzeros: null  # Optional sparse-value scan cap; null computes exact full-data activity.
-  heatmap_top_peaks: 200  # Most frequently active peaks shown in the heatmap.
-  family_count: 20  # Number of hierarchical cosine peptide families.
-  clustering_linkage: average  # Hierarchical linkage for embedding cosine distances.
-  figure_dpi: 300  # Resolution of saved PNG figures.
+  activity_chunk_size: 5000000  # Sparse values processed per peak-activity scan chunk.
+  activity_max_nonzeros: null  # Optional activity-scan cap; null scans the full labeled dataset.
+  heatmap_top_peaks: 200  # Most frequently active peaks shown in the embedding-similarity heatmap.
+  family_count: 20  # Number of hierarchical cosine peak-embedding families.
+  clustering_linkage: average  # Hierarchical linkage method for embedding cosine distances.
+  figure_dpi: 300  # Resolution of saved analysis PNGs.
   point_size: 0.1  # Marker size in UMAP and validation scatter plots.
   density_cmap: jet  # Continuous colormap for density-colored UMAP panels.
-  density_vmin_percentile: 1.0  # Lower percentile used for density UMAP color limits.
-  density_vmax_percentile: 99.0  # Upper percentile used for density UMAP color limits.
-  calibration_coverage_levels: [0.50, 0.90]  # Central predictive interval levels scored against observed positives.
-  calibration_pit_bins: 50  # Histogram bins in the probability-integral-transform panels.
-  exceedance_thresholds: []  # Density thresholds t for optional P(y > t) spatial columns; empty disables them.
-  output_dir: /workspaces/multimodal-pdac/data/PDAC/Results/dann/analysis  # Analysis tables and figures; UMAP exports go under umap/, calibration under calibration/.
+  density_vmin_percentile: 1.0  # Lower percentile for density UMAP color limits.
+  density_vmax_percentile: 99.0  # Upper percentile for density UMAP color limits.
+  calibration_coverage_levels: [0.50, 0.90]  # Central positive-branch predictive intervals to score.
+  calibration_pit_bins: 50  # Histogram bins for positive-branch probability-integral-transform diagnostics.
+  exceedance_thresholds: []  # Optional density thresholds for P(y > t) summaries; empty disables them.
+
+results:
+  # All paths derive from root/<spectral>__agg-<type>__bio-<type>__disc-<type>/<run_name>/.
+  # Subdirectories: model/, analysis/, analysis/spatial/, and latent_variance/.
+  # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
+  root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
+  run_name: fit  # Human-readable run name; separate experiments should use separate names.

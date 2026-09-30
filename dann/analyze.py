@@ -117,6 +117,8 @@ def load_model(
         num_batches=len(bundle.metadata.batch_names),
         num_targets=len(config["data"]["target_columns"]),
     ).to(device)
+    from dann.checkpoints import validate_checkpoint
+    validate_checkpoint(checkpoint, config)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
     return model, int(checkpoint["epoch"]) + 1
@@ -155,6 +157,9 @@ def extract_latent_predictions(
             predictions = model(batch, grl_strength=0.0)
             for key in ("latent", "pi", "mu", "sigma"):
                 outputs[key].append(predictions[key].cpu().numpy())
+            for key in ("support", "latent_support"):
+                if key in batch:
+                    outputs.setdefault(key, []).append(batch[key].cpu().numpy())
             for key in ("targets", "batches", "row_ids"):
                 outputs[key].append(batch[key].cpu().numpy())
             raw = batch.get("raw_targets", batch["targets"])
@@ -1192,12 +1197,14 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     )
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint_analysis_config(config, checkpoint)
-    bundle = create_data_bundle(config)
+    bundle = create_data_bundle(config, checkpoint.get("split_indices"), checkpoint.get("data_identity"))
+    if tuple(checkpoint["batch_names"]) != bundle.metadata.batch_names:
+        raise ValueError("Analysis batch order differs from checkpoint.")
     model, checkpoint_epoch = load_model(checkpoint_path, config, bundle, device)
     split = str(config["analysis"]["split"])
     print(
         f"Analyzing checkpoint epoch {checkpoint_epoch} on {device}; "
-        f"extracting {len(bundle.datasets[split]):,} {split} rows.",
+        f"extracting {len(bundle.split_indices[split]):,} {split} rows.",
         flush=True,
     )
     mc_samples, mc_seed = density_sampling_settings(config["analysis"])
@@ -1305,7 +1312,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     )
     scatter_split = str(config["analysis"]["ziln_scatter_split"])
     print(
-        f"Analyzing {len(bundle.datasets[scatter_split]):,} {scatter_split} "
+        f"Analyzing {len(bundle.split_indices[scatter_split]):,} {scatter_split} "
         "rows for the prediction scatter and calibration.",
         flush=True,
     )
@@ -1399,6 +1406,10 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         int(config["analysis"]["figure_dpi"]),
         best_epoch=best_epoch,
     )
+    from dann.diagnostics import write_density_diagnostics
+    write_density_diagnostics(extracted, config, output_dir, split)
+    if scatter_split != split:
+        write_density_diagnostics(scatter_data, config, output_dir, scatter_split)
     for dataset in bundle.datasets.values():
         dataset.close()
     return output_dir

@@ -114,7 +114,62 @@ def test_epoch_mean_uses_valid_mass_not_batch_size():
                          5., 1., None, None, 0, 1, "constant", .25, 10., None)
     whole, split = evaluate([slice(None)]), evaluate([slice(0, 1), slice(1, 3)])
     for key in whole:
-        assert whole[key] == pytest.approx(split[key], rel=1e-6)
+        assert whole[key] == pytest.approx(split[key], rel=1e-6, nan_ok=True)
+
+
+def test_hurdle_accuracy_and_mean_r2_ignore_masked_targets(capsys):
+    class FixedModel(torch.nn.Module):
+        def forward(self, batch, grl_strength):
+            return {
+                "pi_logits": pi,
+                "mu": mu,
+                "sigma": torch.ones_like(targets),
+                "batch_logits": torch.zeros((len(targets), 2)),
+            }
+
+    epsilon = 1e-5
+    targets = torch.tensor([
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.5, 0.2],
+        [0.8, 0.4],
+    ])
+    valid = torch.tensor([
+        [False, True],
+        [True, True],
+        [True, True],
+        [True, True],
+    ])
+    pi = torch.tensor([
+        [-5.0, 2.0],
+        [2.0, -2.0],
+        [-2.0, -1.0],
+        [3.0, 1.0],
+    ])
+    mu = torch.zeros_like(targets)
+    clamped = targets.clamp(epsilon, 1.0 - epsilon)
+    mu[2, 0] = torch.logit(clamped[2, 0])
+    mu[3, 0] = torch.logit(clamped[3, 0])
+    loader = [{
+        "targets": targets,
+        "target_valid_mask": valid,
+        "batches": torch.zeros(len(targets), dtype=torch.long),
+    }]
+    metric = run_epoch(
+        FixedModel(), loader, ZILNLoss([1.0, 1.0], logit_epsilon=epsilon),
+        torch.device("cpu"), 5.0, 1.0, None, None, 0, 1, "constant", 0.25, 10.0, None,
+        target_columns=["Density_CD8", "Density_Tumor"],
+    )
+    assert capsys.readouterr().out == ""
+    assert metric["hurdle_acc_cd8"] == pytest.approx(0.75)
+    assert metric["hurdle_acc_tumor"] == pytest.approx(0.5)
+    assert metric["hurdle_acc"] == pytest.approx(0.625)
+    assert metric["mean_r2_cd8"] == pytest.approx(1.0)
+    observed = targets[2:, 1].numpy()
+    logits = np.log(observed / (1.0 - observed))
+    expected_r2 = 1.0 - np.square(logits).sum() / np.square(logits - logits.mean()).sum()
+    assert metric["mean_r2_tumor"] == pytest.approx(expected_r2)
+    assert metric["mean_r2"] == pytest.approx(0.5 * (1.0 + expected_r2))
 
 
 def config_and_checkpoint():

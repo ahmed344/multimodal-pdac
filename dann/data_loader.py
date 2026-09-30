@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-import anndata as ad
 import h5py
 import numpy as np
 import torch
@@ -36,7 +35,7 @@ class DataBundle:
 
     metadata: AnnDataMetadata
     split_indices: dict[str, np.ndarray]
-    datasets: dict[str, "SparseAnnDataDataset"]
+    datasets: dict[str, Dataset]
     loaders: dict[str, DataLoader[dict[str, torch.Tensor]]]
     batch_class_weights: torch.Tensor
 
@@ -78,7 +77,9 @@ def load_anndata_metadata(
         AnnDataMetadata: Validated labels, batches, m/z values, and dimensions.
     """
 
-    adata = ad.read_h5ad(path, backed="r")
+    from dann.tiles import open_backed_anndata
+
+    adata = open_backed_anndata(path)
     required = [*target_columns, batch_column]
     missing = [column for column in required if column not in adata.obs]
     if missing:
@@ -461,7 +462,7 @@ def compute_batch_class_weights(
     return torch.from_numpy(weights.astype(np.float32))
 
 
-def create_data_bundle(config: Mapping[str, Any]) -> DataBundle:
+def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_identity=None) -> DataBundle:
     """Build metadata, stratified datasets, and DataLoaders from configuration.
 
     Args:
@@ -494,6 +495,16 @@ def create_data_bundle(config: Mapping[str, Any]) -> DataBundle:
         float(data_config["test_fraction"]),
         seed,
     )
+    if saved_identity is not None:
+        from dann.tiles import row_identity
+        if row_identity(path, data_config) != saved_identity:
+            raise ValueError("Checkpoint row identities or feature order differ from input data.")
+    if saved_splits is not None:
+        split_indices = {key: np.asarray(value, dtype=np.int64).copy()
+                         for key, value in saved_splits.items()}
+        combined = np.concatenate(list(split_indices.values()))
+        if (combined < 0).any() or (combined >= metadata.num_observations).any() or len(np.unique(combined)) != len(combined):
+            raise ValueError("Invalid or overlapping saved split identities.")
     cap_keys = {
         "train": "max_train_samples",
         "validation": "max_validation_samples",
@@ -519,10 +530,21 @@ def create_data_bundle(config: Mapping[str, Any]) -> DataBundle:
         name: SparseAnnDataDataset(indices=indices, **dataset_kwargs)
         for name, indices in split_indices.items()
     }
+    from dann.config import execution_settings
+    execution = execution_settings(config)
+    collator = sparse_collate
+    if execution["mode"] == "spatial":
+        from dann.tiles import SpatialTileDataset, tile_collate
+        datasets = {}
+        geometry = None
+        for name, indices in split_indices.items():
+            datasets[name] = SpatialTileDataset(config, indices, metadata, geometry=geometry)
+            geometry = datasets[name].geometry
+        collator = tile_collate
     num_workers = int(training_config["num_workers"])
     common_loader_kwargs: dict[str, Any] = {
         "num_workers": num_workers,
-        "collate_fn": sparse_collate,
+        "collate_fn": collator,
         "pin_memory": bool(training_config["pin_memory"]),
         "persistent_workers": num_workers > 0,
     }
@@ -545,7 +567,11 @@ def create_data_bundle(config: Mapping[str, Any]) -> DataBundle:
         ),
         "test": DataLoader(
             datasets["test"],
-            batch_size=int(config["analysis"]["batch_size"]),
+            batch_size=int(
+                training_config["tiles_per_batch"]
+                if execution["mode"] == "spatial"
+                else config["analysis"]["batch_size"]
+            ),
             shuffle=False,
             **common_loader_kwargs,
         ),

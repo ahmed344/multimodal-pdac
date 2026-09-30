@@ -331,6 +331,8 @@ def test_normal_checkpoint_round_trip(tmp_path: Path, tiny_h5ad: Path) -> None:
     config = load_config(Path("dann/config.yaml"))
     config["data"]["path"] = str(tiny_h5ad)
     config["training"].update(num_workers=0, batch_size=2, validation_batch_size=2)
+    for key in ("spectral_encoder", "aggregation", "heads"):
+        config["model"].pop(key)
     config["model"].update(num_peaks=4, embedding_dim=3, peak_hidden_dims=[4],
                            peak_output_dim=4, aggregation_hidden_dims=[4], latent_dim=3,
                            biology_hidden_dims=[3], discriminator_hidden_dims=[3], dropout=0.)
