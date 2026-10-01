@@ -545,3 +545,68 @@ coverage against the full grid reader's core extraction.
 Corrected source-isolation tests and the required sequential comparisons are
 reported in [`2026-09-30-dann-labeled-source-correction.md`](../markdowns/2026-09-30-dann-labeled-source-correction.md).
 The two corrected A runs disagreed, so the stopping rule withheld C and D.
+
+### Matched discriminator controls
+
+The separately authorized discriminator diagnostic isolates tile execution,
+shared gradient clipping, and adversarial reversal. It starts fresh models using
+only the reference checkpoint's saved splits, class ordering, and data identity:
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 python -m dann.verification.discriminator_controls \
+  --config dann/config.yaml \
+  --reference-checkpoint <MLP-model/best.pt> \
+  --output <new-diagnostic-directory>
+```
+
+The four primary controls use the same MLP encoder/biology initialization,
+eight 32×32 training tiles with a three-pixel halo, learning rate 0.001, and
+configured dropout and global gradient clipping. A forces the all-MLP model
+through spatial execution with discriminator loss disabled. B replaces only the
+discriminator with a CNN, still disabling its loss. C enables discriminator loss
+with zero GRL; D enables the configured GRL ramp. The ramp keeps the original
+300-epoch horizon. Controls have matching tile-order generators and per-update
+dropout seeds, preventing discriminator random draws from shifting the next
+update's biology randomness. Disabling discriminator loss omits its backward
+path entirely, so AdamW also skips its parameters.
+
+Each control performs 500 updates, cycling the training loader if needed, and
+scores every saved validation row initially and every 100 updates. Since the
+encoder and biology head are pointwise in every control, validation uses the
+equivalent pixel biology path; a numerical test checks this against full spatial
+execution. A fixed training batch supplies representation variation, spectrum
+shuffle sensitivity, and separate biology/discriminator gradient audits. The
+audits preserve training RNG and gradients. Actual training logs include global
+gradient norms, clipping factors, slide counts, and rows per update.
+
+If both A and B finish with nonpositive positive-CD8 logit R², the runner adds
+A and B at learning rate 0.0001 and a shuffled-pixel MLP at 0.001, each with
+discriminator loss disabled and the same 500-update limit. Pixel batches retain
+the configured pixel batch size; compare both update counts and processed rows.
+`--updates` and `--evaluate-every` permit smaller synthetic or smoke checks.
+
+Outputs include a frozen reference snapshot, source/config snapshots, split
+identities, training-fitted marginal baselines, initial weights, histories,
+validation predictions, and final diagnostic checkpoints. The latter use
+`diagnostic-discriminator-v1` and must be reconstructed with `make_control`;
+they are not production resume/inference checkpoints. Existing production files
+are never written, and concurrently running training is left untouched. These
+bounded comparisons use no test labels and do not launch a full fit.
+
+The completed 2026-09-30 run performed all seven 500-update controls; evidence is
+in `data/PDAC/Results/dann/diagnostics/2026-09-30-discriminator-controls/`, with
+`diagnosis.txt` and `summary.csv` summarizing the results. At learning rate 0.001,
+the forced-spatial MLP and all three CNN-discriminator controls converged to
+almost constant CD8 predictions (validation positive-logit R² approximately
+−0.00009). The shuffled-pixel MLP at the **same** learning rate reached R² 0.01979
+and CD8 loss 1.23655, beating the training-fitted marginal baseline of 1.24841.
+The 0.0001 spatial controls retained MSI sensitivity but failed the prediction
+baseline within the update cap (R² −0.75495).
+
+This implicates the spatial training regime, without identifying one sampler or
+execution mechanism: tile updates averaged 4,353 supervised rows from 7.188
+slides, versus 2,048 rows from 42.996 slides for shuffled pixels. A matched
+flat-tile MLP control would separate this batch-composition change from spatial
+microbatch/dropout execution. The measured early ramp reached only 0.00666;
+these experiments do not evaluate the full 0.25 adversarial strength. They do
+not establish a production fix. The full synthetic suites passed 265 tests.
