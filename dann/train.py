@@ -18,10 +18,11 @@ from torch.nn import functional as F
 
 from dann.config import apply_smoke_overrides, load_config, resolve_device, seed_everything
 from dann.data_loader import DataBundle, create_data_bundle
+from dann.sampling import SamplingEpochAudit
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion
 from dann.checkpoints import (architecture_contract, validate_checkpoint, training_data_contract,
-                              validate_training_data_contract)
+                              validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
 from dann.targets import CD8, checkpoint_contract, target_contract
 
@@ -407,6 +408,7 @@ def run_epoch(
     gradient_clip_norm: float | None,
     cd8_index: int = 0,
     target_columns: Sequence[str] | None = None,
+    sampling_audit_dir: Path | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -428,6 +430,7 @@ def run_epoch(
         cd8_index (int): Column of the CD8 target inside ``target_columns``.
         target_columns (Sequence[str] | None): Ordered target names. Defaults to
             ``target_{index}`` suffixes when omitted.
+        sampling_audit_dir (Path | None): Optional spatial batch logs and epoch hashes.
 
     Returns:
         dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
@@ -446,6 +449,14 @@ def run_epoch(
     cd8_loss = ZILNLoss([1.0], ziln_loss.logit_epsilon, "sum",
                         ziln_loss.include_normal_constant).to(device)
     steps_per_epoch = max(len(loader), 1)
+    # Production retains the epoch-based GRL horizon, unlike diagnostic fixed-update runs.
+    if training and hasattr(loader.sampler, "set_epoch"):
+        loader.sampler.set_epoch(epoch_index)
+    audit = (SamplingEpochAudit(epoch_index, len(loader.dataset.indices))
+             if training and sampling_audit_dir is not None else None)
+    if audit is not None:
+        sampling_audit_dir.mkdir(parents=True, exist_ok=True)
+        (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").write_text("")
     with torch.set_grad_enabled(training):
         for step, cpu_batch in enumerate(loader):
             batch = move_batch_to_device(cpu_batch, device)
@@ -488,6 +499,10 @@ def run_epoch(
                 if gradient_clip_norm is not None:
                     nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
                 optimizer.step()
+                if audit is not None and "occupancy" in cpu_batch:
+                    composition = audit.update(cpu_batch)
+                    with (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").open("a") as handle:
+                        handle.write(json.dumps(composition) + "\n")
 
             batch_size = int(batch["targets"].shape[0])
             metrics["samples"] += batch_size
@@ -509,6 +524,9 @@ def run_epoch(
     finalized["total_loss"] = (
         biology_weight * finalized["biology_loss"] + batch_weight * finalized["batch_loss"]
     )
+    if audit is not None and audit.compositions:
+        with (sampling_audit_dir / f"epoch_{epoch_index:04d}_summary.json").open("w") as handle:
+            json.dump(audit.summary(), handle, indent=2)
     return finalized
 
 
@@ -539,6 +557,9 @@ def save_checkpoint(
     path.parent.mkdir(parents=True, exist_ok=True)
     identity = row_identity(Path(config["data"]["path"]), config["data"])
     payload = {
+        "sampling_contract": sampling_contract(config, bundle.split_indices["train"]),
+        "sampler_state": {"completed_epoch": int(epoch), "sampler_epoch": int(epoch),
+                          "next_epoch": int(epoch) + 1},
         "architecture": architecture_contract(config),
         "optimizer_parameter_names": list(dict(model.named_parameters())),
         "data_identity": identity,
@@ -566,6 +587,7 @@ def load_training_checkpoint(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     config: Mapping[str, Any],
+    selected_rows=None,
 ) -> tuple[int, float]:
     """Restore model and optimizer state for resumed training.
 
@@ -575,6 +597,8 @@ def load_training_checkpoint(
         optimizer (torch.optim.Optimizer): Optimizer receiving saved state.
         device (torch.device): Tensor map location.
         config (Mapping[str, Any]): Requested training configuration to validate.
+        selected_rows: Actual selected training rows; defaults to saved rows for callers
+            that do not rebuild the training bundle.
 
     Returns:
         tuple[int, float]: Next epoch index and prior best validation biology loss.
@@ -585,6 +609,7 @@ def load_training_checkpoint(
         raise ValueError("Resume target transformation or target order is incompatible with checkpoint.")
     validate_training_data_contract(checkpoint, config)
     validate_checkpoint(checkpoint, config, model, optimizer=True)
+    validate_sampling_contract(checkpoint, config, selected_rows)
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     return int(checkpoint["epoch"]) + 1, float(
@@ -662,7 +687,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
     resume = training.get("resume_checkpoint")
     if resume:
         start_epoch, prior_best = load_training_checkpoint(
-            Path(resume), model, optimizer, device, config
+            Path(resume), model, optimizer, device, config, bundle.split_indices["train"]
         )
     stopper = EarlyStopping(
         patience=int(training["early_stopping_patience"]),
@@ -716,6 +741,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
             gradient_clip_norm=gradient_clip_norm,
             cd8_index=target_columns.index(CD8),
             target_columns=target_columns,
+            sampling_audit_dir=output_dir / "sampling",
         )
         validation_metrics = run_epoch(
             model=model,

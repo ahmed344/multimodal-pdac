@@ -223,6 +223,10 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     execution = execution_settings(config)
     training = config["training"]
     mode = execution["mode"]
+    spatial_batching = {key: training.get("spatial", training).get(key, default)
+                       for key, default in (("core_size", 32), ("tiles_per_batch", 8),
+                                            ("sampling_strategy", "shuffled_tiles"),
+                                            ("supervised_rows_per_batch", 2048))}
     if "pixel" in training:
         training.update(training["pixel"])
     if mode in training:
@@ -232,15 +236,18 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         for key in ("path", "x_column", "y_column", "batch_column"):
             if not isinstance(data.get(key), str) or not data[key]:
                 raise ValueError(f"Spatial execution requires data.{key}.")
-        training.setdefault("core_size", 32)
-        training.setdefault("tiles_per_batch", 8)
-        training["batch_size"] = training["tiles_per_batch"]
+        training.update(spatial_batching)
+        if not isinstance(training["sampling_strategy"], str) or training["sampling_strategy"] not in {"shuffled_tiles", "proportional_slide_tiles"}:
+            raise ValueError("Unsupported training.spatial.sampling_strategy.")
+        training["batch_size"] = (training["supervised_rows_per_batch"]
+                                  if training["sampling_strategy"] == "proportional_slide_tiles"
+                                  else training["tiles_per_batch"])
         training["validation_batch_size"] = training["tiles_per_batch"]
     for key in ("batch_size", "validation_batch_size", "prefetch_factor"):
         value = training[key]
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"training.{key} must be a positive integer.")
-    for key in ("core_size", "tiles_per_batch") if mode == "spatial" else ():
+    for key in ("core_size", "tiles_per_batch", "supervised_rows_per_batch") if mode == "spatial" else ():
         if not isinstance(training[key], int) or isinstance(training[key], bool) or training[key] <= 0:
             raise ValueError(f"training.{key} must be a positive integer.")
     if (isinstance(training["num_workers"], bool) or not isinstance(training["num_workers"], int)
@@ -250,7 +257,14 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     config["execution"] = {**execution, **{key: training[key] for key in
         ("batch_size", "validation_batch_size", "num_workers", "prefetch_factor", "learning_rate")}}
     if mode == "spatial":
-        config["execution"].update(core_size=training["core_size"], tiles_per_batch=training["tiles_per_batch"])
+        config["execution"].update(
+            core_size=training["core_size"], tiles_per_batch=training["tiles_per_batch"],
+            sampling_strategy=training["sampling_strategy"],
+            training_supervised_rows_per_batch=(training["supervised_rows_per_batch"]
+                if training["sampling_strategy"] == "proportional_slide_tiles" else None),
+            training_tiles_per_batch=(training["tiles_per_batch"]
+                if training["sampling_strategy"] == "shuffled_tiles" else None),
+            evaluation_tiles_per_batch=training["tiles_per_batch"])
     if "results" in config:
         result = config["results"]
         root = Path(result["root"]) / execution["combination"] / result.get("run_name", "fit")

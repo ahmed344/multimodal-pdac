@@ -44,7 +44,7 @@ model:
 
   # 2. Latent aggregation: choose the original pointwise MLP or local spatial CNN.
   aggregation:
-    type: mlp  # Choices: mlp, cnn. Only the selected component's settings are used.
+    type: cnn  # Choices: mlp, cnn. Only the selected component's settings are used.
     mlp:
       hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
@@ -107,15 +107,15 @@ training:
     prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
 
   spatial:  # Used when any selected aggregation/head component is a CNN.
-    core_size: 32  # Core side length in grid pixels; no edge pixels are discarded.
-    tiles_per_batch: 8  # Logical tiles per optimizer step, not pixels; at most 8192 core positions.
-    # This is independent of spectral_peak_budget: more tiles do not enlarge spectral microbatches.
-    # Larger batches reduce optimizer steps per epoch; GPU memory headroom alone is not a reason to increase them.
+    core_size: 8  # Core side length in grid pixels; no edge pixels are discarded.
+    sampling_strategy: proportional_slide_tiles  # Independently shuffled slide queues, proportional row interleaving.
+    supervised_rows_per_batch: 2048  # Exact training row budget; final epoch batch may be smaller.
+    tiles_per_batch: 8  # Validation/test tile count; also training count with legacy shuffled_tiles.
     learning_rate: 0.001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
-    num_workers: 4  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
-    prefetch_factor: 2  # Tile batches prefetched per worker; larger batches also increase host-memory use.
+    num_workers: 20  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
+    prefetch_factor: 4  # Tile batches prefetched per worker; larger batches also increase host-memory use.
     # Halo is derived: aggregation radius + max(biology radius, discriminator radius).
-    # Default radii give halo 6, a 44x44 input, 13x13 biology support, and 7x7 latent support.
+    # Default radii give halo 6, a 20x20 input, 13x13 biology support, and 7x7 latent support.
     # Only occupied, selected core rows supply labels; all occupied halo MSI remains context.
 
   # Shared optimization and adversarial schedule.
@@ -140,7 +140,7 @@ training:
   smoke_epochs: 1  # Epoch count for smoke training.
   smoke_num_workers: 0  # Worker count for smoke training and analysis.
   smoke_core_size: 8  # Spatial smoke core side length; the halo is still derived from component radii.
-  smoke_tiles_per_batch: 2  # Logical tiles per spatial smoke optimizer step.
+  smoke_tiles_per_batch: 2  # Spatial smoke evaluation tiles; training row budget remains unchanged.
 
 analysis:
   split: test  # Saved checkpoint split used for latent/prediction analysis.
@@ -173,4 +173,4 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: fit  # Human-readable run name; separate experiments should use separate names.
+  run_name: proportional-slide-tiles-8x8-2048  # Human-readable run name; separate experiments should use separate names.

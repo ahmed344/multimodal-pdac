@@ -67,3 +67,49 @@ def validate_training_data_contract(checkpoint: Mapping[str, Any], config: Mappi
         raise ValueError('Incompatible training_data_contract for supervised training/analysis.')
     if checkpoint.get('data_identity', saved['labeled_identity']) != saved['labeled_identity']:
         raise ValueError('Checkpoint data identity and training_data_contract disagree.')
+
+
+def sampling_contract(config: Mapping[str, Any], selected_rows) -> dict[str, Any]:
+    """Describe optimizer sampling separately from inference/architecture compatibility.
+
+    Row IDs refer to the ordered source protected by training_data_contract. Their
+    order is hashed too, because it determines tile identities and within-tile order.
+    """
+    import hashlib
+    import numpy as np
+    from dann.sampling import ALGORITHM_VERSION
+    training = config['training']
+    spatial = execution_settings(config)['mode'] == 'spatial'
+    strategy = training.get('sampling_strategy', 'shuffled_tiles') if spatial else 'shuffled_pixels'
+    return dict(version=1, strategy=strategy,
+                algorithm_version=ALGORITHM_VERSION if strategy == 'proportional_slide_tiles' else 1,
+                seed=int(training['seed']), core_size=training.get('core_size', 32) if spatial else None,
+                supervised_rows_per_batch=(training.get('supervised_rows_per_batch', 2048)
+                    if strategy == 'proportional_slide_tiles' else
+                    (training['batch_size'] if not spatial else None)),
+                tiles_per_batch=(training.get('tiles_per_batch', 8) if strategy == 'shuffled_tiles' else None),
+                selected_training_rows_sha256=hashlib.sha256(
+                    np.asarray(selected_rows, dtype='<i8').tobytes()).hexdigest())
+
+
+def validate_sampling_contract(checkpoint: Mapping[str, Any], config: Mapping[str, Any],
+                               selected_rows=None) -> None:
+    """Reject incompatible optimizer resumes; old checkpoints imply legacy sampling."""
+    import copy
+    from dann.config import resolve_execution
+    saved_rows = checkpoint['split_indices']['train']
+    saved = checkpoint.get('sampling_contract')
+    if saved is None:
+        legacy = copy.deepcopy(checkpoint['config'])
+        legacy['training']['sampling_strategy'] = 'shuffled_tiles'
+        if 'spatial' in legacy['training']:
+            legacy['training']['spatial']['sampling_strategy'] = 'shuffled_tiles'
+        saved = sampling_contract(resolve_execution(legacy), saved_rows)
+    expected = sampling_contract(config, saved_rows if selected_rows is None else selected_rows)
+    if saved != expected:
+        raise ValueError('Cannot resume: incompatible sampling contract.')
+    state = checkpoint.get('sampler_state')
+    if state is not None and state != dict(completed_epoch=int(checkpoint['epoch']),
+                                          sampler_epoch=int(checkpoint['epoch']),
+                                          next_epoch=int(checkpoint['epoch']) + 1):
+        raise ValueError('Cannot resume: inconsistent sampler epoch state.')

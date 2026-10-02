@@ -38,28 +38,55 @@ per-pixel channel LayerNorm, GELU, and dropout 0.10. Occupancy masks suppress
 features in missing tissue after every hidden stage and the output projection.
 There is no spatial pooling or normalization over a whole tile.
 
-All-MLP configurations use the original sparse pixel loader and the settings in
-`training.pixel`: 1,024 pixels per optimizer step, 4,096 per validation batch, and
-learning rate 0.01. Any CNN selects `training.spatial`: **eight tiles** per optimizer
-step, 32×32 core positions per tile, learning rate 0.001, four workers, and prefetch
-factor two. Eight tiles contain at most 8,192 core positions; actual supervised
-counts depend on tissue occupancy, the selected split, and per-target validity.
-Tiles shuffle across slides without requiring distinct slides within a batch.
+All-MLP configurations retain the sparse pixel loader and `training.pixel` settings.
+Any CNN selects `training.spatial`. The checked-in configuration now uses
+`sampling_strategy: proportional_slide_tiles`, 8×8 cores, and
+`supervised_rows_per_batch: 2048`. Every selected training row appears once per
+epoch, including rows with invalid targets (validity masks still control loss).
+Only the final batch may contain fewer rows. No labels influence sampling.
 
-Eight tiles is a fitting baseline, not a GPU-memory ceiling. A 2026-09-29 RTX 5090
-comparison used the same 32 real-data tiles (17,926 supervised core rows and
-19,953,249 active peaks), one warm-up per batch size, and three timed passes.
-Median times for all 32 tiles were 3.72, 3.73, and 3.79 seconds at batch sizes
-8, 16, and 32; peak allocated memory was 1.37, 1.54, and 2.58 GiB respectively.
-Timing included collation, transfer, forward/backward, gradient clipping, and
-AdamW, but excluded HDF5 reads. Larger logical batches showed no throughput
-improvement in this check. They do not enlarge the spectral microbatches and
-reduce the number of optimizer updates per epoch. Keep eight as the default;
-evaluate larger batches using held-out CD8 loss if changing the fitting setup.
+For zero-based epoch `e`, an isolated NumPy generator uses `seed + 50000 + e`.
+Slides are visited in sorted order and their tile queues independently shuffled.
+Tiles merge by normalized cumulative row midpoint, seeded random tie-break, then
+tile index. Their existing row order is preserved. Larger slides contribute
+proportionally; an update need not contain every slide. Batch boundaries can split
+a tile's supervision across updates, each retaining the entire original context.
+Requests are generated in the main process and sent immutably to persistent
+workers; the dataset reads CSR spectra lazily without a dense MSI matrix.
+
+Missing `sampling_strategy` retains legacy `shuffled_tiles`. Under that strategy,
+`tiles_per_batch` controls training. Under the corrected strategy it controls only
+validation/test tile batches (default eight), never caps training tiles.
+`execution` metadata records training row and evaluation tile units separately.
+Smoke mode caps split membership and evaluation tiles but preserves the training
+row budget and architecture-derived halo. The activated run name is
+`proportional-slide-tiles-8x8-2048`, separate from earlier `fit` directories.
+
+Production retains its epoch-based GRL horizon:
+`(epoch * len(train_loader) + step) / (epochs * len(train_loader) - 1)` (with the
+existing denominator guard). The diagnostic used a fixed update horizon.
+Dropout, AdamW, clipping, loss weights, peak budget and checkpointing are unchanged.
+New checkpoints have a separate versioned `sampling_contract` and epoch-boundary
+`sampler_state`. Optimizer resume rejects changes in strategy, algorithm, seed,
+core size, training batch budget, or ordered selected-row identities. Old
+checkpoints imply legacy sampling using their saved configuration. Inference and
+architecture checks do not depend on sampler compatibility; no mid-epoch resume
+is supported.
+
+Training writes `model/sampling/epoch_NNNN_batches.jsonl` with supervised rows,
+unique tiles, distinct slides, slide entropy (natural logarithm), largest slide
+fraction, cumulative rows and epoch position. The corresponding summary records
+composition ranges/means and SHA-256 hashes of actual row order and cumulative
+boundaries (little-endian int64, including the initial zero boundary).
+
+The preceding diagnostic supports this sampling correction for spatial MLP and
+discriminator-only CNN controls. It does not confirm convergence of the active
+CNN aggregation/CNN biology/MLP discriminator architecture. Global pixel
+shuffling performed better in that study.
 
 The halo is derived as `aggregation radius + max(biology radius, discriminator
 radius)`. An MLP has radius zero; a CNN has radius equal to its depth. Defaults
-therefore use halo six and 44×44 input tiles. Each biology prediction sees a
+therefore use halo six and 20×20 input tiles. Each biology prediction sees a
 13×13 spectral-input neighborhood, and each exported latent sees 7×7. Both heads
 run before core rows are selected, so CNN heads retain their latent halo.
 
@@ -610,3 +637,200 @@ flat-tile MLP control would separate this batch-composition change from spatial
 microbatch/dropout execution. The measured early ramp reached only 0.00666;
 these experiments do not evaluate the full 0.25 adversarial strength. They do
 not establish a production fix. The full synthetic suites passed 265 tests.
+
+### Batch composition and execution diagnosis
+
+`dann.verification.batch_execution_diagnosis` freezes the preceding diagnostic's
+configuration, split identities, and fresh initialization. It separates ordinary
+pixel execution, core spectral microbatching, checkpointing, context processing,
+and spatial grid execution. Production settings and checkpoint APIs are unchanged.
+
+```bash
+OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 PYTORCH_ALLOC_CONF=expandable_segments:True \
+  python -m dann.verification.batch_execution_diagnosis \
+  --output <new-diagnostic-directory> --stage B
+```
+
+Stage A performs strict float64 forward/gradient/clipped-AdamW equivalence and
+checkpoint RNG checks, then preflights each seed and flat schedule at its largest planned peak load.
+Stage B performs 500-update P/F/S comparisons for seeds 20260719–20260721. Stages
+C1 and C2 are explicitly selected after reviewing B: C1 compares complete-pass
+composition schedules; C2 runs the intermediate execution ladder. `--controls`
+and `--seeds` select individual recorded controls. `--repeat <suffix>` creates
+an unchanged repeat without replacing evidence.
+
+Stage D accepts an evidence-selected `--dropout spectral-off` or
+`--dropout aggregation-off`, or `--sampler small`, `rounds`, or `rounds-small`.
+The rounds sampler uses 8×8 cores, complete halos, and seeded rounds over active
+slides without oversampling. `--placement discriminator`, `aggregation`, or
+`biology` constructs paired CNN confirmations with restored adversarial loss
+and the fixed original GRL horizon. A correction must be selected from completed
+causal evidence; these switches are not recommended production settings.
+
+Sampling plans contain ordered row IDs, batch boundaries, pass boundaries, tile
+identities, and hashes. Spectra remain sparse and are read lazily. Full validation
+checks exact row coverage and uses complete spatial inference for CNN aggregation
+or biology. Fixed training-only audits preserve RNG and existing gradients.
+Diagnostic states use `batch-execution-diagnostic-v1`, carry optimizer and plan
+positions, and are not production checkpoints.
+
+The 120-minute persistent wall-clock budget starts with the first real GPU audit.
+Causal stages reserve 35 minutes; correction stages reserve five minutes. Group
+admission uses `--estimate-seconds` with an additional 20% margin. `--resume`
+retains that deadline and skips only completed runs whose scientific contracts
+and artifact hashes match. Incomplete attempts remain immutable; a new explicit
+repeat is required. `--stage report` regenerates the comparison CSV and plots
+from recorded evidence without GPU training.
+
+The completed study is recorded in
+`data/PDAC/Results/dann/diagnostics/2026-10-01-batch-execution-audit-fix/`;
+`diagnosis.txt`, `comparison.csv`, and the per-seed `curves_*.png` contain the
+results. All three globally mixed native-sized controls learned, while all
+three within-slide-dispersed controls failed at identical batch sizes, both
+at update 500 and after two complete passes. Smaller local batches also failed
+in all three seeds. This supports a between-slide composition effect under the
+frozen optimizer/dropout settings; larger batches alone do not force collapse.
+
+The specified 8×8 active-slide-round correction **failed all three spatial MLP
+seeds**. Its mean slide diversity rose to about 30, but fell to one near pass
+ends, and final CD8 spectrum-shuffle sensitivity remained negligible. A paired
+first-seed discriminator-CNN screen also failed; other CNN confirmations and the
+stochastic execution ladder were budget-limited. No production change is
+validated. One third-seed native monolithic control was memory-infeasible and
+is explicitly excluded from completed comparisons. The initial diagnostic audit
+OOM and its correction are preserved in the sibling original-attempt directory.
+
+GPU experiments stopped within the 120-minute persistent deadline. Final checks
+verified 27 complete controls and 256 exact validation exports; 284 synthetic
+tests passed. The final runner preflights each seed/schedule separately, so an
+OOM in a native batch does not block a feasible smaller schedule, and rejects
+incompatible stage/execution/correction choices. These administrative safeguards
+were added after the experiment; its exact implementation remains frozen under
+`<study>/source/`. Resume intentionally rejects changed source contracts. To
+resume that frozen implementation, run from `<study>/source/`, passing absolute
+`--previous-run` and `--output` paths together with `--resume`. The source archive
+contains the package modules needed for that invocation.
+
+### Extended 1,000-update composition/execution study
+
+`python -m dann.verification.extended_batch_diagnosis --output <new-directory>`
+launches the isolated follow-up with a persistent 240-minute cap. It preserves the
+archived data/split/initialization contract and uses three prescribed seeds. Every
+fit has 1,000 optimizer updates; complete-pass plans include final partial batches.
+The original diagnostic CLI also accepts `--updates` without changing its existing
+default stage lengths.
+
+The follow-up compares globally shuffled pixels and native spatial batches, then
+pairs flat/spatial execution on identical 2,048-row batches from 8×8 tile cores.
+Per-slide shuffled queues are interleaved by normalized cumulative supervised-row
+midpoints, spreading slide contributions throughout each pass without oversampling.
+Halo three, dropout, learning rate, target masks, and the biology loss are preserved.
+Training-only density/spectral audits do not exclude data or assert registration
+correctness. An exact globally shuffled spatial-context comparison requires a
+separate memory/time gate; blocked controls are never silently approximated.
+
+Subsequent complete three-seed groups follow the observed contrast: execution
+ladder, within-slide dispersion, or local ordering with smaller spatial supervision.
+An unchanged decisive-pair repeat precedes discriminator-CNN confirmation. The
+complete three-seed CNN group is admitted when the budget permits; otherwise only
+the prescribed first-seed preliminary screen is considered, before seeing CNN
+outcomes. Admission includes a 25% margin and a ten-minute final reserve. All
+fits are sequential; immutable failures and incomplete comparisons are reported.
+No production defaults or preprocessing are changed.
+
+Use `--controls Qflat Qspatial --seeds 20260719` with a new output directory to
+replay an individual matched MLP comparison. Available controls also include
+`P`, `S`, `QX1`, `QX2`, `QX3`, `LocalSmall`, and `Qdispersed`. Explicit `--resume`
+skips completed contract-matching controls and retains the original deadline;
+incomplete attempts are never overwritten. Full studies require all three seeds.
+
+The 1,000-update results are stored in
+`data/PDAC/Results/dann/diagnostics/2026-10-01-batch-execution-1000/`.
+The original spatial regime and its smaller-local-batch variant failed all three
+MLP seeds. The proportional 8×8 spatial regime passed all three, with an unchanged
+first-seed repeat confirming the original/corrected failure/success contrast.
+All corrected spatial MLP seeds had failed at 500 updates, making the longer
+diagnostic horizon consequential. Globally shuffled pixels still performed best.
+
+The restored-adversarial discriminator-only CNN comparison also passed all three
+corrected seeds and failed all three original seeds. Aggregation/biology CNN
+placements and full-strength GRL remain untested. Dispersion within slides improved
+the flat controls at exactly matched batch sizes and slide counts. Execution
+ladder outcomes were seed-sensitive; strict numerical and checkpoint RNG checks
+found no production implementation defect. Registration errors and the causal
+effects of low-signal slides were not ruled out.
+
+See `diagnosis.txt`, `final_assessment.json`, `matched_pass_endpoints.csv`, and
+`composition_summary.png` / `execution_summary.png` / `cnn_summary.png` for
+per-seed evidence, exposure comparisons, and limitations. The complete sampling
+regime is a supported diagnostic candidate, not an automatic production change.
+The exact experiment source remains under `source/`, with separately executed
+follow-up orchestration under `analysis_source/`. The final integrated runner and
+tests are archived separately under `final_implementation/`; resume deliberately
+rejects a different source contract. Use the frozen source archive to reproduce
+the recorded implementation.
+
+## Production sampler integration verification
+
+The production parity tests are in `dann/tests/test_sampling.py`. Run the bounded
+real-data audit with a new output directory:
+
+```bash
+python -m dann.verification.production_sampling_audit \
+  --output data/PDAC/Results/dann/diagnostics/<new-audit-name>
+```
+
+The audit has a 20-minute maximum including checks and validation. It compares
+six full passes with archived Q plans, checks original batch fields and full
+halos, preflights the largest context workload, executes ten updates through
+`run_epoch` with the production worker settings, and evaluates a bounded spatial
+validation subset. It records failures without changing execution settings and
+never scores test labels. Its partial training audit summaries deliberately say
+`complete: false`; no partial epoch is saved as a resumable training checkpoint.
+
+The initial integration audit passed in about one minute; all 327 repository
+tests passed. See
+`data/PDAC/Results/dann/diagnostics/2026-10-01-production-sampling-audit/summary.txt`
+and `report.json` for plan hashes, composition, GPU memory and bounded results.
+
+## Two-architecture production fits
+
+Run the CNN aggregation/biology model, then the MLP aggregation/CNN biology model,
+with a fresh orchestration directory:
+
+```bash
+python -m dann.verification.production_fits \
+  --output data/PDAC/Results/dann/production/<new-study-name>
+```
+
+This entry point copies the current YAML, changes only run names and the second
+aggregation selector, and verifies the prescribed seed, 300-epoch cap, five-epoch
+patience, 0.001 selection delta, 8×8 cores and 2,048-row proportional sampling.
+Architecture-derived halos remain six and three pixels. It verifies both splits
+and the first sampling pass against the archived audit, and fits a training-only
+constant hurdle baseline before starting either fit. Existing run directories
+are rejected, and training is never resumed or retried. This is a two-fit,
+single-seed experiment, without the diagnostic audit's 20-minute limit.
+
+The orchestration directory contains `A.yaml`, `B.yaml`, `manifest.json`,
+`constant_baseline.json`, `splits.npz`, and `results.json`. Each architecture's
+unique results directory contains `status.json`, stage logs, sampled GPU/disk
+usage, resource summaries, and the usual model artifacts. Training failures
+preserve completed artifacts and allow the other architecture to run unchanged.
+The launcher waits for existing GPU compute processes without interrupting them.
+
+Each normally completed best checkpoint is independently evaluated on the entire
+validation split using full spatial execution. Downstream work requires CD8 loss
+at least 0.001 below the constant baseline, weighted biology loss below baseline,
+and positive-CD8 logit R² above zero. `assessment.json` records the three checks,
+checkpoint hash, stopping/best epochs, metrics and exact validation coverage.
+Only passing runs execute configured analysis, full tissue prediction/latent
+export, spatial heatmaps and latent variance diagnostics. The configured 1,000
+Monte Carlo samples and test analysis settings are retained. Export validators
+check complete tissue row coverage, finite values and all target heatmaps.
+
+Routing and threshold tests run without launching production fits:
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q dann/tests/test_production_fits.py
+```
