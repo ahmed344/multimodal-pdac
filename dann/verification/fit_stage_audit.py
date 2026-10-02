@@ -49,7 +49,7 @@ def main():
     if elapsed >= 1200:
         raise RuntimeError('Insufficient remaining budget for the follow-up allocation.')
     checkpoint = torch.load(manifest['checkpoint'], map_location='cpu', weights_only=False)
-    from dann.checkpoints import validate_training_data_contract
+    from dann.checkpoints import checkpoint_config, validate_training_data_contract
     validate_training_data_contract(checkpoint, checkpoint['config'])
     cached = torch.load(root/'batches.pt', map_location='cpu', weights_only=False)
     torch.set_num_threads(4)
@@ -58,10 +58,11 @@ def main():
     pixel = move_batch_to_device(cached['pixel'], torch.device('cuda'))
     labeled = move_batch_to_device(cached['labeled_pixel'], torch.device('cuda'))
     results = {}
-    cases = [('fresh', checkpoint['config'], None), ('fitted', checkpoint['config'], checkpoint['model_state'])]
+    config = checkpoint_config(checkpoint)
+    cases = [('fresh', config, None), ('fitted', config, checkpoint['model_state'])]
     for name in ('cnn_lr_1e-3', 'cnn_lr_1e-4', 'mlp_lr_1e-4'):
         saved = torch.load(root/name/'last.pt', map_location='cpu', weights_only=False)
-        cases.append((name, saved['config'], saved['model_state']))
+        cases.append((name, checkpoint_config(saved), saved['model_state']))
     residuals = []
     for name, config, state in cases:
         if time.monotonic()-start > 580:

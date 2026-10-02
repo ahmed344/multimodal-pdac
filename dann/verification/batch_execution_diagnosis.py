@@ -827,6 +827,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.error('Output exists; choose a new directory or explicit --resume.')
     root.mkdir(parents=True, exist_ok=args.resume)
     config = load_config(args.previous_run/'source_config.yaml')
+    config['model']['heads']['biology']['cnn']['residual'] = False  # Historical plain-CNN controls.
     freeze(root, args.previous_run, config, SEEDS, args.budget_minutes)
     payload = torch.load(args.previous_run/'reference.pt', map_location='cpu', weights_only=False)
     if target_contract(config) != checkpoint_contract(payload):
@@ -902,7 +903,7 @@ def main(argv: list[str] | None = None) -> None:
                 if args.placement=='aggregation':
                     reference.encoder.aggregation_mlp = CNNAggregation(256,256,**group['cnn'])
                 elif args.placement=='biology':
-                    reference.biology_predictor = CNNBiology(256,12,**group['cnn'])
+                    reference.biology_predictor = CNNBiology(256,12,**{**group['cnn'], 'residual': False})
                 else:
                     reference.batch_discriminator = CNNDiscriminator(256,43,**group['cnn'])
             reference.halo = reference.encoder.aggregation_mlp.radius+max(reference.biology_predictor.radius,reference.batch_discriminator.radius)

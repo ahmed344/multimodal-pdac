@@ -44,7 +44,7 @@ model:
 
   # 2. Latent aggregation: choose the original pointwise MLP or local spatial CNN.
   aggregation:
-    type: cnn  # Choices: mlp, cnn. Only the selected component's settings are used.
+    type: mlp  # Choices: mlp, cnn. Only the selected component's settings are used.
     mlp:
       hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
@@ -55,12 +55,13 @@ model:
   # 3. Prediction heads: choices are independent; both consume aggregation latents.
   heads:
     biology:
-      type: mlp  # Choices: mlp, cnn. Emits three raw ZILN parameters per target.
+      type: cnn  # Choices: mlp, cnn. Emits three raw ZILN parameters per target.
       mlp:
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
         channels: 128  # Hidden spatial width; final pointwise projection emits target parameters.
         depth: 3  # Neighborhood radius in latent-grid pixels.
+        residual: true  # Disabling may prevent learning: the tested plain CNN collapsed pixel-to-pixel feature variation.
         dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
 
     discriminator:

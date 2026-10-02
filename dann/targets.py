@@ -57,7 +57,8 @@ def checkpoint_contract(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
 def checkpoint_analysis_config(config: Mapping[str, Any], checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     """Use frozen model/preprocessing/target semantics with runtime analysis settings."""
     resolved = copy.deepcopy(dict(config))
-    saved = checkpoint["config"]
+    from dann.checkpoints import checkpoint_config
+    saved = checkpoint_config(checkpoint)
     resolved["model"] = copy.deepcopy(saved["model"])
     for key in ("matrix_key", "batch_column", "intensity_transform", "intensity_clip_max", "nonzero_threshold", "x_column", "y_column"):
         if key in saved["data"]:

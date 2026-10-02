@@ -271,8 +271,8 @@ def main():
     started = time.monotonic()
     source_hash = hashlib.sha256(args.checkpoint.read_bytes()).hexdigest()
     checkpoint = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
-    config = copy.deepcopy(checkpoint['config'])
-    from dann.checkpoints import validate_training_data_contract
+    from dann.checkpoints import checkpoint_config, validate_training_data_contract
+    config = checkpoint_config(checkpoint)
     validate_training_data_contract(checkpoint, config)
     config['training']['core_size'] = 8
     seed = config['training']['seed']

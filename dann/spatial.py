@@ -724,7 +724,8 @@ def load_checkpoint_model(
     missing = required.difference(checkpoint)
     if missing:
         raise KeyError(f"Checkpoint is missing required keys: {sorted(missing)}")
-    config = copy.deepcopy(checkpoint["config"])
+    from dann.checkpoints import checkpoint_config
+    config = checkpoint_config(checkpoint)
     config["data"].pop("context_path", None)  # Inference input belongs to the runtime caller.
     config["data"]["cd8_normalization"] = checkpoint_contract(checkpoint)["cd8_normalization"]
     target_columns = tuple(str(value) for value in checkpoint["target_columns"])

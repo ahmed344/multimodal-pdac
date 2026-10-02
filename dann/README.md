@@ -38,6 +38,16 @@ per-pixel channel LayerNorm, GELU, and dropout 0.10. Occupancy masks suppress
 features in missing tissue after every hidden stage and the output projection.
 There is no spatial pooling or normalization over a whole tile.
 
+The biology CNN defaults to `model.heads.biology.cnn.residual: true`. Each hidden
+3×3 block adds its input to its normalized, activated, dropped-out output, divides
+by `sqrt(2)`, and reapplies the tissue mask. Input/output projections and receptive
+fields are unchanged. Set `residual: false` to use the original plain CNN. In the
+matched three-epoch diagnosis, the plain CNN collapsed pixel-to-pixel feature
+variation and failed all three seeds; residual connections passed all three,
+including fresh fits with adversarial loss restored. This supports the default
+but does not guarantee convergence over the full training schedule. Aggregation
+and discriminator behavior are unchanged by this option.
+
 All-MLP configurations retain the sparse pixel loader and `training.pixel` settings.
 Any CNN selects `training.spatial`. The checked-in configuration now uses
 `sampling_strategy: proportional_slide_tiles`, 8×8 cores, and
@@ -131,13 +141,19 @@ Checkpoint selection uses **mean validation CD8 ZILN loss over valid CD8 rows**.
 Training still optimizes all four weighted targets plus the adversarial objective.
 Checkpoints save the exact split positions plus an ordered row/feature identity
 fingerprint; analysis reuses those splits and may cap them further. There is no
-refit using validation or test labels. Version-two architecture metadata records
+refit using validation or test labels. Version-three architecture metadata records
 selected components, numerical settings, receptive fields, batch order, targets,
 and optimizer parameter names. Legacy flat configurations mean Deep Sets with
 MLP aggregation and heads. Legacy parameter-key conversion is identity because
 keys and registration order were retained; optimizer ordering and state shapes
 are checked before resume. Incompatible components or targets are rejected.
 A legacy selection score is reset when resuming under the CD8 selection metric.
+The architecture contract now includes the biology CNN residual setting.
+Version-two and unversioned checkpoints without that setting retain the original
+non-residual calculation during analysis and inference. To resume one of those
+CNN checkpoints, explicitly set `model.heads.biology.cnn.residual: false`;
+resuming with a different residual setting is rejected even though tensor shapes
+match. Saved configuration and architecture metadata must agree.
 
 All prediction consumers should use `model(batch)`. Calling `encode()` and then
 the biology head loses the spatial halo when a CNN head is selected. Peak-embedding

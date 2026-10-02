@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 from dataclasses import dataclass
@@ -556,11 +557,17 @@ def save_checkpoint(
 
     path.parent.mkdir(parents=True, exist_ok=True)
     identity = row_identity(Path(config["data"]["path"]), config["data"])
+    saved_config = copy.deepcopy(dict(config))
+    architecture = architecture_contract(config)
+    if "spectral_encoder" in saved_config["model"]:
+        from dann.config import component_settings
+        saved_config["model"]["heads"]["biology"].setdefault("cnn", {})["residual"] = (
+            component_settings(config["model"])["heads"]["biology"]["cnn"]["residual"])
     payload = {
         "sampling_contract": sampling_contract(config, bundle.split_indices["train"]),
         "sampler_state": {"completed_epoch": int(epoch), "sampler_epoch": int(epoch),
                           "next_epoch": int(epoch) + 1},
-        "architecture": architecture_contract(config),
+        "architecture": architecture,
         "optimizer_parameter_names": list(dict(model.named_parameters())),
         "data_identity": identity,
         "training_data_contract": training_data_contract(config, identity),
@@ -568,7 +575,7 @@ def save_checkpoint(
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "epoch": int(epoch),
-        "config": dict(config),
+        "config": saved_config,
         "batch_names": bundle.metadata.batch_names,
         "target_columns": tuple(config["data"]["target_columns"]),
         "target_transform": target_contract(config),

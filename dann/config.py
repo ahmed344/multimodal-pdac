@@ -199,6 +199,10 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
         positive.extend([*group["mlp"]["hidden_dims"], group["cnn"]["channels"], group["cnn"]["depth"]])
         if not 0 <= group["cnn"]["dropout"] < 1:
             raise ValueError("CNN dropout must be in [0, 1).")
+    biology_cnn = settings["heads"]["biology"]["cnn"]
+    biology_cnn.setdefault("residual", True)
+    if not isinstance(biology_cnn["residual"], bool):
+        raise ValueError("model.heads.biology.cnn.residual must be boolean.")
     if any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in positive):
         raise ValueError("Model widths, depths, and peak budgets must be positive integers.")
     if not isinstance(model.get("spectral_checkpointing", True), bool):
@@ -220,6 +224,10 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve mode-specific settings and all run paths once, without overrides."""
+    settings = component_settings(config["model"])
+    if "spectral_encoder" in config["model"]:
+        config["model"]["heads"]["biology"].setdefault("cnn", {})["residual"] = (
+            settings["heads"]["biology"]["cnn"]["residual"])
     execution = execution_settings(config)
     training = config["training"]
     mode = execution["mode"]

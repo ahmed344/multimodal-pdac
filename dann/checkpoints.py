@@ -1,4 +1,5 @@
 """Versioned architecture contracts and deterministic legacy compatibility."""
+import copy
 from typing import Any, Mapping
 
 from dann.config import component_settings, execution_settings
@@ -10,10 +11,41 @@ def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     selected = {'spectral_encoder': settings['spectral_encoder']}
     for name, group in [('aggregation', settings['aggregation']), *settings['heads'].items()]:
         selected[name] = {'type': group['type'], group['type']: group[group['type']]}
-    return {'version': 2, 'components': selected,
+    return {'version': 3, 'components': selected,
             'numerics': {key: config['model'][key] for key in
                          ('num_peaks', 'latent_dim', 'activation', 'dropout', 'use_layer_norm', 'sigma_min')},
             'spatial': execution_settings(config)}
+
+
+def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve saved model semantics without applying new defaults to old weights.
+
+    Version-two and unversioned checkpoints predate biology residual connections.
+    Their missing flag means false; version three explicitly records the flag.
+    No checkpoint data is mutated or rewritten.
+    """
+    config = copy.deepcopy(checkpoint['config'])
+    saved = copy.deepcopy(checkpoint.get('architecture'))
+    version = saved['version'] if saved is not None else 2
+    if version not in (2, 3):
+        raise ValueError('Unsupported checkpoint architecture version.')
+    if 'spectral_encoder' in config['model']:
+        biology = config['model']['heads']['biology']
+        cnn = biology.setdefault('cnn', {})
+        if version == 3 and biology['type'] == 'cnn' and 'residual' not in cnn:
+            raise ValueError('Checkpoint configuration is missing biology CNN residual setting.')
+        cnn.setdefault('residual', version == 3)
+    if saved is not None:
+        biology = saved['components']['biology']
+        if biology['type'] == 'cnn':
+            if version == 2:
+                biology['cnn'].setdefault('residual', False)
+            if not isinstance(biology['cnn'].get('residual'), bool):
+                raise ValueError('Checkpoint architecture requires a boolean biology CNN residual setting.')
+        saved['version'] = 3
+        if saved != architecture_contract(config):
+            raise ValueError('Checkpoint configuration disagrees with architecture metadata.')
+    return config
 
 
 def legacy_parameter_conversion(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -24,9 +56,21 @@ def legacy_parameter_conversion(state: Mapping[str, Any]) -> dict[str, Any]:
 def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any],
                         model=None, optimizer: bool = False) -> None:
     """Reject architecture or optimizer registration changes before loading state."""
-    saved = checkpoint.get('architecture', architecture_contract(checkpoint['config']))
-    if saved != architecture_contract(config):
-        raise ValueError('Checkpoint components or numerical settings are incompatible.')
+    saved = architecture_contract(checkpoint_config(checkpoint))
+    requested = architecture_contract(config)
+    if saved != requested:
+        message = 'Checkpoint components or numerical settings are incompatible.'
+        saved_biology = saved['components']['biology']
+        requested_biology = requested['components']['biology']
+        if (saved_biology['type'] == requested_biology['type'] == 'cnn'
+                and saved_biology['cnn']['residual'] != requested_biology['cnn']['residual']):
+            flag = str(saved_biology['cnn']['residual']).lower()
+            message += f' Biology CNN residual setting differs; use residual: {flag} to resume.'
+        raise ValueError(message)
+    if model is not None and hasattr(model.biology_predictor, 'residual'):
+        biology = requested['components']['biology']
+        if biology['type'] != 'cnn' or model.biology_predictor.residual != biology['cnn']['residual']:
+            raise ValueError('Model biology CNN residual setting is incompatible with checkpoint.')
     if optimizer and model is not None:
         names = list(dict(model.named_parameters()))
         saved_names = checkpoint.get('optimizer_parameter_names', list(checkpoint['model_state']))
