@@ -44,7 +44,7 @@ model:
 
   # 2. Latent aggregation: choose the original pointwise MLP or local spatial CNN.
   aggregation:
-    type: mlp  # Choices: mlp, cnn. Only the selected component's settings are used.
+    type: cnn  # Choices: mlp, cnn. Only the selected component's settings are used.
     mlp:
       hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
@@ -65,7 +65,7 @@ model:
         dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
 
     discriminator:
-      type: mlp  # Choices: mlp, cnn. Predicts batch class from gradient-reversed latents.
+      type: cnn  # Choices: mlp, cnn. Predicts batch class from gradient-reversed latents.
       mlp:
         hidden_dims: [256, 128, 64]  # Original batch-discriminator hidden widths.
       cnn:
@@ -128,10 +128,10 @@ training:
   grl_max_lambda: 0.25  # Maximum encoder-bound gradient reversal strength.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
   grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
-  early_stopping_patience: 5  # Epochs without improvement in mean validation CD8 ZILN loss over valid CD8 rows.
+  early_stopping_patience: 10  # Epochs without improvement in mean validation CD8 ZILN loss over valid CD8 rows.
   early_stopping_min_delta: 0.001  # Minimum improvement in that selection metric; training still uses all four targets.
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
-  resume_checkpoint: null  # Optional checkpoint path; incompatible targets, components, or optimizer ordering are rejected.
+  resume_checkpoint: null  # Continue this checkpoint. Epochs, workers, prefetch, and early stopping come from this file; other training values stay in the checkpoint.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
 
   # --smoke-test overrides, recorded in resolved_config.yaml under a separate smoke/ run directory.

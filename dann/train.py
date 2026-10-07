@@ -22,7 +22,7 @@ from dann.data_loader import DataBundle, create_data_bundle
 from dann.sampling import SamplingEpochAudit
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion
-from dann.checkpoints import (architecture_contract, validate_checkpoint, training_data_contract,
+from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
 from dann.targets import CD8, checkpoint_contract, target_contract
@@ -54,6 +54,261 @@ class EarlyStopping:
         else:
             self.stale_epochs += 1
         return improved, self.stale_epochs >= self.patience
+
+
+_RESUME_OVERRIDES = (
+    "early_stopping_patience",
+    "early_stopping_min_delta",
+    "epochs",
+    "num_workers",
+    "prefetch_factor",
+    "resume_checkpoint",
+)
+
+
+def resume_training_config(saved_config: Mapping[str, Any], requested_config: Mapping[str, Any]) -> dict[str, Any]:
+    """Continue from saved training values, applying a short set of current overrides.
+
+    Args:
+        saved_config (Mapping[str, Any]): Configuration stored in the checkpoint.
+        requested_config (Mapping[str, Any]): Current resolved configuration.
+
+    Returns:
+        dict[str, Any]: Checkpoint configuration with epochs, workers, prefetch,
+        early-stopping patience, minimum improvement, and the resume path replaced
+        by the requested values. The checkpoint learning rate stays in place.
+    """
+
+    config = copy.deepcopy(dict(saved_config))
+    training = config.setdefault("training", {})
+    requested = requested_config["training"]
+    for key in _RESUME_OVERRIDES:
+        training[key] = requested[key]
+    mode = config.get("execution", {}).get("mode")
+    if mode not in {"pixel", "spatial"}:
+        from dann.config import execution_settings
+        mode = execution_settings(config)["mode"]
+    block = training.get(mode)
+    if isinstance(block, dict):
+        for key in ("num_workers", "prefetch_factor"):
+            block[key] = requested[key]
+    execution = config.get("execution")
+    if isinstance(execution, dict):
+        for key in ("num_workers", "prefetch_factor"):
+            if key in execution:
+                execution[key] = requested[key]
+    return config
+
+
+def _config_values_equal(left: Any, right: Any) -> bool:
+    """Compare configuration leaves, treating close numbers as equal.
+
+    Args:
+        left (Any): Saved or requested value.
+        right (Any): Value from the other configuration.
+
+    Returns:
+        bool: Whether the two leaves represent the same setting.
+    """
+
+    if isinstance(left, np.generic):
+        left = left.item()
+    if isinstance(right, np.generic):
+        right = right.item()
+    if isinstance(left, bool) or isinstance(right, bool):
+        return left == right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        left_value, right_value = float(left), float(right)
+        if math.isnan(left_value) and math.isnan(right_value):
+            return True
+        return math.isclose(left_value, right_value, rel_tol=0, abs_tol=1e-12)
+    return left == right
+
+
+def ignored_resume_settings(requested_config: Mapping[str, Any], effective_config: Mapping[str, Any]) -> list[str]:
+    """List requested settings that resume does not apply.
+
+    Args:
+        requested_config (Mapping[str, Any]): Configuration loaded from the current YAML.
+        effective_config (Mapping[str, Any]): Configuration that training will use.
+
+    Returns:
+        list[str]: Sorted dotted paths whose requested values differ from the effective configuration.
+    """
+
+    def walk(left: Any, right: Any, prefix: str) -> list[str]:
+        """Collect dotted paths that differ between two configuration values.
+
+        Args:
+            left (Any): Requested configuration node.
+            right (Any): Effective configuration node.
+            prefix (str): Dotted path of this node.
+
+        Returns:
+            list[str]: Sorted differing paths at or below this node.
+        """
+
+        if isinstance(left, Mapping) and isinstance(right, Mapping):
+            paths: list[str] = []
+            for key in sorted(set(left) | set(right), key=str):
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if key not in left or key not in right:
+                    paths.append(path)
+                else:
+                    paths.extend(walk(left[key], right[key], path))
+            return paths
+        if _config_values_equal(left, right):
+            return []
+        return [prefix]
+
+    return walk(requested_config, effective_config, "")
+
+
+def _history_row_count(path: Path) -> int:
+    """Count data rows in a history CSV.
+
+    Args:
+        path (Path): History file path.
+
+    Returns:
+        int: Number of non-empty data rows, or zero when the file is absent.
+    """
+
+    if not path.is_file():
+        return 0
+    lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return max(len(lines) - 1, 0)
+
+
+def load_resume_history(
+    path: Path, completed_epoch: int
+) -> tuple[list[dict[str, float]], list[str], dict[float, str]]:
+    """Keep completed rows from an existing training history.
+
+    Args:
+        path (Path): ``history.csv`` path. A missing file yields an empty history.
+        completed_epoch (int): Last finished one-based epoch. Later rows are excluded
+            because those epochs will be trained again.
+
+    Returns:
+        tuple[list[dict[str, float]], list[str], dict[float, str]]: Kept rows in epoch
+        order, their column order, and the original text of each kept row.
+    """
+
+    if completed_epoch <= 0 or not path.is_file():
+        return [], [], {}
+    text = path.read_text(encoding="utf-8").splitlines()
+    if not text or "epoch" not in text[0].split(","):
+        raise ValueError("history.csv is missing the epoch column.")
+    columns = text[0].split(",")
+    epoch_index = columns.index("epoch")
+    preserved: dict[float, str] = {}
+    for line in text[1:]:
+        if not line.strip():
+            continue
+        preserved[float(line.split(",")[epoch_index])] = line
+    frame = pd.read_csv(path)
+    frame = frame.loc[frame["epoch"] <= completed_epoch]
+    frame = frame.drop_duplicates("epoch", keep="last").sort_values("epoch")
+    rows = [
+        {column: float(record[column]) for column in columns}
+        for record in frame.to_dict(orient="records")
+    ]
+    preserved = {float(row["epoch"]): preserved[float(row["epoch"])] for row in rows}
+    return rows, columns, preserved
+
+
+def restore_resume_stopping(
+    stopper: EarlyStopping,
+    history: Sequence[Mapping[str, float]],
+    use_checkpoint_best: bool,
+) -> float | None:
+    """Replay validation CD8 loss so the early-stopping streak continues.
+
+    Args:
+        stopper (EarlyStopping): Stopper initialized with the checkpoint selection score.
+        history (Sequence[Mapping[str, float]]): Completed history rows to replay.
+        use_checkpoint_best (bool): Whether the checkpoint score remains the selection
+            threshold. Legacy checkpoints leave the stopper unchanged.
+
+    Returns:
+        float | None: One-based epoch of the last CD8 improvement, or ``None`` when
+        the streak is not restored.
+    """
+
+    if not use_checkpoint_best or not history:
+        return None
+    if any("validation_cd8_loss" not in row for row in history):
+        raise ValueError("history.csv is missing validation_cd8_loss; cannot restore early stopping.")
+    replay = EarlyStopping(patience=stopper.patience, min_delta=stopper.min_delta)
+    best_epoch = None
+    for row in history:
+        improved, _ = replay.update(float(row["validation_cd8_loss"]))
+        if improved:
+            best_epoch = float(row["epoch"])
+    stopper.stale_epochs = replay.stale_epochs
+    return best_epoch
+
+
+def write_training_history(
+    path: Path,
+    rows: Sequence[Mapping[str, float]],
+    columns: Sequence[str],
+    preserved_lines: Mapping[float, str] | None = None,
+) -> list[str]:
+    """Write the full training history, preserving existing row text.
+
+    Args:
+        path (Path): Destination ``history.csv`` path.
+        rows (Sequence[Mapping[str, float]]): Completed and new epoch rows.
+        columns (Sequence[str]): Existing column order. New keys are appended.
+        preserved_lines (Mapping[float, str] | None): Original CSV lines keyed by
+            one-based epoch. Matching lines are copied unchanged.
+
+    Returns:
+        list[str]: Column order written to disk.
+    """
+
+    ordered = list(columns)
+    for row in rows:
+        for key in row:
+            if key not in ordered:
+                ordered.append(str(key))
+    preserved = {} if preserved_lines is None else preserved_lines
+    lines = [",".join(ordered)]
+    for row in rows:
+        epoch = float(row["epoch"])
+        saved = preserved.get(epoch)
+        if saved is not None and saved.count(",") == len(ordered) - 1:
+            lines.append(saved)
+            continue
+        formatted = pd.DataFrame([{key: row.get(key, math.nan) for key in ordered}], columns=ordered)
+        lines.append(formatted.to_csv(index=False, header=False).rstrip("\n"))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return ordered
+
+
+def refresh_loss_curves(
+    history_path: Path,
+    output_path: Path,
+    figure_dpi: int,
+    best_epoch: float | None,
+) -> None:
+    """Redraw train and validation curves from the complete history.
+
+    Args:
+        history_path (Path): Training history CSV.
+        output_path (Path): Destination ``loss_curves.png`` path.
+        figure_dpi (int): Saved figure resolution.
+        best_epoch (float | None): One-based epoch of the selected checkpoint.
+
+    Returns:
+        None: Figure is saved to disk.
+    """
+
+    from dann.analyze import plot_loss_curves
+    plot_loss_curves(history_path, output_path, figure_dpi, best_epoch=best_epoch)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -659,13 +914,23 @@ def train_model(config: Mapping[str, Any]) -> Path:
         Path: Best validation checkpoint path.
     """
 
+    requested = config
     training = config["training"]
+    resume = training.get("resume_checkpoint")
+    resume_payload: dict[str, Any] = {}
+    if resume:
+        if config.get("results", {}).get("smoke"):
+            raise ValueError("Cannot resume a checkpoint during a smoke test.")
+        resume_payload = torch.load(resume, map_location="cpu", weights_only=False)
+        config = resume_training_config(checkpoint_config(resume_payload), requested)
+        ignored = ignored_resume_settings(requested, config)
+        if ignored:
+            print("Resume kept checkpoint values for: " + ", ".join(ignored), flush=True)
+        training = config["training"]
     seed_everything(
         int(training["seed"]), bool(training["deterministic_algorithms"])
     )
     device = resolve_device(str(training["device"]))
-    resume_payload = (torch.load(training["resume_checkpoint"], map_location="cpu", weights_only=False)
-                      if training.get("resume_checkpoint") else {})
     if resume_payload:
         validate_training_data_contract(resume_payload, config)
     bundle = create_data_bundle(config, resume_payload.get("split_indices"), resume_payload.get("data_identity"))
@@ -726,93 +991,119 @@ def train_model(config: Mapping[str, Any]) -> Path:
         )
 
     history: list[dict[str, float]] = []
-    epochs = int(training["epochs"])
-    clip = training.get("gradient_clip_norm")
-    gradient_clip_norm = None if clip is None else float(clip)
-    target_columns = list(config["data"]["target_columns"])
-    for epoch in range(start_epoch, epochs):
-        train_metrics = run_epoch(
-            model=model,
-            loader=bundle.loaders["train"],
-            ziln_loss=ziln_loss,
-            device=device,
-            biology_weight=float(config["loss"]["biology_weight"]),
-            batch_weight=float(config["loss"]["batch_weight"]),
-            class_weights=class_weights,
-            optimizer=optimizer,
-            epoch_index=epoch,
-            total_epochs=epochs,
-            grl_schedule=training["grl_schedule"],
-            grl_max_lambda=float(training["grl_max_lambda"]),
-            grl_gamma=float(training["grl_gamma"]),
-            gradient_clip_norm=gradient_clip_norm,
-            cd8_index=target_columns.index(CD8),
-            target_columns=target_columns,
-            sampling_audit_dir=output_dir / "sampling",
-        )
-        validation_metrics = run_epoch(
-            model=model,
-            loader=bundle.loaders["validation"],
-            ziln_loss=ziln_loss,
-            device=device,
-            biology_weight=float(config["loss"]["biology_weight"]),
-            batch_weight=float(config["loss"]["batch_weight"]),
-            class_weights=class_weights,
-            optimizer=None,
-            epoch_index=epoch,
-            total_epochs=epochs,
-            grl_schedule=training["grl_schedule"],
-            grl_max_lambda=float(training["grl_max_lambda"]),
-            grl_gamma=float(training["grl_gamma"]),
-            gradient_clip_norm=None,
-            cd8_index=target_columns.index(CD8),
-            target_columns=target_columns,
-        )
-        row: dict[str, float] = {"epoch": float(epoch + 1)}
-        row.update({f"train_{key}": value for key, value in train_metrics.items()})
-        row.update(
-            {f"validation_{key}": value for key, value in validation_metrics.items()}
-        )
-        history.append(row)
-        pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
-        if not math.isfinite(validation_metrics["cd8_loss"]):
-            raise ValueError("Validation requires valid CD8 observations for checkpoint selection.")
-        improved, should_stop = stopper.update(validation_metrics["cd8_loss"])
-        if improved:
-            save_checkpoint(
-                output_dir / "best.pt",
-                model,
-                optimizer,
-                epoch,
-                config,
-                bundle,
-                stopper.best,
+    history_columns: list[str] = []
+    preserved_lines: dict[float, str] = {}
+    best_epoch: float | None = None
+    history_path = output_dir / "history.csv"
+    try:
+        if resume:
+            history, history_columns, preserved_lines = load_resume_history(history_path, start_epoch)
+            best_epoch = restore_resume_stopping(
+                stopper, history, resume_payload.get("selection_metric") == "mean_valid_cd8_ziln")
+            if history and len(preserved_lines) != _history_row_count(history_path):
+                history_columns = write_training_history(
+                    history_path, history, history_columns, preserved_lines)
+            if history:
+                refresh_loss_curves(
+                    history_path, output_dir / "loss_curves.png",
+                    int(config["analysis"]["figure_dpi"]), best_epoch)
+        if resume and stopper.stale_epochs >= stopper.patience:
+            print(f"Early stopping remains in effect after epoch {start_epoch}.", flush=True)
+            return output_dir / "best.pt"
+        epochs = int(training["epochs"])
+        clip = training.get("gradient_clip_norm")
+        gradient_clip_norm = None if clip is None else float(clip)
+        target_columns = list(config["data"]["target_columns"])
+        for epoch in range(start_epoch, epochs):
+            train_metrics = run_epoch(
+                model=model,
+                loader=bundle.loaders["train"],
+                ziln_loss=ziln_loss,
+                device=device,
+                biology_weight=float(config["loss"]["biology_weight"]),
+                batch_weight=float(config["loss"]["batch_weight"]),
+                class_weights=class_weights,
+                optimizer=optimizer,
+                epoch_index=epoch,
+                total_epochs=epochs,
+                grl_schedule=training["grl_schedule"],
+                grl_max_lambda=float(training["grl_max_lambda"]),
+                grl_gamma=float(training["grl_gamma"]),
+                gradient_clip_norm=gradient_clip_norm,
+                cd8_index=target_columns.index(CD8),
+                target_columns=target_columns,
+                sampling_audit_dir=output_dir / "sampling",
             )
-        if (epoch + 1) % int(training["checkpoint_every"]) == 0:
-            save_checkpoint(
-                output_dir / "latest.pt",
-                model,
-                optimizer,
-                epoch,
-                config,
-                bundle,
-                stopper.best,
+            validation_metrics = run_epoch(
+                model=model,
+                loader=bundle.loaders["validation"],
+                ziln_loss=ziln_loss,
+                device=device,
+                biology_weight=float(config["loss"]["biology_weight"]),
+                batch_weight=float(config["loss"]["batch_weight"]),
+                class_weights=class_weights,
+                optimizer=None,
+                epoch_index=epoch,
+                total_epochs=epochs,
+                grl_schedule=training["grl_schedule"],
+                grl_max_lambda=float(training["grl_max_lambda"]),
+                grl_gamma=float(training["grl_gamma"]),
+                gradient_clip_norm=None,
+                cd8_index=target_columns.index(CD8),
+                target_columns=target_columns,
             )
-        print(
-            _format_epoch_summary(
-                epoch + 1,
-                epochs,
-                train_metrics,
-                validation_metrics,
-                target_columns,
-            ),
-            flush=True,
-        )
-        if should_stop:
-            print(f"Early stopping after epoch {epoch + 1}.", flush=True)
-            break
-    for dataset in bundle.datasets.values():
-        dataset.close()
+            row: dict[str, float] = {"epoch": float(epoch + 1)}
+            row.update({f"train_{key}": value for key, value in train_metrics.items()})
+            row.update(
+                {f"validation_{key}": value for key, value in validation_metrics.items()}
+            )
+            history.append(row)
+            history_columns = write_training_history(
+                history_path, history, history_columns, preserved_lines)
+            if not math.isfinite(validation_metrics["cd8_loss"]):
+                raise ValueError("Validation requires valid CD8 observations for checkpoint selection.")
+            improved, should_stop = stopper.update(validation_metrics["cd8_loss"])
+            if improved:
+                best_epoch = float(epoch + 1)
+            refresh_loss_curves(
+                history_path, output_dir / "loss_curves.png",
+                int(config["analysis"]["figure_dpi"]), best_epoch)
+            if improved:
+                save_checkpoint(
+                    output_dir / "best.pt",
+                    model,
+                    optimizer,
+                    epoch,
+                    config,
+                    bundle,
+                    stopper.best,
+                )
+            if (epoch + 1) % int(training["checkpoint_every"]) == 0:
+                save_checkpoint(
+                    output_dir / "latest.pt",
+                    model,
+                    optimizer,
+                    epoch,
+                    config,
+                    bundle,
+                    stopper.best,
+                )
+            print(
+                _format_epoch_summary(
+                    epoch + 1,
+                    epochs,
+                    train_metrics,
+                    validation_metrics,
+                    target_columns,
+                ),
+                flush=True,
+            )
+            if should_stop:
+                print(f"Early stopping after epoch {epoch + 1}.", flush=True)
+                break
+    finally:
+        for dataset in bundle.datasets.values():
+            dataset.close()
     return output_dir / "best.pt"
 
 
