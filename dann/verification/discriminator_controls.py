@@ -40,7 +40,7 @@ def make_control(reference: AdversarialLatentFusion, config: dict,
             torch.manual_seed(config['training']['seed'] + 10000)
             model.batch_discriminator = CNNDiscriminator(
                 model.latent_dim, reference.batch_discriminator.network[-1].out_features,
-                **config['model']['heads']['discriminator']['cnn'])
+                **{**config['model']['heads']['discriminator']['cnn'], 'residual': False})
     model.halo = config['model']['heads']['discriminator']['cnn']['depth'] if spatial else 0
     return model
 
@@ -130,6 +130,8 @@ def run_control(name: str, reference: AdversarialLatentFusion, config: dict, bun
                 ramp: bool, lr: float, updates: int, evaluate_every: int,
                 spatial: bool = True) -> dict:
     """Fit one control with fixed sampler/RNG seeds and an unchanged GRL horizon."""
+    config = copy.deepcopy(config)
+    config['model']['heads']['discriminator']['cnn']['residual'] = False
     directory = root/name
     directory.mkdir()
     t, seed = config['training'], config['training']['seed']
@@ -247,6 +249,7 @@ def main(argv: list[str] | None = None) -> None:
     if min(args.updates, args.evaluate_every) <= 0:
         parser.error('Update limits and evaluation intervals must be positive.')
     config = load_config(args.config)
+    config['model']['heads']['discriminator']['cnn']['residual'] = False  # Historical plain CNN.
     if config['execution']['mode'] != 'pixel':
         parser.error('The reference configuration must be all MLP.')
     if any(config['data'].get('max_'+s+'_samples') is not None for s in ('train', 'validation', 'test')):

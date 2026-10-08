@@ -356,3 +356,173 @@ def test_normal_checkpoint_round_trip(tmp_path: Path, tiny_h5ad: Path) -> None:
         np.testing.assert_array_equal(payload["split_indices"][split], indices)
     for dataset in bundle.datasets.values():
         dataset.close()
+
+
+def test_resume_training_config_keeps_checkpoint_learning_rate() -> None:
+    """Apply only the resume allowlist and report every other requested change.
+
+    Args:
+        None.
+
+    Returns:
+        None: Assertions validate the effective configuration and ignored paths.
+    """
+
+    from dann.train import ignored_resume_settings, resume_training_config
+    saved = {
+        "execution": {"mode": "spatial", "num_workers": 2, "prefetch_factor": 2, "learning_rate": 0.01},
+        "training": {
+            "learning_rate": 0.01, "epochs": 30, "num_workers": 2, "prefetch_factor": 2,
+            "early_stopping_patience": 5, "early_stopping_min_delta": 0.001,
+            "resume_checkpoint": None, "weight_decay": 1e-5,
+            "spatial": {"num_workers": 2, "prefetch_factor": 2, "learning_rate": 0.01},
+        },
+        "loss": {"biology_weight": 5.0},
+    }
+    requested = {
+        "execution": {"mode": "spatial", "num_workers": 8, "prefetch_factor": 4, "learning_rate": 0.2},
+        "training": {
+            "learning_rate": 0.2, "epochs": 400, "num_workers": 8, "prefetch_factor": 4,
+            "early_stopping_patience": 10, "early_stopping_min_delta": 0.002,
+            "resume_checkpoint": "latest.pt", "weight_decay": 1e-4,
+            "spatial": {"num_workers": 8, "prefetch_factor": 4, "learning_rate": 0.2},
+        },
+        "loss": {"biology_weight": 9.0},
+    }
+    effective = resume_training_config(saved, requested)
+    assert effective["training"]["learning_rate"] == 0.01
+    assert effective["training"]["spatial"]["learning_rate"] == 0.01
+    assert effective["execution"]["learning_rate"] == 0.01
+    assert effective["training"]["weight_decay"] == 1e-5
+    assert effective["loss"]["biology_weight"] == 5.0
+    assert effective["training"]["epochs"] == 400
+    assert effective["training"]["num_workers"] == 8
+    assert effective["training"]["prefetch_factor"] == 4
+    assert effective["training"]["spatial"]["num_workers"] == 8
+    assert effective["training"]["spatial"]["prefetch_factor"] == 4
+    assert effective["execution"]["num_workers"] == 8
+    assert effective["execution"]["prefetch_factor"] == 4
+    assert effective["training"]["early_stopping_patience"] == 10
+    assert effective["training"]["early_stopping_min_delta"] == 0.002
+    assert effective["training"]["resume_checkpoint"] == "latest.pt"
+    ignored = ignored_resume_settings(requested, effective)
+    assert "training.learning_rate" in ignored
+    assert "training.spatial.learning_rate" in ignored
+    assert "execution.learning_rate" in ignored
+    assert "loss.biology_weight" in ignored
+    assert "training.epochs" not in ignored
+    assert "training.num_workers" not in ignored
+    assert "training.prefetch_factor" not in ignored
+
+
+def test_resume_history_restores_streak_and_omits_later_rows(tmp_path: Path) -> None:
+    """Keep completed history rows and continue the early-stopping streak.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+
+    Returns:
+        None: Assertions validate kept epochs, the omitted row, and the stale count.
+    """
+
+    from dann.train import EarlyStopping, load_resume_history, restore_resume_stopping, write_training_history
+    path = tmp_path / "history.csv"
+    rows = [
+        {"epoch": 1, "validation_cd8_loss": 1.0, "train_total_loss": 3.0},
+        {"epoch": 2, "validation_cd8_loss": 0.4, "train_total_loss": 2.0},
+        {"epoch": 3, "validation_cd8_loss": 0.45, "train_total_loss": 1.9},
+        {"epoch": 4, "validation_cd8_loss": 0.46, "train_total_loss": 1.8},
+        {"epoch": 5, "validation_cd8_loss": 0.47, "train_total_loss": 1.7},
+        {"epoch": 6, "validation_cd8_loss": 0.48, "train_total_loss": 1.6},
+        {"epoch": 7, "validation_cd8_loss": 0.49, "train_total_loss": 1.5},
+        {"epoch": 8, "validation_cd8_loss": 0.2, "train_total_loss": 1.4},
+    ]
+    pd.DataFrame(rows).to_csv(path, index=False)
+    raw = path.read_text(encoding="utf-8").splitlines()
+    kept, columns, preserved = load_resume_history(path, 7)
+    assert [row["epoch"] for row in kept] == [1, 2, 3, 4, 5, 6, 7]
+    assert columns[0] == "epoch"
+    stopper = EarlyStopping(patience=10, min_delta=0.001, best=0.4)
+    best_epoch = restore_resume_stopping(stopper, kept, True)
+    assert best_epoch == 2
+    assert stopper.best == 0.4
+    assert stopper.stale_epochs == 5
+    strict = EarlyStopping(patience=10, min_delta=0.2, best=0.4)
+    strict_rows = [
+        {"epoch": 1, "validation_cd8_loss": 1.0},
+        {"epoch": 2, "validation_cd8_loss": 0.9},
+    ]
+    assert restore_resume_stopping(strict, strict_rows, True) == 1
+    assert strict.best == 0.4
+    assert strict.stale_epochs == 1
+    kept.append({"epoch": 9, "validation_cd8_loss": 0.3, "train_total_loss": 1.2})
+    written = tmp_path / "continued.csv"
+    write_training_history(written, kept, columns, preserved)
+    text = written.read_text(encoding="utf-8").splitlines()
+    assert text[:8] == raw[:8]
+    assert float(text[-1].split(",")[0]) == 9
+    reloaded, _, _ = load_resume_history(written, 9)
+    assert [row["epoch"] for row in reloaded] == [1, 2, 3, 4, 5, 6, 7, 9]
+    assert load_resume_history(tmp_path / "missing.csv", 7) == ([], [], {})
+
+
+def test_smoke_resume_is_rejected() -> None:
+    """Refuse a smoke run that would otherwise continue a full checkpoint.
+
+    Args:
+        None.
+
+    Returns:
+        None: The assertion validates the rejection.
+    """
+
+    from dann.train import train_model
+    with pytest.raises(ValueError, match="smoke"):
+        train_model({"training": {"resume_checkpoint": "missing.pt"}, "results": {"smoke": True}})
+
+
+def test_resume_optimizer_keeps_saved_learning_rate(tmp_path: Path, tiny_h5ad: Path) -> None:
+    """Restore Adam moments and the checkpoint learning rate together.
+
+    Args:
+        tmp_path (Path): Pytest temporary directory.
+        tiny_h5ad (Path): Synthetic sparse AnnData fixture.
+
+    Returns:
+        None: Assertions validate the restored learning rate and moment buffers.
+    """
+
+    from dann.config import load_config
+    from dann.data_loader import create_data_bundle
+    from dann.train import load_training_checkpoint, save_checkpoint
+    config = load_config(Path("dann/config.yaml"))
+    config["data"]["path"] = str(tiny_h5ad)
+    config["training"].update(num_workers=0, batch_size=2, validation_batch_size=2, learning_rate=0.01)
+    for key in ("spectral_encoder", "aggregation", "heads"):
+        config["model"].pop(key)
+    config["model"].update(num_peaks=4, embedding_dim=3, peak_hidden_dims=[4],
+                           peak_output_dim=4, aggregation_hidden_dims=[4], latent_dim=3,
+                           biology_hidden_dims=[3], discriminator_hidden_dims=[3], dropout=0.)
+    bundle = create_data_bundle(config)
+    model = AdversarialLatentFusion.from_config(config, num_batches=2, num_targets=4).train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=1e-5)
+    batch = next(iter(bundle.loaders["train"]))
+    model(batch)["mu"].sum().backward()
+    optimizer.step()
+    moments = {
+        name: optimizer.state[parameter]["exp_avg"].detach().clone()
+        for name, parameter in model.named_parameters()
+        if parameter in optimizer.state and "exp_avg" in optimizer.state[parameter]
+    }
+    assert moments
+    path = tmp_path / "optimizer.pt"
+    save_checkpoint(path, model, optimizer, 0, config, bundle, 1.0)
+    restored = AdversarialLatentFusion.from_config(config, num_batches=2, num_targets=4).train()
+    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.2, weight_decay=1e-5)
+    load_training_checkpoint(path, restored, restored_optimizer, torch.device("cpu"), config)
+    assert restored_optimizer.param_groups[0]["lr"] == 0.01
+    for name, parameter in restored.named_parameters():
+        if name in moments:
+            torch.testing.assert_close(restored_optimizer.state[parameter]["exp_avg"], moments[name])
+    for dataset in bundle.datasets.values():
+        dataset.close()

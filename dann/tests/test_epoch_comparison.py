@@ -28,6 +28,17 @@ def pointwise_config(config):
     return resolve_execution(config)
 
 
+@pytest.mark.parametrize('name', ['aggregation', 'biology'])
+def test_historical_spatial_control_stays_plain(spatial_config, name):
+    config = pointwise_config(spatial_config)
+    reference = AdversarialLatentFusion.from_config(config, 2, 4)
+    model = spatial_control(reference, config, production=name)
+    module = model.encoder.aggregation_mlp if name == 'aggregation' else model.biology_predictor
+    assert not module.residual
+    group = config['model']['aggregation'] if name == 'aggregation' else config['model']['heads'][name]
+    assert group['cnn']['residual'] is True
+
+
 def test_flat_and_grid_values_gradients_adamw(spatial_config):
     torch.manual_seed(109)
     c = pointwise_config(spatial_config)

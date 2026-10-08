@@ -191,18 +191,18 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
     positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
                 spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
                 model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144)]
-    for group in (settings["aggregation"], *settings["heads"].values()):
+    for name, group in [("aggregation", settings["aggregation"]),
+                        *((f"heads.{name}", group) for name, group in settings["heads"].items())]:
         if group["type"] not in {"mlp", "cnn"}:
             raise ValueError("Component type must be mlp or cnn.")
         group.setdefault("mlp", {"hidden_dims": [512, 512]})
-        group["cnn"] = {"channels": 128, "depth": 3, "dropout": .10, **group.get("cnn", {})}
+        group["cnn"] = {"channels": 128, "depth": 3, "dropout": .10,
+                        "residual": True, **group.get("cnn", {})}
         positive.extend([*group["mlp"]["hidden_dims"], group["cnn"]["channels"], group["cnn"]["depth"]])
         if not 0 <= group["cnn"]["dropout"] < 1:
             raise ValueError("CNN dropout must be in [0, 1).")
-    biology_cnn = settings["heads"]["biology"]["cnn"]
-    biology_cnn.setdefault("residual", True)
-    if not isinstance(biology_cnn["residual"], bool):
-        raise ValueError("model.heads.biology.cnn.residual must be boolean.")
+        if not isinstance(group["cnn"]["residual"], bool):
+            raise ValueError(f"model.{name}.cnn.residual must be boolean.")
     if any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in positive):
         raise ValueError("Model widths, depths, and peak budgets must be positive integers.")
     if not isinstance(model.get("spectral_checkpointing", True), bool):
@@ -226,8 +226,10 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve mode-specific settings and all run paths once, without overrides."""
     settings = component_settings(config["model"])
     if "spectral_encoder" in config["model"]:
-        config["model"]["heads"]["biology"].setdefault("cnn", {})["residual"] = (
-            settings["heads"]["biology"]["cnn"]["residual"])
+        for name, group in [("aggregation", config["model"]["aggregation"]),
+                            *config["model"]["heads"].items()]:
+            resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
+            group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
     execution = execution_settings(config)
     training = config["training"]
     mode = execution["mode"]

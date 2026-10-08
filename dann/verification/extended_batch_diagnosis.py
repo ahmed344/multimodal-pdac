@@ -205,6 +205,8 @@ class Study:
     def __init__(self, args: argparse.Namespace):
         self.args=args; self.root=args.output; self.updates=args.updates
         self.config=b.load_config(args.previous_run/'source_config.yaml')
+        for group in [self.config['model']['aggregation'], *self.config['model']['heads'].values()]:
+            group['cnn']['residual'] = False  # Historical plain-CNN controls.
         if self.root.exists() and not args.resume:
             raise FileExistsError('Output exists: use a new root or explicit --resume.')
         self.root.mkdir(parents=True,exist_ok=True)

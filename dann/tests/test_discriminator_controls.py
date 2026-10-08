@@ -41,6 +41,8 @@ def test_matched_initialization_core_inputs_and_pointwise_gradients(spatial_conf
     bundle, reference, flat, tiled = setup_control(c)
     a = make_control(reference, c, False).double().eval()
     b = make_control(reference, c, True).double().eval()
+    assert not b.batch_discriminator.residual
+    assert c['model']['heads']['discriminator']['cnn']['residual'] is True
     reference.double().eval()
     flat = {k: v.double() if v.is_floating_point() else v for k, v in flat.items()}
     tiled = {k: v.double() if v.is_floating_point() else v for k, v in tiled.items()}
@@ -148,6 +150,7 @@ def test_runner_matches_order_preserves_schedule_and_saves_controls(spatial_conf
         assert [h['update'] for h in history] == [0, 1, 2]
         saved = torch.load(root/name/'final.pt', weights_only=False)
         assert saved['settings']['schedule_epochs'] == 300
+        assert saved['settings']['config']['model']['heads']['discriminator']['cnn']['residual'] is False
         pred = torch.load(root/name/'validation_2.pt', weights_only=False)
         np.testing.assert_array_equal(pred['row_ids'], bundle.split_indices['validation'])
         assert not np.isin(pred['row_ids'], bundle.split_indices['test']).any()

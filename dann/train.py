@@ -816,8 +816,11 @@ def save_checkpoint(
     architecture = architecture_contract(config)
     if "spectral_encoder" in saved_config["model"]:
         from dann.config import component_settings
-        saved_config["model"]["heads"]["biology"].setdefault("cnn", {})["residual"] = (
-            component_settings(config["model"])["heads"]["biology"]["cnn"]["residual"])
+        settings = component_settings(config["model"])
+        for name, group in [("aggregation", saved_config["model"]["aggregation"]),
+                            *saved_config["model"]["heads"].items()]:
+            resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
+            group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
     payload = {
         "sampling_contract": sampling_contract(config, bundle.split_indices["train"]),
         "sampler_state": {"completed_epoch": int(epoch), "sampler_epoch": int(epoch),

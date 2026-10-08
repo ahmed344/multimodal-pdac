@@ -79,7 +79,8 @@ def make_variant(config: dict, num_batches: int, seed: int, variant: str,
     if variant not in VARIANTS:
         raise ValueError(variant)
     config = copy.deepcopy(config)
-    config['model']['heads']['biology']['cnn']['residual'] = False
+    for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
+        group['cnn']['residual'] = False  # Historical plain-CNN controls.
     with torch.random.fork_rng(devices=[]):
         torch.random.default_generator.manual_seed(seed)
         model = AdversarialLatentFusion.from_config(config, num_batches,

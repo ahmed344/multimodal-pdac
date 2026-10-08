@@ -122,7 +122,7 @@ def spatial_control(reference: AdversarialLatentFusion, config: Mapping[str, Any
     if production == 'aggregation':
         model.encoder.aggregation_mlp = SpatialNetwork(
             config['model']['spectral_encoder']['deep_sets']['peak_output_dim'],
-            model.latent_dim, **config['model']['aggregation']['cnn'])
+            model.latent_dim, **{**config['model']['aggregation']['cnn'], 'residual': False})
     elif production == 'biology':
         model.biology_predictor = SpatialNetwork(model.latent_dim, model.num_targets * 3,
                                                 **{k: v for k, v in config['model']['heads']['biology']['cnn'].items()
@@ -229,7 +229,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument('--production', choices=['none', 'aggregation', 'biology'], default='none')
     args = parser.parse_args(argv)
     config = load_config(args.config)
-    config['model']['heads']['biology']['cnn']['residual'] = False  # Historical plain-CNN controls.
+    for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
+        group['cnn']['residual'] = False  # Historical plain-CNN controls.
     t = config['training']; seed = int(t['seed'])
     if not 1 <= args.epoch_limit <= t['epochs']:
         parser.error('epoch-limit must be positive and cannot exceed the unchanged schedule horizon')

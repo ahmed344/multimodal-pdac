@@ -38,15 +38,21 @@ per-pixel channel LayerNorm, GELU, and dropout 0.10. Occupancy masks suppress
 features in missing tissue after every hidden stage and the output projection.
 There is no spatial pooling or normalization over a whole tile.
 
-The biology CNN defaults to `model.heads.biology.cnn.residual: true`. Each hidden
-3×3 block adds its input to its normalized, activated, dropped-out output, divides
-by `sqrt(2)`, and reapplies the tissue mask. Input/output projections and receptive
-fields are unchanged. Set `residual: false` to use the original plain CNN. In the
-matched three-epoch diagnosis, the plain CNN collapsed pixel-to-pixel feature
-variation and failed all three seeds; residual connections passed all three,
-including fresh fits with adversarial loss restored. This supports the default
-but does not guarantee convergence over the full training schedule. Aggregation
-and discriminator behavior are unchanged by this option.
+All three CNN components default to residual connections for new training.
+The independent boolean options are `model.aggregation.cnn.residual`,
+`model.heads.biology.cnn.residual`, and `model.heads.discriminator.cnn.residual`.
+Each hidden 3×3 block adds its input to its normalized, activated, dropped-out
+output, divides by `sqrt(2)`, and reapplies the tissue mask. Input/output
+projections, parameter counts, receptive fields, and halo sizes are unchanged.
+Set a component's `residual: false` to use its original plain CNN. These settings
+apply only when that component selects `type: cnn`.
+
+In the matched three-epoch biology diagnosis, the plain biology CNN collapsed
+pixel-to-pixel feature variation and failed all three seeds; residual connections
+passed all three, including fresh fits with adversarial loss restored. This
+evidence is specific to biology; aggregation and discriminator residuals have
+not been evaluated in that experiment. Historical plain-CNN diagnostic controls
+explicitly disable residuals to retain their original comparisons.
 
 All-MLP configurations retain the sparse pixel loader and `training.pixel` settings.
 Any CNN selects `training.spatial`. The checked-in configuration now uses
@@ -77,9 +83,11 @@ Production retains its epoch-based GRL horizon:
 existing denominator guard). The diagnostic used a fixed update horizon.
 Dropout, AdamW, clipping, loss weights, peak budget and checkpointing are unchanged.
 New checkpoints have a separate versioned `sampling_contract` and epoch-boundary
-`sampler_state`. Optimizer resume rejects changes in strategy, algorithm, seed,
-core size, training batch budget, or ordered selected-row identities. Old
-checkpoints imply legacy sampling using their saved configuration. Inference and
+`sampler_state`. Training resume keeps the checkpoint sampling contract, so a YAML change to
+strategy, algorithm, seed, core size, training batch budget, or selected-row
+identity is ignored. The contract check still rejects a checkpoint whose saved
+sampler state is inconsistent. Old checkpoints imply legacy sampling using their
+saved configuration. Inference and
 architecture checks do not depend on sampler compatibility; no mid-epoch resume
 is supported.
 
@@ -141,19 +149,27 @@ Checkpoint selection uses **mean validation CD8 ZILN loss over valid CD8 rows**.
 Training still optimizes all four weighted targets plus the adversarial objective.
 Checkpoints save the exact split positions plus an ordered row/feature identity
 fingerprint; analysis reuses those splits and may cap them further. There is no
-refit using validation or test labels. Version-three architecture metadata records
+refit using validation or test labels. Version-four architecture metadata records
 selected components, numerical settings, receptive fields, batch order, targets,
 and optimizer parameter names. Legacy flat configurations mean Deep Sets with
 MLP aggregation and heads. Legacy parameter-key conversion is identity because
 keys and registration order were retained; optimizer ordering and state shapes
 are checked before resume. Incompatible components or targets are rejected.
 A legacy selection score is reset when resuming under the CD8 selection metric.
-The architecture contract now includes the biology CNN residual setting.
-Version-two and unversioned checkpoints without that setting retain the original
-non-residual calculation during analysis and inference. To resume one of those
-CNN checkpoints, explicitly set `model.heads.biology.cnn.residual: false`;
-resuming with a different residual setting is rejected even though tensor shapes
-match. Saved configuration and architecture metadata must agree.
+Training resume copies the checkpoint configuration, then applies only the current
+YAML values for `epochs`, `num_workers`, `prefetch_factor`,
+`early_stopping_patience`, and `early_stopping_min_delta`. The checkpoint learning
+rate and other training settings stay in place; differing YAML values are reported
+and ignored. `--smoke-test` cannot be combined with a resume checkpoint. Completed
+`history.csv` rows are kept and `loss_curves.png` is refreshed from that full history.
+The architecture contract includes the residual setting for every selected CNN.
+Version-three checkpoints retain their recorded biology setting and default missing
+aggregation/discriminator flags to false. Version-two and unversioned checkpoints
+default all missing residual flags to false. This preserves their original
+calculations during analysis and inference. Training resume keeps checkpoint
+residual settings, so different YAML values are ignored. Version-four checkpoints
+require explicit boolean residual settings for selected CNNs in both saved
+configuration and architecture metadata, and those settings must agree.
 
 All prediction consumers should use `model(batch)`. Calling `encode()` and then
 the biology head loses the spatial halo when a CNN head is selected. Peak-embedding
@@ -326,8 +342,8 @@ under `analysis/` (UMAP exports in `analysis/umap/`):
 `model/`:
 
 - `best.pt`, `latest.pt`
-- `history.csv`, `data_schema.json`, `resolved_config.yaml`
-- `loss_curves.png` (written by analysis)
+- `history.csv` (resume keeps completed epochs and appends new ones), `data_schema.json`, `resolved_config.yaml`
+- `loss_curves.png` (refreshed from the full history during training, and written again by analysis)
 
 `analysis/umap/`:
 
@@ -850,3 +866,40 @@ Routing and threshold tests run without launching production fits:
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q dann/tests/test_production_fits.py
 ```
+
+## Frozen biology neighborhood benefit
+
+Evaluate two saved validation checkpoints without retraining:
+
+```bash
+python -m dann.verification.neighborhood_benefit \
+  --cnn-checkpoint <cnn-run>/model/best.pt \
+  --mlp-checkpoint <mlp-run>/model/best.pt \
+  --output data/PDAC/Results/dann_neighborhood_benefit/<new-run>
+```
+
+The runner requires pointwise aggregation in both models, a depth-three biology
+CNN, identical saved splits/input identity/target transformations, and 169,824
+validation rows by default. It uses the legacy-compatible inference loader with
+restricted checkpoint deserialization and preserves unknown training provenance.
+Only validation labels are scored; labeled-grid spectra supply frozen context.
+
+It verifies original losses and patch/tile equivalence, then preserves each
+center and occupancy mask while replacing neighbors with a complete distant
+same-slide patch, rearranging occupied neighbors, or replicating the center.
+The random interventions use seeds 20261003–20261007. MLP controls must remain
+exactly invariant. Results include per-row parameters and intervention identities,
+quadrature density means, paired slide-bootstrap loss intervals, per-slide and
+boundary metrics, adjacent-pixel contrast summaries, effect plots, and a report.
+
+GPU execution uses evaluation mode, float32, two CPU threads, no loader workers,
+and a 3 GiB PyTorch allocator cap. It waits for 16 GiB free before starting, pauses
+between chunks below 12 GiB, and waits for training to exit after an analysis OOM
+before retrying. CUDA context/library overhead is outside the allocator cap.
+Completed arrays and progress records are retained on failure; existing output
+directories are refused. Neither production settings nor checkpoints are changed.
+
+After all inference conditions complete, regenerate the CPU tables and report
+with `--summarize-only --output <existing-run>` (checkpoint arguments omitted).
+This verifies frozen checkpoint/data identities and saves a separate reporting
+source snapshot; inference arrays and the original source snapshot are retained.

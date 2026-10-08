@@ -1,4 +1,5 @@
 """Shared pointwise and local spatial layers."""
+import math
 from typing import Sequence
 import torch
 from torch import nn
@@ -65,8 +66,11 @@ class SpatialNetwork(nn.Module):
     """Local convolutions with channel-only normalization and tissue masking."""
 
     def __init__(self, input_dim: int, output_dim: int, channels: int = 128,
-                 depth: int = 3, dropout: float = 0.10) -> None:
+                 depth: int = 3, dropout: float = 0.10, residual: bool = False) -> None:
         super().__init__()
+        if not isinstance(residual, bool):
+            raise ValueError("CNN residual must be boolean.")
+        self.residual = residual
         self.radius = depth
         self.input = nn.Conv2d(input_dim, channels, 1)
         self.convolutions = nn.ModuleList(nn.Conv2d(channels, channels, 3, padding=1)
@@ -81,7 +85,9 @@ class SpatialNetwork(nn.Module):
         return self.dropout(self.activation(value)) * mask
 
     def forward(self, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Apply masked hidden blocks with optional normalized residual additions."""
         value = self.hidden(self.input(value * mask), self.norms[0], mask)
         for convolution, norm in zip(self.convolutions, self.norms[1:]):
-            value = self.hidden(convolution(value), norm, mask)
+            hidden = self.hidden(convolution(value), norm, mask)
+            value = ((value + hidden) / math.sqrt(2)) * mask if self.residual else hidden
         return self.output(value) * mask

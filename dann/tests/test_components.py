@@ -111,10 +111,13 @@ def test_combinations_train_reload_and_gradients(spatial_config, choices, tmp_pa
 
 def predict_tiles(config, model, rows):
     dataset = SpatialTileDataset(config, rows, input_path=config['data']['context_path'])
+    dtype = next(model.parameters()).dtype
     results = {}
     with torch.no_grad():
         for item in range(len(dataset)):
             batch = tile_collate([dataset[item]])
+            batch = {key: value.to(dtype=dtype) if value.is_floating_point() else value
+                     for key, value in batch.items()}
             outputs = model(batch)
             for i, row in enumerate(batch['row_ids'].tolist()):
                 results[row] = {key: value[i].clone() for key, value in outputs.items()}
@@ -123,23 +126,27 @@ def predict_tiles(config, model, rows):
 
 
 @pytest.mark.parametrize('choices', list(itertools.product(('mlp','cnn'), repeat=3))[1:])
-def test_combined_receptive_field_matches_reference(spatial_config, choices):
+@pytest.mark.parametrize('residuals', [(True, True, True), (False, False, False), (True, False, True)])
+def test_combined_receptive_field_matches_reference(spatial_config, choices, residuals):
+    torch.manual_seed(33)
     c = spatial_config
-    for group, choice in zip([c['model']['aggregation'], *c['model']['heads'].values()], choices):
+    for group, choice, residual in zip([c['model']['aggregation'], *c['model']['heads'].values()], choices, residuals):
         group['type'] = choice
+        group['cnn']['residual'] = residual
     resolve_execution(c)
-    model = AdversarialLatentFusion.from_config(c, 2, 4).eval()
+    # Isolate geometry from float32 convolution rounding across tile shapes.
+    model = AdversarialLatentFusion.from_config(c, 2, 4).double().eval()
     rows = np.arange(156)
     small = predict_tiles(c, model, rows)
     c['training']['core_size'] = 32
     reference = predict_tiles(c, model, rows)
     for row in rows:
         for name in reference[row]:
-            torch.testing.assert_close(small[row][name], reference[row][name], atol=2e-6, rtol=2e-5)
+            torch.testing.assert_close(small[row][name], reference[row][name], atol=1e-10, rtol=1e-9)
     capped = predict_tiles(c, model, rows[:7])
     for row in capped:
         for name in capped[row]:
-            torch.testing.assert_close(capped[row][name], reference[row][name])
+            torch.testing.assert_close(capped[row][name], reference[row][name], atol=1e-10, rtol=1e-9)
 
 
 @pytest.mark.parametrize('dropout', [0., .3])
@@ -235,9 +242,11 @@ def test_spatial_export_order_cap_and_cleanup(spatial_config, tmp_path, choices)
         d.close()
 
 
-def test_gradient_reversal_only_discriminator_upstream(spatial_config):
+@pytest.mark.parametrize('residual', [False, True])
+def test_gradient_reversal_only_discriminator_upstream(spatial_config, residual):
     c = spatial_config
     c['model']['heads']['discriminator']['type'] = 'cnn'
+    c['model']['heads']['discriminator']['cnn']['residual'] = residual
     model = AdversarialLatentFusion.from_config(c, 2, 4).eval()
     bundle = create_data_bundle(c)
     batch = next(iter(bundle.loaders['train']))

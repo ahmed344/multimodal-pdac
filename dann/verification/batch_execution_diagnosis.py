@@ -827,7 +827,8 @@ def main(argv: list[str] | None = None) -> None:
         parser.error('Output exists; choose a new directory or explicit --resume.')
     root.mkdir(parents=True, exist_ok=args.resume)
     config = load_config(args.previous_run/'source_config.yaml')
-    config['model']['heads']['biology']['cnn']['residual'] = False  # Historical plain-CNN controls.
+    for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
+        group['cnn']['residual'] = False  # Historical plain-CNN controls.
     freeze(root, args.previous_run, config, SEEDS, args.budget_minutes)
     payload = torch.load(args.previous_run/'reference.pt', map_location='cpu', weights_only=False)
     if target_contract(config) != checkpoint_contract(payload):

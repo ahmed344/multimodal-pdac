@@ -50,6 +50,7 @@ model:
     cnn:
       channels: 128  # Pointwise input projection and hidden convolution width.
       depth: 3  # Number of 3x3, stride-one convolutions; spatial radius equals depth.
+      residual: true  # Normalized skip connections within hidden 3x3 blocks; false restores the plain CNN.
       dropout: 0.10  # Hidden dropout after per-pixel channel LayerNorm and GELU.
 
   # 3. Prediction heads: choices are independent; both consume aggregation latents.
@@ -71,6 +72,7 @@ model:
       cnn:
         channels: 128  # Hidden spatial width; final projection emits batch-class logits.
         depth: 3  # Neighborhood radius; included when deriving the required halo.
+        residual: true  # Independent of biology/aggregation residuals; false restores the plain CNN.
         dropout: 0.10  # Hidden dropout; missing tissue is masked throughout every CNN.
 
   # Shared MLP numerics and ZILN output transformation; CNN settings are above.
@@ -174,4 +176,4 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: proportional-slide-tiles-8x8-2048  # Human-readable run name; separate experiments should use separate names.
+  run_name: residual-cnn-aggregation  # Human-readable run name; separate experiments should use separate names.
