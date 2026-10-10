@@ -1004,6 +1004,8 @@ def run_inference(
             os.replace(support_temporary, support_path)
         output_path.with_suffix(".provenance.json").write_text(json.dumps({
             "checkpoint": str(checkpoint_path), "input": str(input_path),
+            "architecture": saved_checkpoint.get("architecture"),
+            "support_semantics": "occupancy_fraction_in_enclosing_square_window_not_graph_reachability_or_attention_mass",
             "training_data_contract": saved_checkpoint.get("training_data_contract", {"version": 0, "status": "unknown_legacy_provenance"}),
             "selected_rows": selected_rows, "context_rows": total_rows, "edge_exclusions": 0,
             "execution": config.get("execution", {"mode": "pixel"}),

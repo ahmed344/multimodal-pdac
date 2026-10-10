@@ -3,7 +3,7 @@
 This package fits sparse MALDI-MSI to four IHC targets and exports a shared latent
 representation. MSI stays in backed CSR form until Deep Sets mean-pools the
 intensity-weighted learned peak embeddings. Aggregation and the two prediction
-heads can independently use MLPs or local spatial CNNs.
+heads can independently use MLPs, local spatial CNNs, or residual GATv2 attention.
 
 The four biology targets each use a structural-zero hurdle with three parameters:
 zero probability `pi`, positive logit mean `mu`, and positive logit standard
@@ -17,18 +17,18 @@ There are three groups and four selectors, all in `dann/config.yaml`:
 | Group | Selector | Choices | Default |
 |---|---|---|---|
 | Spectral processing | `model.spectral_encoder.type` | `deep_sets` | `deep_sets` |
-| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn` | `cnn` |
-| Prediction heads | `model.heads.biology.type` | `mlp`, `cnn` | `cnn` |
-| Prediction heads | `model.heads.discriminator.type` | `mlp`, `cnn` | `mlp` |
+| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
+| Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `cnn` |
+| Prediction heads | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `cnn` |
 
-All eight aggregation/head combinations are supported. Selectable neural modules
+All 27 aggregation/head combinations are supported. Selectable neural modules
 live in `dann/model_components/`; `dann/model.py` composes them. The Deep Sets stage uses
-256-dimensional learned peak embeddings, multiplies each by its transformed
-intensity, applies the original per-peak MLP with `[512, 512]` hidden widths and
-512 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
-The selectable aggregation produces the **exported 512-dimensional latent**.
-The MLP aggregation preserves `[512, 512]` hidden widths; both MLP heads preserve
-`[512, 256, 128]`. The shared ZILN transformation, weighted four-target objective,
+128-dimensional learned peak embeddings, multiplies each by its transformed
+intensity, applies the original per-peak MLP with `[256, 256]` hidden widths and
+256 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
+The selectable aggregation produces the **exported 256-dimensional latent**.
+The MLP aggregation uses `[256, 256]` hidden widths; both MLP heads use
+`[256, 128, 64]`. The shared ZILN transformation, weighted four-target objective,
 class-weighted batch cross-entropy, and gradient reversal schedule are unchanged.
 Only the discriminator input receives gradient reversal.
 
@@ -47,6 +47,73 @@ projections, parameter counts, receptive fields, and halo sizes are unchanged.
 Set a component's `residual: false` to use its original plain CNN. These settings
 apply only when that component selects `type: cnn`.
 
+GATv2 uses [PyTorch Geometric 2.8.0.post1](https://pypi.org/project/torch-geometric/2.8.0.post1/),
+pinned in `.devcontainer/requirements.txt`. Install it in an existing environment:
+
+```bash
+python -m pip install torch-geometric==2.8.0.post1
+```
+
+The implementation uses ordinary tensor edge lists; optional compiled neighbor
+extensions are unnecessary. PyG is imported only when constructing a GATv2
+component. MLP/CNN models and file-based consumers work without PyG installed.
+
+Each component has an independent `gatv2` configuration block:
+
+```yaml
+gatv2:
+  channels: 128
+  depth: 3
+  heads: 4
+  neighbor_radius: 1.5
+  residual: true
+  dropout: 0.10
+  attention_dropout: 0.0
+```
+
+`channels` is the total concatenated hidden width and must divide evenly by
+`heads`. `depth` counts attention layers. `neighbor_radius` is a finite per-layer
+Euclidean cutoff in grid units, at least 1: radius 1 includes the four cardinal
+neighbors, 1.5 includes all eight immediate neighbors, and 2 also reaches cardinal
+neighbors two grid units away. Every occupied pixel is a node, including empty
+spectra. All eligible occupied endpoints connect in both directions plus exactly
+one self-edge. Gaps may be spanned if endpoints are within the cutoff. Tiles have
+independent graphs, including overlapping copies and tiles from different slides.
+No label, absolute coordinate, slide identifier, spectral similarity, neighbor cap,
+or random edge sampling enters graph construction.
+
+Edges from source j to receiver i carry `[(x_j-x_i)/r, (y_j-y_i)/r, distance/r]`;
+self-edge features are zero. Finite integer offset lookups avoid all-pairs distance
+or adjacency matrices. Edges are built once per component forward and reused by
+its layers; only offset templates are cached across calls.
+
+A pointwise linear projection, node-wise LayerNorm, GELU and feature dropout
+precede hidden attention layers. Each hidden update uses attention, LayerNorm,
+GELU and feature `dropout`; `residual: true` returns `(hidden + update)/sqrt(2)`.
+A final pointwise projection emits latent channels, raw biology parameters, or
+batch logits. Missing positions remain zero. Residual toggles change neither
+parameters nor reach. `attention_dropout` affects attention coefficients only;
+zero avoids extra attention regularization in the initial comparison. During
+training, each attention update uses activation checkpointing with preserved RNG:
+backward recomputes edge activations while retaining all eligible neighbors and the
+original optimizer batch. Evaluation does not checkpoint attention updates.
+`model.gatv2_tile_budget: 8` bounds the number of independent tile graphs processed
+per internal attention call, preventing a large supervised row batch from requiring
+one enormous edge-activation tensor. This execution control retains every node,
+neighbor and optimizer row, and is saved with the configuration. It does not change
+reach, graph semantics, parameter count, or evaluation predictions. Changing this
+budget can reorder dropout random draws during training; resume retains the saved
+value. Each tile graph is built once per component forward and reused by its layers.
+[PyG GATv2Conv](https://pytorch-geometric.readthedocs.io/en/2.8.0/generated/torch_geometric.nn.conv.GATv2Conv.html)
+uses concatenated heads, edge dimension 3, separate source/receiver weights,
+negative slope 0.2 and bias, with automatic self-loops and internal residuals disabled.
+
+The objective remains `biology_weight * weighted_masked_ZILN + batch_weight *
+class_weighted_cross_entropy`. There are no graph, smoothness, contrastive, or
+attention regularization losses. Held-out spectra may supply context; only selected
+training core labels contribute training losses. GATv2 performance improvements
+require matched full-training experiments; smoke checks establish execution only.
+
 In the matched three-epoch biology diagnosis, the plain biology CNN collapsed
 pixel-to-pixel feature variation and failed all three seeds; residual connections
 passed all three, including fresh fits with adversarial loss restored. This
@@ -55,7 +122,7 @@ not been evaluated in that experiment. Historical plain-CNN diagnostic controls
 explicitly disable residuals to retain their original comparisons.
 
 All-MLP configurations retain the sparse pixel loader and `training.pixel` settings.
-Any CNN selects `training.spatial`. The checked-in configuration now uses
+Any CNN or GATv2 selects `training.spatial`. The checked-in configuration now uses
 `sampling_strategy: proportional_slide_tiles`, 8×8 cores, and
 `supervised_rows_per_batch: 2048`. Every selected training row appears once per
 epoch, including rows with invalid targets (validity masks still control loss).
@@ -76,7 +143,7 @@ validation/test tile batches (default eight), never caps training tiles.
 `execution` metadata records training row and evaluation tile units separately.
 Smoke mode caps split membership and evaluation tiles but preserves the training
 row budget and architecture-derived halo. The activated run name is
-`proportional-slide-tiles-8x8-2048`, separate from earlier `fit` directories.
+`residual-gatv2-aggregation`, separate from earlier experiments.
 
 Production retains its epoch-based GRL horizon:
 `(epoch * len(train_loader) + step) / (epochs * len(train_loader) - 1)` (with the
@@ -99,14 +166,18 @@ boundaries (little-endian int64, including the initial zero boundary).
 
 The preceding diagnostic supports this sampling correction for spatial MLP and
 discriminator-only CNN controls. It does not confirm convergence of the active
-CNN aggregation/CNN biology/MLP discriminator architecture. Global pixel
+GATv2 aggregation/CNN biology/CNN discriminator architecture. Global pixel
 shuffling performed better in that study.
 
 The halo is derived as `aggregation radius + max(biology radius, discriminator
-radius)`. An MLP has radius zero; a CNN has radius equal to its depth. Defaults
-therefore use halo six and 20×20 input tiles. Each biology prediction sees a
-13×13 spectral-input neighborhood, and each exported latent sees 7×7. Both heads
-run before core rows are selected, so CNN heads retain their latent halo.
+radius)`. An MLP has reach zero; a CNN has reach equal to its depth. A GATv2
+component has reach `depth * maximum_step`, where `maximum_step` is the largest
+absolute x/y offset among integer offsets within its Euclidean cutoff. The same
+offset definition builds edges and calculates reach. Aggregation reach is the
+latent radius; aggregation plus biology reach is the biology radius. Defaults
+use halo six and 20×20 input tiles for 8×8 cores. The enclosing biology window
+is 13×13 and latent window is 7×7. Both heads run before core rows are selected,
+retaining their complete latent halo.
 
 All supervised spectra, neighborhoods, labels, and masks come from `data.path`
 (`adata_assembled.h5ad`). `data.context_path` is a backward-compatible name for
@@ -149,7 +220,7 @@ Checkpoint selection uses **mean validation CD8 ZILN loss over valid CD8 rows**.
 Training still optimizes all four weighted targets plus the adversarial objective.
 Checkpoints save the exact split positions plus an ordered row/feature identity
 fingerprint; analysis reuses those splits and may cap them further. There is no
-refit using validation or test labels. Version-four architecture metadata records
+refit using validation or test labels. Version-five architecture metadata records
 selected components, numerical settings, receptive fields, batch order, targets,
 and optimizer parameter names. Legacy flat configurations mean Deep Sets with
 MLP aggregation and heads. Legacy parameter-key conversion is identity because
@@ -171,13 +242,21 @@ residual settings, so different YAML values are ignored. Version-four checkpoint
 require explicit boolean residual settings for selected CNNs in both saved
 configuration and architecture metadata, and those settings must agree.
 
+Version-five GATv2 checkpoints require all selected settings, versioned fixed graph
+semantics, and derived reach to agree with the saved configuration. Versions 2–4
+and unversioned payloads cannot select GATv2. Old MLP/CNN metadata is normalized
+in memory without rewriting historical checkpoints. PyTorch and PyG versions are
+informational reproducibility metadata, separate from architecture compatibility.
+Switching a component from CNN to GATv2 requires fresh weights and optimizer state.
+Resume retains saved architecture and the existing runtime override whitelist.
+
 All prediction consumers should use `model(batch)`. Calling `encode()` and then
-the biology head loses the spatial halo when a CNN head is selected. Peak-embedding
+the biology head loses the spatial halo when a CNN or GATv2 head is selected. Peak-embedding
 analysis remains available for every combination through the Deep Sets dictionary.
 
 ## Result routing
 
-`results.root`, the four selectors, and `results.run_name` (default `fit`) derive:
+`results.root`, the four selectors, and `results.run_name` (checked-in `residual-gatv2-aggregation`) derive:
 
 ```text
 data/PDAC/Results/dann/<combination>/<run_name>/
@@ -187,20 +266,25 @@ data/PDAC/Results/dann/<combination>/<run_name>/
     latent_variance/
 ```
 
-The default combination is `deep_sets__agg-cnn__bio-cnn__disc-mlp`. Smoke artifacts
+The default run is
+`deep_sets__agg-gatv2__bio-cnn__disc-cnn/residual-gatv2-aggregation/`. Smoke artifacts
 insert `smoke/` after the run name. Training, analysis, inference, heatmaps, and
 latent variance use this root; no separate architecture YAML files are required.
 For a smoke checkpoint, pass its `model/resolved_config.yaml` to downstream CLIs.
 Checkpoint overrides use saved architecture and run routing.
 
-Spatial exports preserve existing schemas and original tissue row order. CNN
+Spatial exports preserve existing schemas and original tissue row order. Spatial
 inference stages tile-order latents/parameters in temporary disk arrays, then
 streams them in row order. Temporary staging is removed on success or failure;
 allow roughly four bytes per row per exported latent/parameter channel on disk.
 `--max-rows` limits exported cores while retaining the full tissue context.
 `spatial_predictions.support.parquet` reports occupied-neighborhood fractions for
-biology and latent receptive fields. `spatial_predictions.provenance.json` records
-checkpoint/input paths, context and output counts, and zero edge exclusions.
+biology and latent enclosing square windows. These are geometric occupancy
+diagnostics, not exact graph reachability or attention mass. Boundary/interior
+analysis uses this same square-window definition, including for GATv2.
+`spatial_predictions.provenance.json` records graph settings and semantics,
+support semantics, checkpoint/input paths, context/output counts, and zero edge
+exclusions. Prediction and latent Parquet columns remain unchanged.
 
 Analysis adds `<split>_density_errors.csv` with density-scale MAE, RMSE, bias, and
 hurdle Brier scores for all rows and for boundary/interior subsets. Boundary means
@@ -322,7 +406,10 @@ Fast end-to-end verification on capped rows from the real AnnData:
 
 ```bash
 python -m dann.train --config dann/config.yaml --smoke-test
-python -m dann.analyze --config dann/config.yaml --smoke-test
+# Use the saved smoke configuration for analysis and capped tissue inference.
+smoke_config=data/PDAC/Results/dann/deep_sets__agg-gatv2__bio-cnn__disc-cnn/residual-gatv2-aggregation/smoke/model/resolved_config.yaml
+python -m dann.analyze --config "$smoke_config"
+python -m dann.spatial --config "$smoke_config" --max-rows 512
 ```
 
 Tissue-wide spatial inference writes ordered ZILN predictions and the complete
@@ -330,11 +417,29 @@ latent representation for every AnnData row. Heatmaps join the predictions back
 onto the tissue AnnData and plot per-batch logit / mean / presence / sigma
 panels plus HES.
 
-Run focused tests:
+Run both synthetic suites:
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q dann/tests ihc_mvn/tests
 ```
+
+GATv2 implementation validation (2026-10-08): **627 synthetic tests passed**,
+including all 27 architectures, legacy checkpoints, halo equivalence, optimizer
+reload, and the complete synthetic downstream workflow. On an RTX 5090 with
+PyTorch 2.11.0+cu128 and PyG 2.8.0.post1, the configured one-epoch smoke trained
+2,048 core rows across 1,997 tiles and 43 slides without reducing neighbor coverage
+or optimizer batch size. Training took 174.2 s with 25.38 GiB peak allocated and
+27.53 GiB peak reserved GPU memory. Train/validation total losses were finite
+(54.725424 / 17.685151); validation CD8 loss was 2.434584. All 80 optimizer
+parameter states reloaded. Saved-config analysis passed in 105.6 s, and capped
+512-row tissue inference passed in 19.0 s with 36 prediction and 256 latent channels.
+
+The initial unbounded graph execution exceeded GPU memory; attention recomputation
+plus the internal tile budget above resolved it. Logs, resource measurements, and
+`validation_summary.json` live in the smoke run directory. Full latent-variance
+and all eight heatmap outputs were verified on the aligned 156-row synthetic
+input. These checks establish execution and compatibility, not predictive gains.
+
 
 Within the resolved run root, training artifacts go under `model/` and analysis
 under `analysis/` (UMAP exports in `analysis/umap/`):

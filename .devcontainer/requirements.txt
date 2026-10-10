@@ -15,3 +15,4 @@ imagecodecs
 jupyter
 ipywidgets
 kneed
+torch-geometric==2.8.0.post1

@@ -50,6 +50,7 @@ def spatial_config(tmp_path):
     for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
         group['mlp']['hidden_dims'] = [7]
         group['cnn'].update(channels=5, depth=2, dropout=0.)
+        group['gatv2'].update(channels=8, heads=2, depth=2, dropout=0.)
     config['training']['pixel'].update(batch_size=12, validation_batch_size=12, num_workers=0)
     config['training']['spatial'].update(core_size=4, tiles_per_batch=2, num_workers=0)
     config['training'].update(device='cpu', pin_memory=False)
@@ -74,7 +75,7 @@ def test_test_loader_uses_execution_mode_batch_units(spatial_config, spatial):
         dataset.close()
 
 
-@pytest.mark.parametrize('choices', list(itertools.product(('mlp','cnn'), repeat=3)))
+@pytest.mark.parametrize('choices', list(itertools.product(('mlp','cnn','gatv2'), repeat=3)))
 def test_combinations_train_reload_and_gradients(spatial_config, choices, tmp_path):
     c = spatial_config
     for group, choice in zip([c['model']['aggregation'], *c['model']['heads'].values()], choices):
@@ -125,7 +126,7 @@ def predict_tiles(config, model, rows):
     return results
 
 
-@pytest.mark.parametrize('choices', list(itertools.product(('mlp','cnn'), repeat=3))[1:])
+@pytest.mark.parametrize('choices', list(itertools.product(('mlp','cnn','gatv2'), repeat=3))[1:])
 @pytest.mark.parametrize('residuals', [(True, True, True), (False, False, False), (True, False, True)])
 def test_combined_receptive_field_matches_reference(spatial_config, choices, residuals):
     torch.manual_seed(33)
@@ -133,6 +134,7 @@ def test_combined_receptive_field_matches_reference(spatial_config, choices, res
     for group, choice, residual in zip([c['model']['aggregation'], *c['model']['heads'].values()], choices, residuals):
         group['type'] = choice
         group['cnn']['residual'] = residual
+        group['gatv2']['residual'] = residual
     resolve_execution(c)
     # Isolate geometry from float32 convolution rounding across tile shapes.
     model = AdversarialLatentFusion.from_config(c, 2, 4).double().eval()
@@ -184,8 +186,11 @@ def test_checkpoint_microbatches_values_gradients_rng(spatial_config, dropout):
                 torch.testing.assert_close(pa.grad, pb.grad, atol=2e-6, rtol=2e-5)
 
 
-def test_grid_validation_and_supervision_isolation(spatial_config):
+@pytest.mark.parametrize('kind', ['cnn', 'gatv2'])
+def test_grid_validation_and_supervision_isolation(spatial_config, kind):
     c = spatial_config
+    c['model']['aggregation']['type'] = kind
+    resolve_execution(c)
     bundle = create_data_bundle(c)
     dataset = bundle.datasets['train']
     original = tile_collate([dataset[0]])
@@ -213,7 +218,7 @@ def test_grid_validation_and_supervision_isolation(spatial_config):
         read_grid(Path(c['data']['context_path']), c['data'])
 
 
-@pytest.mark.parametrize("choices", list(itertools.product(("mlp", "cnn"), repeat=3)))
+@pytest.mark.parametrize("choices", list(itertools.product(("mlp", "cnn", "gatv2"), repeat=3)))
 def test_spatial_export_order_cap_and_cleanup(spatial_config, tmp_path, choices):
     from dann.spatial import run_inference
     import pyarrow.parquet as pq
@@ -243,10 +248,11 @@ def test_spatial_export_order_cap_and_cleanup(spatial_config, tmp_path, choices)
 
 
 @pytest.mark.parametrize('residual', [False, True])
-def test_gradient_reversal_only_discriminator_upstream(spatial_config, residual):
+@pytest.mark.parametrize('kind', ['cnn', 'gatv2'])
+def test_gradient_reversal_only_discriminator_upstream(spatial_config, residual, kind):
     c = spatial_config
-    c['model']['heads']['discriminator']['type'] = 'cnn'
-    c['model']['heads']['discriminator']['cnn']['residual'] = residual
+    c['model']['heads']['discriminator']['type'] = kind
+    c['model']['heads']['discriminator'][kind]['residual'] = residual
     model = AdversarialLatentFusion.from_config(c, 2, 4).eval()
     bundle = create_data_bundle(c)
     batch = next(iter(bundle.loaders['train']))
@@ -301,14 +307,14 @@ def test_frozen_splits_and_incompatible_resume(spatial_config, tmp_path):
 def test_configuration_routes_and_invalid_selectors(spatial_config):
     c = spatial_config
     roots = set()
-    for choices in itertools.product(('mlp', 'cnn'), repeat=3):
+    for choices in itertools.product(('mlp', 'cnn', 'gatv2'), repeat=3):
         for group, choice in zip([c['model']['aggregation'], *c['model']['heads'].values()], choices):
             group['type'] = choice
         resolve_execution(c)
         roots.add(c['results']['run_dir'])
         assert c['analysis']['checkpoint'] == str(Path(c['training']['output_dir'])/'best.pt')
         assert c['latent_variance']['latents'] == c['spatial']['latents']
-    assert len(roots) == 8
+    assert len(roots) == 27
     c['model']['aggregation']['cnn']['depth'] = 0
     with pytest.raises(ValueError, match='positive'):
         resolve_execution(c)
@@ -334,9 +340,12 @@ def test_duplicate_grid_and_feature_order_rejected(spatial_config):
         read_grid(Path(c['data']['context_path']), c['data'])
 
 
-def test_disk_staging_cleans_failure(spatial_config, tmp_path):
+@pytest.mark.parametrize('kind', ['cnn', 'gatv2'])
+def test_disk_staging_cleans_failure(spatial_config, tmp_path, kind):
     from dann.tiles import ordered_spatial_predictions
     c = spatial_config
+    c['model']['aggregation']['type'] = kind
+    resolve_execution(c)
     model = AdversarialLatentFusion.from_config(c, 2, 4).eval()
     dataset = SpatialTileDataset(c, np.arange(5), input_path=c['data']['context_path'])
     batch = tile_collate([dataset[0]])

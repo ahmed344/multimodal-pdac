@@ -12,6 +12,9 @@ from dann.model_components.biology_mlp import MLPBiology
 from dann.model_components.biology_cnn import CNNBiology
 from dann.model_components.discriminator_mlp import MLPDiscriminator
 from dann.model_components.discriminator_cnn import CNNDiscriminator
+from dann.model_components.aggregation_gatv2 import AggregationGATv2
+from dann.model_components.biology_gatv2 import BiologyGATv2
+from dann.model_components.discriminator_gatv2 import DiscriminatorGATv2
 
 
 def transform_biology(raw: torch.Tensor, num_targets: int, sigma_min: float) -> dict[str, torch.Tensor]:
@@ -138,18 +141,31 @@ class AdversarialLatentFusion(nn.Module):
         if settings["aggregation"]["type"] == "cnn":
             encoder.aggregation_mlp = CNNAggregation(spectral["peak_output_dim"],
                 values["latent_dim"], **settings["aggregation"]["cnn"])
+        elif settings["aggregation"]["type"] == "gatv2":
+            encoder.aggregation_mlp = AggregationGATv2(spectral["peak_output_dim"],
+                values["latent_dim"], **settings["aggregation"]["gatv2"])
         bio = settings["heads"]["biology"]
         disc = settings["heads"]["discriminator"]
-        biology = (BiologyPredictor(values["latent_dim"], bio["mlp"]["hidden_dims"],
-                   num_targets, values["sigma_min"], **common) if bio["type"] == "mlp"
-                   else CNNBiology(values["latent_dim"], num_targets * 3, **bio["cnn"]))
-        discriminator = (BatchDiscriminator(values["latent_dim"], disc["mlp"]["hidden_dims"],
-                         num_batches, **common) if disc["type"] == "mlp" else
-                         CNNDiscriminator(values["latent_dim"], num_batches, **disc["cnn"]))
+        if bio["type"] == "mlp":
+            biology = BiologyPredictor(values["latent_dim"], bio["mlp"]["hidden_dims"],
+                                       num_targets, values["sigma_min"], **common)
+        else:
+            biology = {"cnn": CNNBiology, "gatv2": BiologyGATv2}[bio["type"]](
+                values["latent_dim"], num_targets * 3, **bio[bio["type"]])
+        if disc["type"] == "mlp":
+            discriminator = BatchDiscriminator(values["latent_dim"], disc["mlp"]["hidden_dims"],
+                                               num_batches, **common)
+        else:
+            discriminator = {"cnn": CNNDiscriminator, "gatv2": DiscriminatorGATv2}[disc["type"]](
+                values["latent_dim"], num_batches, **disc[disc["type"]])
+        from dann.model_components.layers_gatv2 import GATv2Network
+        for component in (encoder.aggregation_mlp, biology, discriminator):
+            if isinstance(component, GATv2Network):
+                component.tile_budget = values.get("gatv2_tile_budget", 8)
         model = cls(encoder, biology, discriminator)
         model.num_targets, model.sigma_min = num_targets, values["sigma_min"]
         model.latent_dim = int(values["latent_dim"])
-        model.spatial = any(x["type"] == "cnn" for x in (settings["aggregation"], bio, disc))
+        model.spatial = any(x["type"] in {"cnn", "gatv2"} for x in (settings["aggregation"], bio, disc))
         model.peak_budget = values.get("spectral_peak_budget", 65536)
         model.checkpointing = values.get("spectral_checkpointing", True)
         model.halo = encoder.aggregation_mlp.radius + max(biology.radius, discriminator.radius)
@@ -164,7 +180,7 @@ class AdversarialLatentFusion(nn.Module):
 
     def _latent_map(self, batch):
         if "occupancy" not in batch:
-            raise ValueError("CNN components require spatial tiles with occupancy and core indices.")
+            raise ValueError("Spatial components require spatial tiles with occupancy and core indices.")
         args = [batch[key] for key in ("peak_indices", "intensities", "sample_indices", "peak_counts")]
         pooled = self.encoder.microbatched(*args, peak_budget=self.peak_budget,
                                           checkpointing=self.checkpointing)

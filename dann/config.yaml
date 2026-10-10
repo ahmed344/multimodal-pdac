@@ -1,6 +1,6 @@
 # DANN configuration. Keep editable settings here; resolved_config.yaml records
 # the selected execution mode, effective settings, and derived output paths.
-# All-MLP aggregation/heads select pixel mode; any CNN selects spatial mode.
+# All-MLP aggregation/heads select pixel mode; any CNN or GATv2 selects spatial mode.
 
 latent_variance:
   # Reads existing spatial latents; input and output paths follow the selected run.
@@ -42,21 +42,29 @@ model:
       peak_hidden_dims: [256, 256]  # Hidden widths of the original per-peak MLP.
       peak_output_dim: 256  # Pooled pixel width passed to the aggregation component.
 
-  # 2. Latent aggregation: choose the original pointwise MLP or local spatial CNN.
+  # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
-    type: cnn  # Choices: mlp, cnn. Only the selected component's settings are used.
+    type: gatv2  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
       hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
       channels: 128  # Pointwise input projection and hidden convolution width.
       depth: 3  # Number of 3x3, stride-one convolutions; spatial radius equals depth.
-      residual: true  # Normalized skip connections within hidden 3x3 blocks; false restores the plain CNN.
+      residual: false  # Normalized skip connections within hidden 3x3 blocks; false restores the plain CNN.
       dropout: 0.10  # Hidden dropout after per-pixel channel LayerNorm and GELU.
+    gatv2:
+      channels: 128  # Total hidden width across concatenated heads; divisible by heads.
+      depth: 3  # Number of local attention layers.
+      heads: 4  # Each attention head emits channels / heads channels.
+      neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
+      residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+      dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
+      attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
 
   # 3. Prediction heads: choices are independent; both consume aggregation latents.
   heads:
     biology:
-      type: cnn  # Choices: mlp, cnn. Emits three raw ZILN parameters per target.
+      type: gatv2  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
       mlp:
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
@@ -64,9 +72,17 @@ model:
         depth: 3  # Neighborhood radius in latent-grid pixels.
         residual: true  # Disabling may prevent learning: the tested plain CNN collapsed pixel-to-pixel feature variation.
         dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
+      gatv2:
+        channels: 128  # Total hidden width across concatenated heads; divisible by heads.
+        depth: 3  # Number of local attention layers.
+        heads: 4  # Each attention head emits channels / heads channels.
+        neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
+        residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+        dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
+        attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
 
     discriminator:
-      type: cnn  # Choices: mlp, cnn. Predicts batch class from gradient-reversed latents.
+      type: gatv2  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
       mlp:
         hidden_dims: [256, 128, 64]  # Original batch-discriminator hidden widths.
       cnn:
@@ -74,6 +90,14 @@ model:
         depth: 3  # Neighborhood radius; included when deriving the required halo.
         residual: true  # Independent of biology/aggregation residuals; false restores the plain CNN.
         dropout: 0.10  # Hidden dropout; missing tissue is masked throughout every CNN.
+      gatv2:
+        channels: 128  # Total hidden width across concatenated heads; divisible by heads.
+        depth: 3  # Number of local attention layers.
+        heads: 4  # Each attention head emits channels / heads channels.
+        neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
+        residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+        dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
+        attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
 
   # Shared MLP numerics and ZILN output transformation; CNN settings are above.
   activation: gelu  # MLP activation: relu, gelu, silu, or leaky_relu.
@@ -82,6 +106,7 @@ model:
   sigma_min: 0.0001  # Positive floor in sigma = softplus(raw_sigma) + sigma_min.
 
   # Execution controls change memory use, not the selected architecture.
+  gatv2_tile_budget: 8  # Independent tile graphs per internal attention call; all neighbors and optimizer rows are retained.
   spectral_peak_budget: 65536  # Spatial spectral microbatch budget in active peaks; complete spectra stay together.
   spectral_checkpointing: true  # Recompute spectral activations during spatial backward, preserving dropout RNG.
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
@@ -109,7 +134,7 @@ training:
     num_workers: 20  # Read-only, process-local HDF5 data-loader workers.
     prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
 
-  spatial:  # Used when any selected aggregation/head component is a CNN.
+  spatial:  # Used when any selected aggregation/head component is a CNN or GATv2.
     core_size: 8  # Core side length in grid pixels; no edge pixels are discarded.
     sampling_strategy: proportional_slide_tiles  # Independently shuffled slide queues, proportional row interleaving.
     supervised_rows_per_batch: 2048  # Exact training row budget; final epoch batch may be smaller.
@@ -149,7 +174,7 @@ analysis:
   split: test  # Saved checkpoint split used for latent/prediction analysis.
   ziln_scatter_split: validation  # Saved held-out split used for prediction scatter and additional calibration.
   max_samples: null  # Optional stratified cap within saved splits; null uses all saved rows.
-  batch_size: 4096  # Pixel-mode tissue inference batch size; CNN inference uses the saved tiles_per_batch.
+  batch_size: 4096  # Pixel-mode tissue inference batch size; spatial inference uses the saved tiles_per_batch.
   num_workers: 4  # Analysis and tissue-inference workers; does not change training workers.
   density_mc_samples: 1000  # Hurdle draws per pixel/target, averaged to estimate unconditional density.
   density_mc_seed: 20260719  # Isolated Monte Carlo seed; tissue exports use row-keyed streams for cap invariance.
@@ -176,4 +201,4 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: residual-cnn-aggregation  # Human-readable run name; separate experiments should use separate names.
+  run_name: no-residual-gatv2-aggregation  # Human-readable run name; separate experiments should use separate names.

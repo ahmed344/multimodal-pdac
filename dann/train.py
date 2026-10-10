@@ -821,7 +821,16 @@ def save_checkpoint(
                             *saved_config["model"]["heads"].items()]:
             resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
             group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
+            group["gatv2"] = resolved["gatv2"]
+    # Distribution metadata is informational, never an architecture compatibility key.
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        pyg_version = version("torch-geometric")
+    except PackageNotFoundError:
+        pyg_version = None
+    validate_checkpoint({"config": saved_config, "architecture": architecture}, config, model)
     payload = {
+        "software_versions": {"torch": str(torch.__version__), "torch_geometric": pyg_version},
         "sampling_contract": sampling_contract(config, bundle.split_indices["train"]),
         "sampler_state": {"completed_epoch": int(epoch), "sampler_epoch": int(epoch),
                           "next_epoch": int(epoch) + 1},

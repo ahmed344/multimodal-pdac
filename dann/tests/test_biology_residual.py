@@ -172,7 +172,8 @@ def test_checkpoint_predictions_resume_and_analysis(spatial_config, tmp_path, ki
         path = tmp_path / 'checkpoint.pt'
         save_checkpoint(path, model, optimizer, 0, config, bundle, 1.)
         payload = torch.load(path, weights_only=False)
-        assert payload['architecture']['version'] == 4
+        assert payload['architecture']['version'] == 5
+        payload['architecture']['version'] = 4  # Exercise the historical v4 contract.
         for name, enabled in zip(COMPONENTS, flags):
             assert component_group(payload['config'], name)['cnn']['residual'] is enabled
         legacy = kind in ('version2', 'version3', 'unversioned')

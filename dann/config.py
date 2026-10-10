@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import yaml
 
+from dann.model_components.layers_gatv2 import gatv2_settings, graph_reach
 from dann.targets import normalization_settings, target_contract
 
 
@@ -190,14 +191,16 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
     spectral = settings["spectral_encoder"]["deep_sets"]
     positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
                 spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
-                model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144)]
+                model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144),
+                model.get("gatv2_tile_budget", 8)]
     for name, group in [("aggregation", settings["aggregation"]),
                         *((f"heads.{name}", group) for name, group in settings["heads"].items())]:
-        if group["type"] not in {"mlp", "cnn"}:
-            raise ValueError("Component type must be mlp or cnn.")
+        if group["type"] not in {"mlp", "cnn", "gatv2"}:
+            raise ValueError("Component type must be mlp or cnn or gatv2.")
         group.setdefault("mlp", {"hidden_dims": [512, 512]})
         group["cnn"] = {"channels": 128, "depth": 3, "dropout": .10,
                         "residual": True, **group.get("cnn", {})}
+        group["gatv2"] = gatv2_settings(group.get("gatv2", {}))
         positive.extend([*group["mlp"]["hidden_dims"], group["cnn"]["channels"], group["cnn"]["depth"]])
         if not 0 <= group["cnn"]["dropout"] < 1:
             raise ValueError("CNN dropout must be in [0, 1).")
@@ -216,7 +219,14 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive execution mode and combined halo from the selected components."""
     settings = component_settings(config["model"])
     groups = [settings["aggregation"], settings["heads"]["biology"], settings["heads"]["discriminator"]]
-    radii = [g["cnn"]["depth"] if g["type"] == "cnn" else 0 for g in groups]
+    radii = []
+    for group in groups:
+        if group["type"] == "mlp":
+            radii.append(0)
+        elif group["type"] == "cnn":
+            radii.append(group["cnn"]["depth"])
+        elif group["type"] == "gatv2":
+            radii.append(graph_reach(group["gatv2"]["depth"], group["gatv2"]["neighbor_radius"]))
     return {"mode": "spatial" if any(radii) else "pixel", "halo": radii[0] + max(radii[1:]),
             "latent_radius": radii[0], "biology_radius": radii[0] + radii[1],
             "combination": "deep_sets__agg-{}__bio-{}__disc-{}".format(*(g["type"] for g in groups))}
@@ -230,6 +240,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
                             *config["model"]["heads"].items()]:
             resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
             group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
+            group["gatv2"] = resolved["gatv2"]
     execution = execution_settings(config)
     training = config["training"]
     mode = execution["mode"]
