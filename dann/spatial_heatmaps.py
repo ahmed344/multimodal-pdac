@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import warnings
 from pathlib import Path
 from typing import Sequence
@@ -15,12 +14,11 @@ matplotlib.use("Agg")
 import anndata as ad
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 import scanpy as sc
 import seaborn as sns
 from matplotlib import pyplot as plt
 
-from dann.targets import prepare_observed_targets, target_label
+from dann.targets import target_label
 
 warnings.filterwarnings("ignore")
 sns.set_style("ticks", {"axes.grid": True})
@@ -103,6 +101,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="batch",
         help="Observation column used to split heatmap rows.",
     )
+    parser.add_argument("--regions", nargs="+", choices=("tissue", "lesion"), default=None)
+    parser.add_argument("--lesion-column", default=None)
+    parser.add_argument("--workers", type=int, default=None, help="Rendering processes; 1 selects serial.")
+    parser.add_argument("--host-budget-gib", type=float, default=None)
+    parser.add_argument("--png-compress-level", type=int, default=None)
     return parser.parse_args(argv)
 
 
@@ -518,83 +521,27 @@ def run_spatial_heatmaps(
     logit_epsilon: float,
     dpi: int,
     batch_column: str = "batch",
+    *,
+    regions: Sequence[str] = ("tissue", "lesion"),
+    lesion_column: str = "Lesion",
+    workers: int = 16,
+    host_budget_gib: float = 192.0,
+    png_compress_level: int = 1,
 ) -> Path:
-    """Load tissue predictions and write one heatmap PNG per density.
+    """Load only plotting inputs and write tissue/lesion figures in parallel.
 
-    Args:
-        input_path (Path): Tissue AnnData path.
-        predictions_path (Path): Spatial inference Parquet path.
-        output_dir (Path): Directory for heatmap PNGs.
-        densities (Sequence[str]): Observed density columns to visualize.
-        logit_epsilon (float): Clamp applied before the logit transform.
-        dpi (int): Saved figure resolution.
-        batch_column (str): Observation column holding batch labels.
-
-    Returns:
-        Path: Output directory containing written PNG files.
+    Lesion panels zoom to the annotation bounds and use lesion-only color
+    limits. ``workers=1`` uses the same renderer without a process pool.
+    Execution settings are independent of training and inference settings.
     """
-
-    if not input_path.is_file():
-        raise FileNotFoundError(f"Tissue AnnData not found: {input_path}")
-    if not predictions_path.is_file():
-        raise FileNotFoundError(f"Predictions Parquet not found: {predictions_path}")
-
-    print(f"Loading tissue AnnData from {input_path}", flush=True)
-    adata = sc.read_h5ad(input_path)
-    print(f"Loading predictions from {predictions_path}", flush=True)
-    predictions = pd.read_parquet(predictions_path)
-    prediction_columns = attach_predictions(adata, predictions)
-    metadata = pq.read_schema(predictions_path).metadata or {}
-    if b"dann_target_transform" in metadata:
-        contract = json.loads(metadata[b"dann_target_transform"])
-        if contract.get("version") != 1:
-            raise ValueError("Unsupported spatial target transformation version.")
-        columns = contract["target_columns"]
-        raw = adata.obs[columns].to_numpy(copy=True)
-        targets, valid = prepare_observed_targets(
-            raw, columns, contract["cd8_normalization"]
-        )
-        for index, column in enumerate(columns):
-            adata.obs[f"raw_{column}"] = raw[:, index]
-            adata.obs[f"valid_{column}"] = valid[:, index]
-            adata.obs[column] = np.where(valid[:, index], targets[:, index], np.nan)
-        adata.uns["dann_target_transform"] = contract
-    logit_columns = add_logit_columns(adata, densities, logit_epsilon)
-    residual_columns = add_residual_columns(adata, densities)
-    width_columns = add_interval_width_columns(adata, densities)
-    batches = adata.obs[batch_column].unique().tolist()
-    print(
-        f"Attached {len(prediction_columns)} prediction columns, "
-        f"{len(logit_columns)} logit columns, {len(residual_columns)} residual "
-        f"columns, and {len(width_columns)} interval-width columns "
-        f"for {len(batches)} batches.",
-        flush=True,
+    from dann.heatmap_execution import run_heatmaps
+    return run_heatmaps(
+        Path(input_path), Path(predictions_path), Path(output_dir), densities,
+        logit_epsilon, dpi, batch_column, dict(
+            regions=list(regions), lesion_column=lesion_column, workers=workers,
+            host_budget_gib=host_budget_gib, png_compress_level=png_compress_level,
+        ),
     )
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    for density in densities:
-        output_path = output_dir / f"spatial_heatmap_{density}.png"
-        plot_density_heatmap(
-            adata,
-            density,
-            batches,
-            output_path,
-            batch_column=batch_column,
-            dpi=dpi,
-            logit_epsilon=logit_epsilon,
-        )
-        print(f"Wrote {output_path}", flush=True)
-        diagnostics_path = output_dir / f"spatial_heatmap_diagnostics_{density}.png"
-        plot_diagnostics_density_heatmap(
-            adata,
-            density,
-            batches,
-            diagnostics_path,
-            batch_column=batch_column,
-            dpi=dpi,
-        )
-        print(f"Wrote {diagnostics_path}", flush=True)
-    return output_dir
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -609,8 +556,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     from dann.config import inference_input
     args = parse_args(argv)
-    from dann.config import load_config
+    from dann.config import load_config, spatial_heatmap_settings
     config = load_config(args.config)
+    settings = spatial_heatmap_settings(config["analysis"].get("spatial_heatmaps"))
+    for key in settings:
+        value = getattr(args, key)
+        if value is not None:
+            settings[key] = value
+    settings = spatial_heatmap_settings(settings)
     output_dir = run_spatial_heatmaps(
         input_path=inference_input(config, args.input),
         predictions_path=args.predictions or Path(config["spatial"]["output"]),
@@ -619,6 +572,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         logit_epsilon=args.logit_epsilon,
         dpi=args.dpi,
         batch_column=args.batch_column,
+        **settings,
     )
     print(f"Spatial heatmaps written to {output_dir}", flush=True)
     return 0

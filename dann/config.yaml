@@ -172,10 +172,25 @@ training:
   smoke_tiles_per_batch: 2  # Spatial smoke evaluation tiles; training row budget remains unchanged.
 
 analysis:
+  spatial_heatmaps:
+    regions: [tissue, lesion]
+    lesion_column: Lesion
+    workers: 16
+    host_budget_gib: 192.0
+    png_compress_level: 1  # Lossless; faster encoding with larger files.
+  spatial_execution:
+    enabled: true
+    tiles_per_batch: 64
+    spectral_peak_budget: 262144
+    gat_tiles: 32
+    feature_cache: true
+    feature_cache_rows: 1024
+    output_rows: 16384
+    density_workers: 16
   split: test  # Saved checkpoint split used for latent/prediction analysis.
   ziln_scatter_split: validation  # Saved held-out split used for prediction scatter and additional calibration.
   max_samples: null  # Optional stratified cap within saved splits; null uses all saved rows.
-  batch_size: 4096  # Pixel-mode tissue inference batch size; spatial inference uses the saved tiles_per_batch.
+  batch_size: 4096  # Pixel-mode tissue inference batch size; spatial inference uses spatial_execution or the saved tile default.
   num_workers: 4  # Analysis and tissue-inference workers; does not change training workers.
   density_mc_samples: 1000  # Hurdle draws per pixel/target, averaged to estimate unconditional density.
   density_mc_seed: 20260719  # Isolated Monte Carlo seed; tissue exports use row-keyed streams for cap invariance.

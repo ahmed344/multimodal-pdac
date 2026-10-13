@@ -269,9 +269,14 @@ def test_spatial_heatmaps_transform_observations_from_export_metadata(tmp_path, 
     raw = np.array([[.1, .5, .3, .2], [.2, 1., .3, .2], [0., .2, .3, .2]])
     adata = ad.AnnData(np.zeros((3, 1)), obs=pd.DataFrame(raw, columns=COLUMNS, index=["a", "b", "c"]))
     adata.obs["batch"] = "a"
+    adata.obs["x"] = [0, 1, 2]
+    adata.obs["y"] = 0
+    adata.obs["Lesion"] = True
+    adata.obsm["spatial"] = adata.obs[["x", "y"]].to_numpy()
+    adata.uns["spatial"] = {"a": {"images": {"HES": np.zeros((4, 4, 3))},
+                                      "scalefactors": {"tissue_HES_scalef": 1., "spot_diameter_fullres": 1.}}}
     input_path = tmp_path / "tissue.h5ad"
-    input_path.touch()
-    monkeypatch.setattr(spatial_heatmaps.sc, "read_h5ad", lambda path: adata)
+    adata.write_h5ad(input_path)
     config, _ = config_and_checkpoint()
     contract = target_contract(config)
     table = build_output_table(np.arange(3), np.array(["a", "b", "c"]),
@@ -280,18 +285,16 @@ def test_spatial_heatmaps_transform_observations_from_export_metadata(tmp_path, 
     table = table.replace_schema_metadata({b"dann_target_transform": json.dumps(contract).encode()})
     path = tmp_path / "predictions.parquet"
     pq.write_table(table, path)
-    captured = []
-    def capture(transformed, *args, **kwargs):
-        captured.append(transformed.obs.copy())
-    monkeypatch.setattr(spatial_heatmaps, "plot_density_heatmap", capture)
-    monkeypatch.setattr(spatial_heatmaps, "plot_diagnostics_density_heatmap", capture)
-    spatial_heatmaps.run_spatial_heatmaps(input_path, path, tmp_path / "plots", COLUMNS, 1e-5, 72)
-    assert len(captured) == 8
-    np.testing.assert_allclose(captured[0].Density_CD8, [.2, np.nan, 0.], equal_nan=True)
-    np.testing.assert_array_equal(captured[0].raw_Density_CD8, raw[:, 0])
-    np.testing.assert_allclose(captured[0].Density_Tumor, raw[:, 1])
-    assert np.isnan(captured[0].logit_Density_CD8.iloc[1])
-    assert adata.uns["dann_target_transform"] == contract
+    from dann.heatmap_execution import load_plot_data, prepare_grids
+    from dann.config import spatial_heatmap_settings
+    settings = spatial_heatmap_settings()
+    transformed = load_plot_data(input_path, path, COLUMNS, "batch", settings)
+    prepare_grids(transformed, COLUMNS, 1e-5, "batch", settings, tmp_path)
+    np.testing.assert_allclose(transformed.obs.Density_CD8, [.2, np.nan, 0.], equal_nan=True)
+    np.testing.assert_array_equal(transformed.obs.raw_Density_CD8, raw[:, 0])
+    np.testing.assert_allclose(transformed.obs.Density_Tumor, raw[:, 1])
+    assert np.isnan(transformed.obs.logit_Density_CD8.iloc[1])
+    assert transformed.uns["dann_target_transform"] == contract
 
 
 def test_nearly_constant_predictions_survive_csv_round_trip(tmp_path):

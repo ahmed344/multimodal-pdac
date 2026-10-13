@@ -198,6 +198,7 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     c = spatial_config
     import anndata as ad
     tissue = ad.read_h5ad(c['data']['context_path'])
+    tissue.obs['Lesion'] = True
     tissue.obsm['spatial'] = tissue.obs[['x', 'y']].to_numpy()
     tissue.uns['spatial'] = {
         slide: {'images': {'HES': np.zeros((10, 10, 3))},
@@ -241,8 +242,8 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     assert variance_main(['--config', str(config_path)]) == 0
     assert (Path(c['latent_variance']['output_dir'])/'explained_variance.png').is_file()
     heatmaps = run_spatial_heatmaps(input_path, predictions, tmp_path/'heatmaps',
-                                   c['data']['target_columns'], c['loss']['logit_epsilon'], 20)
-    assert len(list(heatmaps.glob('*.png'))) == 8
+                                   c['data']['target_columns'], c['loss']['logit_epsilon'], 20, workers=1)
+    assert len(list(heatmaps.glob('*.png'))) == 16
     assert not list(predictions.parent.glob('.dann-stage-*'))
 
 

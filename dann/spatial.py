@@ -6,6 +6,7 @@ import argparse
 import copy
 import json
 import os
+import uuid
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -68,8 +69,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--batch-size",
         type=int,
         default=None,
-        help="Inference rows per batch; defaults to checkpoint analysis.batch_size.",
+        help="Pixel rows or spatial tiles per batch; defaults to checkpoint settings.",
     )
+    parser.add_argument("--tiles-per-batch", type=int, default=None,
+                        help="Spatial physical tile batch; takes precedence over --batch-size.")
     parser.add_argument(
         "--num-workers",
         type=int,
@@ -159,14 +162,9 @@ def read_axis_names(path: Path, axis: str) -> np.ndarray:
 
     if axis not in {"obs", "var"}:
         raise ValueError(f"Unsupported AnnData axis: {axis!r}")
-    with h5py.File(path, "r") as handle:
-        group = handle[axis]
-        index_object = group[_axis_index_key(group)]
-        if isinstance(index_object, h5py.Group) and "mask" in index_object:
-            if np.any(np.asarray(index_object["mask"][:], dtype=bool)):
-                raise ValueError(f"{axis}_names contains missing values.")
-        values = _string_values(index_object).asstr()[:]
-    return np.asarray(values, dtype=str)
+    from dann.tiles import _axis_names
+    with h5py.File(path, 'r') as handle:
+        return _axis_names(handle[axis])
 
 
 class ObservationNameReader:
@@ -185,7 +183,13 @@ class ObservationNameReader:
         self._handle = h5py.File(path, "r")
         obs = self._handle["obs"]
         self._index_object = obs[_axis_index_key(obs)]
-        self._values = _string_values(self._index_object)
+        self._categorical = isinstance(self._index_object, h5py.Group) and 'categories' in self._index_object
+        if self._categorical:
+            from anndata.io import read_elem
+            self._categories = np.asarray(read_elem(self._index_object['categories']), dtype=str)
+            self._values = self._index_object['codes']
+        else:
+            self._values = _string_values(self._index_object)
 
     def read(self, start: int, stop: int) -> np.ndarray:
         """Read one contiguous observation-name interval.
@@ -204,6 +208,11 @@ class ObservationNameReader:
                 raise ValueError(
                     f"obs_names contains missing values in rows [{start}, {stop})."
                 )
+        if self._categorical:
+            codes = self._values[start:stop]
+            if np.any(codes < 0):
+                raise ValueError('obs_names contains missing values.')
+            return self._categories[codes]
         return np.asarray(self._values.asstr()[start:stop], dtype=str)
 
     def close(self) -> None:
@@ -782,7 +791,7 @@ def create_inference_loader(
     return DataLoader(dataset, **kwargs)
 
 
-def run_inference(
+def _run_inference(
     input_path: Path,
     checkpoint_path: Path,
     output_path: Path,
@@ -794,6 +803,9 @@ def run_inference(
     latent_output_path: Path | None = None,
     density_mc_samples: int | None = None,
     density_mc_seed: int | None = None,
+    execution_overrides: Mapping[str, Any] | None = None,
+    tiles_per_batch: int | None = None,
+    _report=None,
 ) -> Path:
     """Run all-row sparse tissue inference and atomically write Parquet.
 
@@ -820,14 +832,47 @@ def run_inference(
     latent_output_path = Path(latent_output_path) if latent_output_path is not None else output_path.parent / "spatial_latent.parquet"
     if output_path.resolve() == latent_output_path.resolve():
         raise ValueError("Prediction and latent output paths must be different.")
-    for candidate in (output_path, latent_output_path):
+    support_path = output_path.with_suffix(".support.parquet")
+    provenance_path = output_path.with_suffix(".provenance.json")
+    destinations = (output_path, latent_output_path, support_path, provenance_path)
+    if len({p.resolve() for p in destinations}) != len(destinations):
+        raise ValueError("Inference artifact paths must be different.")
+    for candidate in destinations:
         if candidate.exists() and not overwrite:
             raise FileExistsError(f"Output already exists: {candidate}")
     model, config, target_columns, device, checkpoint_epoch = load_checkpoint_model(
         checkpoint_path, device_override
     )
+    from dann.config import spatial_execution_settings, execution_settings
+    from dann.spatial_execution import inference_performance, preflight
+    if execution_overrides is not None and not isinstance(execution_overrides, Mapping):
+        raise ValueError('execution_overrides must be a mapping.')
+    overrides = dict(execution_overrides or {})
+    for section in overrides:
+        if not isinstance(overrides[section], Mapping):
+            raise ValueError(f'execution_overrides.{section} must be a mapping.')
+    if set(overrides) - {'spatial_execution', 'performance'}:
+        raise ValueError('execution_overrides accepts spatial_execution and performance mappings.')
+    spatial_settings = spatial_execution_settings({
+        **(config['analysis'].get('spatial_execution') or {}), **overrides.get('spatial_execution', {})})
+    if tiles_per_batch is not None and (isinstance(tiles_per_batch, bool)
+                                       or not isinstance(tiles_per_batch, int) or tiles_per_batch <= 0):
+        raise ValueError('tiles_per_batch must be positive.')
+    optimized = model.spatial and spatial_settings['enabled']
+    performance = inference_performance(config, overrides, spatial_settings) if optimized else {}
+    if optimized:
+        config['performance'] = performance
+        if performance['torch_threads'] is not None:
+            torch.set_num_threads(performance['torch_threads'])
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    _report.details.update(spatial_execution=spatial_settings if model.spatial else {'enabled': False},
+                           performance=performance, device=str(device))
     data_config = config["data"]
     saved_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False) if checkpoint_path.exists() else {}
+    # State tensors are already loaded into the model; provenance needs metadata only.
+    saved_checkpoint.pop('model_state', None)
+    saved_checkpoint.pop('optimizer_state', None)
     identity = saved_checkpoint.get("data_identity")
     if identity is not None and list(read_axis_names(input_path, "var").astype(str)) != identity["feature_order"]:
         raise ValueError("Inference feature order differs from frozen checkpoint.")
@@ -845,6 +890,12 @@ def run_inference(
         if int(max_rows) <= 0:
             raise ValueError("max_rows must be positive when provided.")
         selected_rows = min(total_rows, int(max_rows))
+    if optimized and spatial_settings['feature_cache']:
+        from dann.spatial_execution import check_feature_budget
+        # Every selected row is necessarily context, even for a capped export.
+        # Recheck the exact context union before allocating the feature matrix.
+        _report.details['feature_budget_preflight'] = check_feature_budget(
+            model, selected_rows, device, performance)
     analysis_config = dict(config["analysis"])
     if density_mc_samples is not None:
         analysis_config["density_mc_samples"] = density_mc_samples
@@ -852,7 +903,7 @@ def run_inference(
         analysis_config["density_mc_seed"] = density_mc_seed
     mc_samples, mc_seed = density_sampling_settings(analysis_config)
     training_config = config["training"]
-    batch_size = int(batch_size_override or analysis_config["batch_size"])
+    batch_size = int(analysis_config["batch_size"] if batch_size_override is None else batch_size_override)
     num_workers = int(
         analysis_config["num_workers"]
         if num_workers_override is None
@@ -878,55 +929,74 @@ def run_inference(
     )
     if model.spatial:
         from dann.tiles import SpatialTileDataset, tile_collate
+        from dann.execution import PreparedLoader, ResidentSpectra
         dataset.close()
-        dataset = SpatialTileDataset(config, np.arange(selected_rows), input_path=input_path)
-        kwargs = dict(batch_size=batch_size_override or training_config.get("tiles_per_batch", 8),
-                      num_workers=num_workers, collate_fn=tile_collate, shuffle=False,
-                      pin_memory=bool(training_config["pin_memory"]) and device.type == "cuda")
-        if num_workers:
-            kwargs.update(prefetch_factor=training_config["prefetch_factor"], persistent_workers=True)
+        resident = None
+        if optimized:
+            _report.details.update(preflight(input_path, config, selected_rows, performance))
+            if performance['ram_cache']:
+                resident = ResidentSpectra(input_path, data_config,
+                                          int(performance['host_budget_gib'] * 2**30))
+        dataset = SpatialTileDataset(config, np.arange(selected_rows), input_path=input_path, resident=resident,
+                                     spatial_cache={} if optimized else None, progress=_report)
+        del resident
+        physical_tiles = (tiles_per_batch if tiles_per_batch is not None else
+                          batch_size_override if batch_size_override is not None else
+                          spatial_settings['tiles_per_batch'] if optimized else training_config.get('tiles_per_batch', 8))
+        prepared = optimized
+        kwargs = dict(batch_size=physical_tiles,
+                      num_workers=0 if prepared else num_workers, collate_fn=tile_collate, shuffle=False,
+                      pin_memory=bool(training_config['pin_memory']) and device.type == 'cuda' and not prepared)
+        if kwargs['num_workers']:
+            kwargs.update(prefetch_factor=training_config['prefetch_factor'], persistent_workers=True)
         loader = DataLoader(dataset, **kwargs)
+        if optimized:
+            loader = PreparedLoader(loader, performance, config['model'], validation=True)
+            loader.inference = True
+        _report.details['physical_tiles_per_batch'] = physical_tiles
     output_path.parent.mkdir(parents=True, exist_ok=True)
     latent_output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    latent_temporary_path = latent_output_path.with_suffix(
-        latent_output_path.suffix + ".tmp"
-    )
-    for candidate in (temporary_path, latent_temporary_path):
-        if candidate.exists():
-            candidate.unlink()
-    prediction_writer = pq.ParquetWriter(
-        temporary_path,
-        output_schema(target_columns).with_metadata({
-            b"dann_target_transform": json.dumps(target_contract(config)).encode()
-        }),
-        compression="zstd",
-        use_dictionary=["obs_name"],
-    )
-    latent_dim = int(config["model"]["latent_dim"])
-    latent_writer = pq.ParquetWriter(
-        latent_temporary_path,
-        latent_output_schema(latent_dim),
-        compression="zstd",
-        use_dictionary=["obs_name"],
-    )
-    support_path = output_path.with_suffix(".support.parquet")
-    support_temporary = support_path.with_suffix(".parquet.tmp")
-    support_writer = None
+    invocation = uuid.uuid4().hex
+    temporary_path = output_path.with_name(f'.{output_path.name}.{invocation}.tmp')
+    latent_temporary_path = latent_output_path.with_name(f'.{latent_output_path.name}.{invocation}.tmp')
+    support_temporary = support_path.with_name(f'.{support_path.name}.{invocation}.tmp')
+    provenance_temporary = provenance_path.with_name(f'.{provenance_path.name}.{invocation}.tmp')
+    prediction_writer = latent_writer = support_writer = None
     staged = None
-    if model.spatial:
-        from dann.tiles import ordered_spatial_predictions
-        support_writer = pq.ParquetWriter(support_temporary, pa.schema([
-            ("row_position", pa.int64()), ("biology_support", pa.float32()),
-            ("latent_support", pa.float32())]), compression="zstd")
-        staged = ordered_spatial_predictions(model, loader, selected_rows, device, output_path.parent)
-    processed = 0
-    print(
-        f"Inference checkpoint epoch {checkpoint_epoch} on {device}; "
-        f"processing {selected_rows:,} rows.",
-        flush=True,
-    )
     try:
+        prediction_writer = pq.ParquetWriter(
+            temporary_path,
+            output_schema(target_columns).with_metadata({
+                b"dann_target_transform": json.dumps(target_contract(config)).encode()
+            }),
+            compression="zstd",
+            use_dictionary=["obs_name"],
+        )
+        latent_dim = int(config["model"]["latent_dim"])
+        latent_writer = pq.ParquetWriter(
+            latent_temporary_path,
+            latent_output_schema(latent_dim),
+            compression="zstd",
+            use_dictionary=["obs_name"],
+        )
+        support_writer = None
+        staged = None
+        if model.spatial:
+            from dann.tiles import ordered_spatial_predictions
+            support_writer = pq.ParquetWriter(support_temporary, pa.schema([
+                ("row_position", pa.int64()), ("biology_support", pa.float32()),
+                ("latent_support", pa.float32())]), compression="zstd")
+            staged = ordered_spatial_predictions(
+                model, loader, selected_rows, device, output_path.parent,
+                output_batch_size=spatial_settings['output_rows'] if optimized else 4096,
+                execution=spatial_settings if optimized else None,
+                density_samples=mc_samples, density_seed=mc_seed, progress=_report)
+        processed = 0
+        print(
+            f"Inference checkpoint epoch {checkpoint_epoch} on {device}; "
+            f"processing {selected_rows:,} rows.",
+            flush=True,
+        )
         with ObservationNameReader(input_path) as name_reader, torch.inference_mode():
             for batch_number, cpu_batch in enumerate(staged if staged is not None else loader, start=1):
                 row_positions = cpu_batch.pop("row_ids").numpy()
@@ -949,10 +1019,10 @@ def run_inference(
                     latent = predictions["latent"]
                 parameters = {key: predictions[key].cpu().numpy() for key in ("pi", "mu", "sigma")}
                 # Row-keyed streams make capped/full exports independent of tile and output batches.
-                density_mean = np.concatenate([ziln.sampled_density_mean(
-                    parameters["pi"][i:i+1], parameters["mu"][i:i+1], parameters["sigma"][i:i+1],
-                    num_samples=mc_samples, rng=np.random.default_rng([mc_seed, int(row)]))
-                    for i, row in enumerate(row_positions)]).astype(np.float32)
+                from dann.spatial_execution import sample_rows
+                density_mean = (cpu_batch['density_mean'].numpy() if 'density_mean' in cpu_batch else
+                                sample_rows(parameters['pi'], parameters['mu'], parameters['sigma'],
+                                            int(row_positions[0]), mc_samples, mc_seed)).astype(np.float32)
                 obs_names = name_reader.read(
                     processed, processed + row_positions.size
                 )
@@ -975,6 +1045,7 @@ def run_inference(
                     latent_table, row_group_size=row_positions.size
                 )
                 processed += row_positions.size
+                _report.update(processed)
                 if batch_number % 25 == 0 or processed == selected_rows:
                     print(
                         f"Processed {processed:,}/{selected_rows:,} rows "
@@ -987,37 +1058,51 @@ def run_inference(
             )
         prediction_writer.close()
         latent_writer.close()
+        _report.set_phase("output validation", selected_rows)
         validate_output(
             output_path=temporary_path,
             input_path=input_path,
             target_columns=target_columns,
             expected_rows=selected_rows,
+            progress=_report.update,
         )
         validate_latent_output(
             output_path=latent_temporary_path,
             input_path=input_path,
             latent_dim=latent_dim,
             expected_rows=selected_rows,
+            progress=_report.update,
         )
         if support_writer is not None:
             support_writer.close()
-            os.replace(support_temporary, support_path)
-        output_path.with_suffix(".provenance.json").write_text(json.dumps({
+            validate_support_output(support_temporary, selected_rows)
+        _report.update(selected_rows)
+        provenance_temporary.write_text(json.dumps({
             "checkpoint": str(checkpoint_path), "input": str(input_path),
             "architecture": saved_checkpoint.get("architecture"),
             "support_semantics": "occupancy_fraction_in_enclosing_square_window_not_graph_reachability_or_attention_mass",
             "training_data_contract": saved_checkpoint.get("training_data_contract", {"version": 0, "status": "unknown_legacy_provenance"}),
             "selected_rows": selected_rows, "context_rows": total_rows, "edge_exclusions": 0,
-            "execution": config.get("execution", {"mode": "pixel"}),
+            "execution": {**(execution_settings(config) if model.spatial else {"mode": "pixel"}),
+                          **_report.snapshot(device)},
+            "density_mc_samples": mc_samples, "density_mc_seed": mc_seed,
+            "source_identity": _file_identity(input_path),
+            "checkpoint_identity": _file_identity(checkpoint_path),
         }, indent=2))
         os.replace(temporary_path, output_path)
         os.replace(latent_temporary_path, latent_output_path)
-    except BaseException:
-        prediction_writer.close()
-        latent_writer.close()
         if support_writer is not None:
-            support_writer.close()
-        for candidate in (temporary_path, latent_temporary_path, support_temporary):
+            os.replace(support_temporary, support_path)
+        os.replace(provenance_temporary, provenance_path)
+    except BaseException:
+        from contextlib import suppress
+        # A writer can also fail while closing (for example on a full disk).
+        # Attempt every close and still remove all invocation-owned temporaries.
+        for writer in (prediction_writer, latent_writer, support_writer):
+            if writer is not None:
+                with suppress(Exception):
+                    writer.close()
+        for candidate in (temporary_path, latent_temporary_path, support_temporary, provenance_temporary):
             if candidate.exists():
                 candidate.unlink()
         raise
@@ -1028,12 +1113,68 @@ def run_inference(
     return output_path
 
 
+
+def _file_identity(path: Path) -> dict[str, Any]:
+    """Record source path and stat identity without reading a tissue file twice."""
+    if not path.exists():
+        return {'path': str(path.resolve())}
+    stat = path.stat()
+    return dict(path=str(path.resolve()), bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
+
+
+def run_inference(
+    input_path: Path, checkpoint_path: Path, output_path: Path,
+    device_override: str | None = None, batch_size_override: int | None = None,
+    num_workers_override: int | None = None, max_rows: int | None = None,
+    overwrite: bool = False, latent_output_path: Path | None = None,
+    density_mc_samples: int | None = None, density_mc_seed: int | None = None,
+    execution_overrides: Mapping[str, Any] | None = None,
+    tiles_per_batch: int | None = None,
+) -> Path:
+    """Export checkpoint-controlled predictions with optional runtime-only overrides.
+
+    ``execution_overrides`` accepts ``spatial_execution`` and ``performance``
+    mappings. CLI callers pass current YAML settings here. Explicit tile/batch
+    arguments take precedence. Missing inference settings retain legacy execution.
+    """
+    from dann.spatial_execution import InferenceProgress
+    old_threads = torch.get_num_threads()
+    with InferenceProgress() as report:
+        try:
+            return _run_inference(input_path, checkpoint_path, output_path, device_override,
+                                  batch_size_override, num_workers_override, max_rows, overwrite,
+                                  latent_output_path, density_mc_samples, density_mc_seed,
+                                  execution_overrides, tiles_per_batch, report)
+        finally:
+            if torch.get_num_threads() != old_threads:
+                torch.set_num_threads(old_threads)
+
+
+def validate_support_output(path: Path, expected_rows: int) -> None:
+    """Validate the complete support artifact before any output is published."""
+    parquet = pq.ParquetFile(path)
+    schema = pa.schema([('row_position', pa.int64()), ('biology_support', pa.float32()),
+                        ('latent_support', pa.float32())])
+    if not parquet.schema_arrow.equals(schema) or parquet.metadata.num_rows != expected_rows:
+        raise ValueError('Invalid spatial support schema or row count.')
+    checked = 0
+    for batch in parquet.iter_batches():
+        rows = batch.column('row_position').to_numpy()
+        if not np.array_equal(rows, np.arange(checked, checked+len(rows))):
+            raise ValueError('Spatial support rows are not contiguous.')
+        for column in ('biology_support', 'latent_support'):
+            values = batch.column(column).to_numpy()
+            if not np.isfinite(values).all() or np.any((values < 0) | (values > 1)):
+                raise ValueError('Invalid spatial support values.')
+        checked += len(rows)
+
 def validate_output(
     output_path: Path,
     input_path: Path,
     target_columns: Sequence[str],
     expected_rows: int,
     batch_size: int = 262_144,
+    progress=None,
 ) -> dict[str, Any]:
     """Validate identity, order, dtypes, and ranges in a Parquet export.
 
@@ -1104,6 +1245,8 @@ def validate_output(
                         "q05 <= median <= q95."
                     )
             checked += size
+            if progress is not None:
+                progress(checked)
     if checked != expected_rows:
         raise ValueError(f"Validated {checked} rows; expected {expected_rows}.")
     print(
@@ -1125,6 +1268,7 @@ def validate_latent_output(
     latent_dim: int,
     expected_rows: int,
     batch_size: int = 8_192,
+    progress=None,
 ) -> dict[str, Any]:
     """Validate identity, order, dtypes, and finiteness in a latent Parquet export.
 
@@ -1181,6 +1325,8 @@ def validate_latent_output(
                 minimum = min(minimum, float(values.min()))
                 maximum = max(maximum, float(values.max()))
             checked += size
+            if progress is not None:
+                progress(checked)
     if checked != expected_rows:
         raise ValueError(f"Validated {checked} latent rows; expected {expected_rows}.")
     print(
@@ -1223,6 +1369,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         overwrite=args.overwrite,
         density_mc_samples=args.density_mc_samples,
         density_mc_seed=args.density_mc_seed,
+        tiles_per_batch=args.tiles_per_batch,
+        execution_overrides={"spatial_execution": config['analysis'].get('spatial_execution', {}),
+                             "performance": config.get('performance', {})},
     )
     print(f"Spatial inference written to {output}", flush=True)
     print(f"Spatial latent vectors written to {args.latent_output}", flush=True)

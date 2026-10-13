@@ -41,6 +41,7 @@ def spatial_config(tmp_path):
     config = load_config(Path('dann/config.yaml'))
     # Exercise the legacy path unless a test explicitly opts into execution caches.
     config['performance'] = {}
+    config['analysis'].pop('spatial_execution', None)
     config['data'].update(path=str(tmp_path/'labels.h5ad'), context_path=str(tmp_path/'tissue.h5ad'),
                           train_fraction=.6, validation_fraction=.2, test_fraction=.2)
     # Spatial tests must not inherit editable architecture selectors from config.yaml.

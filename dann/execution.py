@@ -141,6 +141,7 @@ class PreparedLoader:
         self._iteration_created = False
         self._metrics_lock = Lock()
         self.pooled_only = False
+        self.inference = False
         self.wait_seconds = 0.
         self.max_batch_bytes = 0
 
@@ -184,6 +185,9 @@ class PreparedLoader:
         required = resident_bytes + geometry_bytes + size * (3 * self.settings['prepared_batches'] + 6)
         if required > self.settings['host_budget_gib'] * 2**30:
             raise MemoryError('Resident cache plus bounded preparation exceeds host budget.')
+        if self.inference:
+            from dann.spatial_execution import check_host_budget
+            check_host_budget(self.settings, size * (3 * self.settings['prepared_batches'] + 6))
         return batch
 
     def __iter__(self) -> Iterator[dict[str, Any]]:
@@ -291,20 +295,35 @@ def validation_execution(model: torch.nn.Module, settings: Mapping[str, Any]) ->
 
 
 def build_validation_features(model: torch.nn.Module, loader: PreparedLoader,
-                              device: torch.device) -> tuple[np.ndarray, torch.Tensor] | None:
+                              device: torch.device, progress=None) -> tuple[np.ndarray, torch.Tensor] | None:
     """Encode every required context row once; return a pass-local GPU/CPU cache."""
+    if model.training or torch.is_grad_enabled():
+        raise ValueError('Feature caches are evaluation-only and require disabled gradients.')
     dataset = loader.dataset
     if not hasattr(dataset, 'context_rows'):
         raise ValueError('Validation feature caching requires prepared spatial geometry.')
     if not dataset.context_rows:
         return None
-    rows = np.unique(np.concatenate([g['context_rows'] for g in dataset.context_rows]))
+    required_rows = np.zeros(len(dataset.keys), dtype=bool)
+    for geometry in dataset.context_rows:
+        required_rows[geometry['context_rows']] = True
+    rows = np.flatnonzero(required_rows)
+    del required_rows
+    if progress is not None:
+        progress.set_phase('feature encoding', len(rows))
     width = model.encoder.peak_mlp[-1].out_features
     element_size = model.encoder.embedding.weight.element_size()
     required = len(rows) * width * element_size
     settings = loader.settings
     if device.type == 'cuda' and torch.cuda.memory_allocated(device) + required > settings['vram_budget_gib'] * 2**30:
-        raise MemoryError('Validation features exceed VRAM budget.')
+        raise MemoryError(f'Pooled feature cache requires {required / 2**30:.2f} GiB in addition to '
+                          f'current allocations; VRAM budget {settings["vram_budget_gib"]:.2f} GiB.')
+    if progress is not None:
+        from dann.spatial_execution import check_host_budget, check_feature_budget
+        check_feature_budget(model, len(rows), device, settings)
+        check_host_budget(settings, len(dataset.keys) * 16 + (required if device.type == 'cpu' else 0))
+        progress.details['feature_cache_rows'] = len(rows)
+        progress.details['feature_cache_bytes'] = required
     values = torch.empty((len(rows), width), device=device, dtype=model.encoder.embedding.weight.dtype)
     lookup = np.full(len(dataset.keys), -1, dtype=np.int64)
     lookup[rows] = np.arange(len(rows))
@@ -317,6 +336,8 @@ def build_validation_features(model: torch.nn.Module, loader: PreparedLoader,
             ('peak_indices', 'intensities', 'sample_indices', 'peak_counts')],
             peak_budget=model.peak_budget, checkpointing=False, chunks=chunks)
         values[start:start + len(selected)] = pooled
+        if progress is not None:
+            progress.update(start + len(selected))
     return lookup, values
 
 

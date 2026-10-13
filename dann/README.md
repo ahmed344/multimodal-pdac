@@ -480,8 +480,8 @@ under `analysis/` (UMAP exports in `analysis/umap/`):
 - `spatial_predictions.parquet` (ordered mu/presence/sigma plus the derived
   logit_mean/logit_sd/logit_median/logit_q05/logit_q95 summaries and density_mean)
 - `spatial_latent.parquet` (ordered full latent vectors)
-- `heatmaps/spatial_heatmap_Density_*.png` (one 6-column per-batch parameter/sampled-mean/HES figure per target)
-- `heatmaps/spatial_heatmap_diagnostics_Density_*.png` (one 5-column per-batch normal diagnostic figure per target)
+- `heatmaps/spatial_heatmap_Density_*_{tissue,lesion}.png` (6-column parameter/sampled-mean/HES figures)
+- `heatmaps/spatial_heatmap_diagnostics_Density_*_{tissue,lesion}.png` (5-column diagnostic figures)
 
 ## Predictions versus parameters
 
@@ -1252,3 +1252,354 @@ The resumable raw report is
 are preserved. Verification: **663 tests passed** across `dann/tests` and
 `ihc_mvn/tests`, including validation chunk restoration, partial groups,
 prediction equivalence, and benchmark selection thresholds.
+
+## Tissue inference execution
+
+`analysis.spatial_execution` enables a separate export profile. Omitting this
+section preserves legacy inference; saved `performance.validation_*` annotations
+do not enable it. The CLI passes current YAML execution settings explicitly.
+Architecture, core size/halo, transforms, feature and target order, and density
+sampling settings still come from the checkpoint. Sampling flags remain explicit
+scientific overrides.
+
+Execution precedence is explicit CLI tile/batch flags, current YAML settings,
+saved inference-specific settings, then legacy defaults. `--tiles-per-batch`
+takes precedence over `--batch-size` in spatial mode. Without that flag,
+`--batch-size` keeps its historical meaning (tiles in spatial mode, rows in pixel
+mode). Python callers may supply `execution_overrides={"spatial_execution": {...},
+"performance": {...}}`; existing calls continue to work.
+
+The optimized profile uses independent physical tile, spectral-peak and GAT
+budgets. An explicit spectral budget controls both the outer complete-spectrum
+batches and the encoder's inner no-gradient chunk limit. `feature_cache_rows`
+bounds cache construction; `output_rows` bounds ordered export blocks.
+`feature_cache` requires `performance.ram_cache` and `cache_geometry`. Residency,
+geometry, CPU preparation threads, queued batches, transfer prefetch, PyTorch CPU
+threads, and host/VRAM budgets reuse the shared `performance` controls.
+
+Grid discovery reads only the required HDF5 observation columns and feature
+index, including categorical and nullable encodings. It does not load unrelated
+layers or HES arrays. Frozen preprocessing runs once on resident CSR storage.
+Only the unique context rows required by the selected output tiles are encoded;
+a leading-row export cap retains its complete external halo. Features and
+prepared graphs are local to one invocation and cannot be used with gradients.
+Spatial aggregation, support semantics and exported schemas are unchanged.
+
+Prediction staging uses a temporary memory map in original source-row order,
+with duplicate and missing-row checks. Model outputs share one CPU transfer per
+tile batch. Preparation resources and pooled features are released before density
+workers start. `density_workers: 0` runs serially; positive values use spawned
+processes with at most twice that many outstanding tasks. Workers read only
+prediction parameters from the staging map. Row-keyed NumPy generators, draw
+order, sample counts and float64 accumulation are unchanged, so identical
+parameters produce bitwise-identical sampled means across worker counts and
+output block sizes. The parent consumes blocks in row order and writes Parquet.
+
+Progress reports startup, feature encoding, spatial prediction, density sampling
+and writing, and validation every five seconds during sustained work. Provenance
+records effective settings, file identities, sampling seed/count, phase durations,
+preparation waits, peak allocated/reserved VRAM, and sampled peak host RSS summed
+across the parent and workers (shared pages can be counted more than once). Total
+time starts before checkpoint loading and ends after complete output validation.
+Host checks include CSR construction scratch, actual geometry/metadata, bounded
+queues, staging and worker reserves. Budget failures report the requested memory;
+there is no automatic precision, neighborhood or draw-count reduction.
+
+Prediction, latent and support artifacts are fully validated before publication.
+Each invocation owns uniquely named temporary files and removes them on failure.
+Existing output or companion artifacts require `--overwrite`; a failed validation
+leaves previously published artifacts intact.
+
+Reproduce stage screening (one warmup and three timed repetitions per candidate),
+then complete exports and compare every row:
+
+```bash
+python -m dann.verification.spatial_execution_benchmark screen \
+  --output data/PDAC/Results/dann/spatial_execution_benchmark/screen
+python -m dann.verification.spatial_execution_benchmark export --legacy \
+  --output data/PDAC/Results/dann/spatial_execution_benchmark/legacy
+python -m dann.verification.spatial_execution_benchmark export \
+  --output data/PDAC/Results/dann/spatial_execution_benchmark/optimized
+python -m dann.verification.spatial_execution_benchmark compare \
+  --left data/PDAC/Results/dann/spatial_execution_benchmark/legacy \
+  --right data/PDAC/Results/dann/spatial_execution_benchmark/optimized \
+  --output data/PDAC/Results/dann/spatial_execution_benchmark/comparison
+```
+
+Run GPU measurements after other GPU workloads finish. Screening includes
+a leading 16,384-row workload and the highest-entry 131,072-row window
+(on a quarter-window scan stride), tile batches 8–256, spectral limits
+262,144–2,097,152, feature batches 1,024–4,096, nonredundant GAT groups 32–128,
+preparation threads 2/4/8 with twice as many queued batches, and density workers
+0/2/4/8/16. Export comparison requires exact identities, order, schemas and
+support, and FP32 `rtol=5e-5, atol=5e-5` for predictions, latents and derived
+columns. Timing artifacts and data stay outside commits.
+
+For density scaling beyond the eight default blocks in the large screen, reuse
+its frozen parameter file with 32 bounded tasks and a persistent pool. This
+reports startup in the warmup and three steady throughput repetitions:
+
+```bash
+python -m dann.verification.spatial_execution_benchmark density-steady \
+  --parameters data/PDAC/Results/dann/spatial_execution_benchmark/screen/density_parameters.bin \
+  --output data/PDAC/Results/dann/spatial_execution_benchmark/density_steady
+```
+
+Full exports always include pool startup in their measured total time. Small
+exports may be faster with `density_workers: 0` because spawning costs more than
+their sampling work.
+
+### Measured tissue export profile (2026-10-13)
+
+Measurements used the RTX 5090 (32 GiB), 16 physical CPU cores, PyTorch
+2.11.0+cu128, the epoch-47 `deep_sets__agg-gatv2__bio-gatv2__disc-mlp` checkpoint
+from `no-residual-gatv2-aggregation`, and all **5,893,291** tissue rows. Sampling
+remained **1,000 draws**, seed **20260719**. Both optimized runs include startup,
+cache construction, prediction, sampling, writing and complete output validation.
+
+| Full export | Total | Peak allocated VRAM | Peak host RSS including workers |
+|---|---:|---:|---:|
+| Preserved pre-change source | 2,276.1 s (37m 56s) | Not instrumented | Startup peak not instrumented |
+| Initial optimized profile | 246.5 s (4m 6s) | 6.94 GiB | 47.12 GiB |
+| Selected profile | **207.3 s (3m 27s)** | **6.29 GiB** | **47.05 GiB** |
+
+The selected profile is **10.98× faster** than the preserved source and 15.9%
+faster than the initial optimized profile. Its peak reserved VRAM was 7.41 GiB.
+Full exports were measured once per profile; the 39.2-second profile difference
+substantially exceeds the observed stage timing variability. The original
+baseline's CPU export overlapped stage screening, while its GPU phase and both
+optimized complete exports had exclusive GPU execution. The selected full run
+had no competing benchmark workload. Filesystem caches were not flushed.
+
+The installed `analysis.spatial_execution` defaults are:
+
+| Control | Selected value |
+|---|---:|
+| `enabled` | `true` in current YAML; absent sections remain legacy |
+| `tiles_per_batch` | 64 |
+| `spectral_peak_budget` | 262,144 |
+| `gat_tiles` | 32 |
+| `feature_cache` | `true` |
+| `feature_cache_rows` | 1,024 |
+| `output_rows` | 16,384 |
+| `density_workers` | 16 |
+
+Shared training performance settings remain unchanged: two preparation threads,
+two queued batches, four Torch CPU threads, residency, geometry caching and CUDA
+prefetch enabled, with 128 GiB host / 24 GiB allocated-VRAM budgets. The full
+resident CSR was 27.73 GiB and the FP32 feature cache 5.62 GiB. Preparation waits
+totaled 0.026 seconds; the largest prepared batch was 6.50 MiB.
+
+Screening covered **60 configurations with 180 timed repetitions**, each after
+one warmup, plus five density-worker configurations with another 15 repetitions.
+The representative window was rows `[0, 16384)` (4,150,349 entries); the largest
+window was `[4161536, 4292608)` (106,328,590 entries). On the latter, encoding was
+fastest with 262,144 peaks / 1,024 cache rows (median 1.693 s). Tile batches
+64–256 with GAT groups of 32 were within 1%; 64 retained the lower-memory choice.
+Larger GAT groups and more preparation threads did not improve throughput.
+
+With 32 density tasks and warm pools, median times for 131,072 rows were
+15.05 / 7.75 / 3.99 / 2.09 / **1.41 seconds** for 0 / 2 / 4 / 8 / 16 workers.
+The selected complete export's phase times were:
+
+| Phase | Seconds |
+|---|---:|
+| Startup, resident inputs and geometry | 82.35 |
+| Encode unique spectra | 38.23 |
+| Spatial prediction and staging | 20.33 |
+| Density sampling and writing | 55.61 |
+| Complete output validation | 10.77 |
+
+Startup/geometry preparation and density sampling are the remaining dominant
+costs. Increasing physical GPU batches offers little benefit on this machine.
+
+**Numerical results:** all selected-profile parameters, latents and continuous
+logit summaries pass `rtol=5e-5, atol=5e-5`. The maximum latent difference is
+`4.94e-5`. Row identities, schemas, ordering and support are exact. The initial
+profile had one latent entry outside that tolerance; it was not selected.
+
+The strict comparison also reports **322 of 23,573,164 sampled density values**
+(0.00137%) outside that initial tolerance, with maximum difference `0.000998795`.
+Tiny FP32 parameter differences can move a uniform draw across the hurdle
+threshold, changing a 1,000-draw mean by up to 0.001. The unchanged sampler is discontinuous at this threshold. The audit replays the
+original row streams using the exact inverse rounding intervals of exported
+float32 presence probabilities. **All 322 exceptions are explained by at most
+one hurdle switch**, with maximum continuous perturbation bound `1.37e-6` and
+no unexplained rows. The strict comparison lists these exceptions explicitly. Frozen identical parameters produce bitwise
+identical float64 means across serial/parallel workers, task order and block size.
+
+All artifacts are isolated under
+`data/PDAC/Results/dann/spatial_execution_benchmark/`: `baseline/` preserves the
+pre-change source/config and commit; `screen/manifest.json` records source hashes,
+configuration, workload positions, software/hardware and input/checkpoint stat
+identities; `screen/screen.json` and `density_steady/density_steady.json` retain
+individual trials. `full_legacy/`, `full_initial/`, and `full_tuned/` contain
+complete exports. Their comparison JSON, the density audit and run logs remain
+there with the original production outputs untouched.
+
+The strict comparison returns a nonzero status for the documented sampled-mean
+exceptions. Reproduce their independent audit with:
+
+```bash
+python -m dann.verification.spatial_density_audit \
+  --left data/PDAC/Results/dann/spatial_execution_benchmark/full_legacy/predictions.parquet \
+  --right data/PDAC/Results/dann/spatial_execution_benchmark/full_tuned/predictions.parquet \
+  --output data/PDAC/Results/dann/spatial_execution_benchmark/density_audit_recheck.json
+```
+
+To reproduce the original pre-change baseline, run `python -m dann.spatial` from
+`data/PDAC/Results/dann/spatial_execution_benchmark/baseline/`, using its saved
+config and **explicit fresh prediction and latent output paths**. The current
+`export --legacy` benchmark mode keeps the backed inference reference but already
+benefits from selective metadata loading. Benchmark subprocesses used
+`OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=4`.
+
+A further 131,072-row frozen-parameter check produced the **same SHA-256 of all
+float64 density means** for 0/2/4/8/16 workers with block sizes ranging from
+2,048 to 16,384 rows. Its evidence is in
+`density_equivalence/density_equivalence.json`; reproduce it with:
+
+```bash
+python -m dann.verification.spatial_execution_benchmark density-exact \
+  --parameters data/PDAC/Results/dann/spatial_execution_benchmark/screen/density_parameters.bin \
+  --output data/PDAC/Results/dann/spatial_execution_benchmark/density_equivalence_recheck
+```
+
+Final verification:
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q dann/tests ihc_mvn/tests`
+completed with **687 passed**. Failure tests cover spawned worker exceptions,
+writer-close errors, budget rejection, temporary cleanup and preservation of
+existing exports. The input tissue and checkpoint stat identities were unchanged;
+no invocation-owned staging files remain. `final_source/` preserves the final
+implementation/configuration and source hashes.
+
+
+## Tissue and lesion spatial heatmaps
+
+`python -m dann.spatial_heatmaps --config dann/config.yaml` generates both tissue
+and lesion views from the existing spatial prediction Parquet. Four targets
+produce 16 PNGs: `spatial_heatmap_<density>_{tissue,lesion}.png` and
+`spatial_heatmap_diagnostics_<density>_{tissue,lesion}.png`. Existing unsuffixed
+figures are left intact. No inference or density resampling is performed.
+
+Tissue views retain the existing grid, masks, colors, and HES orientation. Lesion
+views use the boolean `Lesion` observation column, zoom each slide to its lesion
+bounds, and calculate each panel's color limits from visible lesion values.
+Non-lesion pixels and holes remain gray inside the crop. The HES image is cropped
+to the lesion's spatial bounds as context; its background is not segmented.
+Residual limits remain symmetric around zero. A slide without any lesion retains
+its row with “No lesion” labels. Missing/nonboolean/null lesion annotations fail
+clearly; select `--regions tissue` when annotations are unavailable.
+
+The loader reads only required observation fields, spatial coordinates, HES
+images/scalefactors, and prediction columns. Spectra, layers, other images, and
+HES embeddings are never loaded. Row positions and observation names must match
+the exact inference input; duplicate names are supported. The Parquet's target
+transformation contract controls observed CD8 normalization, including missing
+annotations. The current YAML cannot change those scientific semantics.
+
+Slide indices and numerical grids are prepared once and shared through read-only
+memory maps. Spawned processes render independent PNGs with one numerical-library
+thread each. File-backed maps use the operating system's RAM cache and avoid the
+container's smaller `/dev/shm` limit. Temporary maps and figures live in a unique
+subdirectory of the output directory and are cleaned on failure. Existing output
+PNGs are replaced only after all requested images have been generated and
+validated. Publication uses individual atomic file replacements, not an atomic
+transaction across the entire set.
+
+`analysis.spatial_heatmaps` controls `regions`, `lesion_column`, `workers`,
+`host_budget_gib`, and `png_compress_level`. Explicit CLI options override YAML;
+Python callers may pass the same settings as keyword-only arguments to
+`run_spatial_heatmaps`. One worker uses the identical renderer serially.
+
+```bash
+python -m dann.spatial_heatmaps --workers 8 --host-budget-gib 192
+python -m dann.spatial_heatmaps --regions lesion --png-compress-level 1
+python -m dann.spatial_heatmaps --regions tissue --workers 1
+```
+
+The host budget is independent of inference's RAM/VRAM budgets. Concurrency is
+capped using CPU availability, task count, available RAM, and estimates for shared
+arrays, image copies, four canvas buffers, and process overhead. A full 43-slide
+parameter canvas at 300 DPI alone occupies approximately 2.08 GiB. PNG compression
+level 1 is lossless and favors encoding speed over file size; use a higher level
+(up to 9) for smaller files. Plot resolution and numerical precision are unchanged.
+
+Progress is reported every five seconds during loading, preparation, rendering,
+and validation. `heatmap_run.json` records source identities, settings, effective
+workers, phase/total seconds, output dimensions/sizes, and sampled peak aggregate
+parent/worker RSS. Aggregate RSS conservatively counts shared mapped pages in
+each process; it is not a measurement of unique physical RAM.
+
+Reproduce worker screening and full runs with
+`python -m dann.verification.heatmap_benchmark {screen,full}` using `--input`,
+`--predictions`, and an isolated `--output-dir`. Screening includes the largest
+slide plus slides spread through source order, with warmup and three timed
+repetitions for 1, 4, 8, and 16 workers. The `baseline` mode additionally takes
+`--baseline-script` pointing to a preserved pre-change script. The `compare` mode
+uses `--baseline-output` and `--optimized-output` to compare all tissue PNG pixels.
+
+
+### Measured worker screening
+
+On the Ryzen 9 9950X3D (16 physical cores / 32 logical CPUs, 249 GiB usable
+system RAM), four representative slides at 300 DPI produced these end-to-end
+medians for all 16 tissue/lesion figures. Each setting had a warmup and three
+timed repetitions, with identical input and predictions:
+
+| Rendering processes | Median seconds | Peak aggregate RSS (GiB) |
+|---:|---:|---:|
+| 1 | 59.42 | 4.35 |
+| 4 | 24.96 | 8.04 |
+| 8 | 19.92 | 13.65 |
+| 16 | 19.64 | 21.11 |
+
+The full 43-slide run took 121.27 seconds with eight workers and 105.45 seconds
+with sixteen workers. A preliminary run capped at fifteen workers took 104.36
+seconds, effectively tied with sixteen. The default remains sixteen workers,
+with a separate 192 GiB host budget. Its measured peak aggregate RSS was
+68.68 GiB. Loading took 4.78 seconds, preparation 4.19 seconds, rendering/writing
+95.60 seconds, and final validation 0.89 seconds. These timings start at plotting
+initialization and include input loading through output validation; interpreter
+and module-import startup is excluded.
+
+Rendering and encoding the large PNGs account for approximately 91% of total
+runtime. The sixteen full-resolution files total about 4.58 GiB. Increasing worker
+count beyond sixteen cannot help this sixteen-task workload. Reducing DPI would
+reduce rendering cost, but the default preserves the existing resolution.
+
+Detailed records and the pre-change source/config snapshot are under
+`data/PDAC/Results/dann/heatmap_benchmark/`: `screen/timings.json`,
+`full/timings.json`, and `full_16/timings.json`. The first full run used a more
+conservative memory estimate; the final estimate retains four complete canvas
+buffers and reserves one private copy of the shared image/grid set per worker,
+plus parent/process overhead.
+
+
+The preserved original script required **637.78 seconds** and **99.18 GiB** peak
+RSS for the eight tissue figures. The optimized tissue-only run required
+**82.03 seconds** and **35.73 GiB** peak aggregate RSS: **7.78× faster** for the same
+eight outputs. Compression level 1 increased their combined file size from
+2.71 GiB to 3.13 GiB (about 16%); PNG decoding preserves every pixel.
+
+The normal production CLI subsequently wrote all sixteen figures to the
+configured `analysis/spatial/heatmaps` directory in **112.67 seconds**, with
+**57.59 GiB** peak aggregate RSS. The benchmark and normal CLI were measured in separate end-to-end runs; their
+timing and memory measurements are reported separately. Existing unsuffixed PNGs and the input/prediction files
+were preserved. `full_baseline/baseline_run.json`,
+`tissue_only/workers-16/repeat-0/heatmap_run.json`, and the production directory's
+`heatmap_run.json` contain the complete measurements.
+
+
+Final verification: **711 tests passed** with
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q dann/tests ihc_mvn/tests`.
+All eight production tissue PNGs were compared against the preserved original
+renderer at full resolution: **zero differing pixels** across 4,086,720,000 pixels.
+Synthetic tests also cover lesion masks/crops/color limits, empty lesions,
+normalization, selective reads, duplicate names, serial/parallel image equality,
+worker/initializer failures, cleanup, budgets, and CLI precedence.
+
+`comparison/comparison.json`, `final_suites.log`, `summary.json`, and
+`source_sha256.json` under the benchmark directory retain the verification
+results, software versions, measurements, and final source hashes. `final_source/`
+contains the implemented source/config snapshot.

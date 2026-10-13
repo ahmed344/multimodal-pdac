@@ -84,6 +84,8 @@ def load_config(path: Path) -> dict[str, Any]:
         or max_samples <= 0
     ):
         raise ValueError("analysis.max_samples must be null or a positive integer.")
+    spatial_execution_settings(config["analysis"].get("spatial_execution"))
+    spatial_heatmap_settings(config["analysis"].get("spatial_heatmaps"))
     count, seed = density_sampling_settings(config["analysis"])
     config["analysis"].update(density_mc_samples=count, density_mc_seed=seed)
     config["latent_variance"] = latent_variance_settings(config.get("latent_variance"))
@@ -358,4 +360,58 @@ def performance_settings(config: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError('Threaded preparation requires ram_cache (HDF5 handles are not shared).')
     if settings['validation_feature_cache'] and not (settings['ram_cache'] and settings['cache_geometry']):
         raise ValueError('Validation features require ram_cache and cache_geometry.')
+    return settings
+
+
+SPATIAL_EXECUTION_DEFAULTS = dict(
+    enabled=False, tiles_per_batch=64, spectral_peak_budget=262144, gat_tiles=32,
+    feature_cache=True, feature_cache_rows=1024, output_rows=16384, density_workers=16,
+)
+
+
+def spatial_execution_settings(supplied: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate inference-only execution settings; absent sections stay legacy."""
+    if supplied is not None and not isinstance(supplied, Mapping):
+        raise ValueError('analysis.spatial_execution must be a mapping.')
+    settings = {**SPATIAL_EXECUTION_DEFAULTS, **(supplied or {})}
+    if set(settings) != set(SPATIAL_EXECUTION_DEFAULTS):
+        raise ValueError('Unknown analysis.spatial_execution setting.')
+    for key, value in settings.items():
+        if key in ('enabled', 'feature_cache'):
+            if not isinstance(value, bool):
+                raise ValueError(f'analysis.spatial_execution.{key} must be boolean.')
+        elif isinstance(value, bool) or not isinstance(value, int) or value < (0 if key == 'density_workers' else 1):
+            raise ValueError(f'Invalid analysis.spatial_execution.{key}.')
+    return settings
+
+
+SPATIAL_HEATMAP_DEFAULTS = dict(
+    regions=["tissue", "lesion"], lesion_column="Lesion", workers=16,
+    host_budget_gib=192.0, png_compress_level=1,
+)
+
+
+def spatial_heatmap_settings(supplied: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate standalone heatmap settings, independently of inference budgets."""
+    if supplied is not None and not isinstance(supplied, Mapping):
+        raise ValueError("analysis.spatial_heatmaps must be a mapping.")
+    settings = {**copy.deepcopy(SPATIAL_HEATMAP_DEFAULTS), **(supplied or {})}
+    if set(settings) != set(SPATIAL_HEATMAP_DEFAULTS):
+        raise ValueError("Unknown analysis.spatial_heatmaps setting.")
+    regions = settings["regions"]
+    if (not isinstance(regions, (list, tuple)) or not regions
+            or any(region not in ("tissue", "lesion") for region in regions)
+            or len(set(regions)) != len(regions)):
+        raise ValueError("spatial_heatmaps.regions must select tissue and/or lesion once each.")
+    settings["regions"] = list(regions)
+    if not isinstance(settings["lesion_column"], str) or not settings["lesion_column"].strip():
+        raise ValueError("spatial_heatmaps.lesion_column must be a nonempty string.")
+    for key, minimum, maximum in (("workers", 1, None), ("png_compress_level", 0, 9)):
+        value = settings[key]
+        if (isinstance(value, bool) or not isinstance(value, int) or value < minimum
+                or (maximum is not None and value > maximum)):
+            raise ValueError(f"Invalid spatial_heatmaps.{key}.")
+    budget = settings["host_budget_gib"]
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not np.isfinite(budget) or budget <= 0:
+        raise ValueError("spatial_heatmaps.host_budget_gib must be finite and positive.")
     return settings

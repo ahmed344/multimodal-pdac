@@ -41,49 +41,65 @@ def open_backed_anndata(path: Path) -> ad.AnnData:
 
 def read_grid(path: Path, data: Mapping[str, Any]) -> tuple[pd.MultiIndex, np.ndarray]:
     """Read unique integer (slide, x, y) keys; observation names are not identities."""
-    adata = open_backed_anndata(path)
-    try:
+    from anndata.io import read_elem
+    with h5py.File(path, 'r') as handle:
         columns = [data['batch_column'], data['x_column'], data['y_column']]
-        obs = adata.obs[columns]
-        if obs.isna().any().any():
-            raise ValueError("Grid columns cannot contain missing values.")
-        coordinates = obs[columns[1:]].to_numpy(dtype=float)
-        if not np.isfinite(coordinates).all() or not np.equal(coordinates, np.floor(coordinates)).all():
-            raise ValueError("Spatial coordinates must be finite integers.")
-        keys = pd.MultiIndex.from_arrays([obs[columns[0]].astype(str),
-                                         coordinates[:, 0].astype(np.int64),
-                                         coordinates[:, 1].astype(np.int64)], names=columns)
-        if not keys.is_unique:
-            raise ValueError("Duplicate (batch, x, y) grid positions.")
-        return keys, np.asarray(adata.var_names, dtype=str)
-    finally:
-        adata.file.close()
+        obs = pd.DataFrame({column: read_elem(handle['obs'][column]) for column in columns})
+        features = _axis_names(handle['var'])
+    if obs.isna().any().any():
+        raise ValueError("Grid columns cannot contain missing values.")
+    coordinates = obs[columns[1:]].to_numpy(dtype=float)
+    if not np.isfinite(coordinates).all() or not np.equal(coordinates, np.floor(coordinates)).all():
+        raise ValueError("Spatial coordinates must be finite integers.")
+    keys = pd.MultiIndex.from_arrays([obs[columns[0]].astype(str),
+                                     coordinates[:, 0].astype(np.int64),
+                                     coordinates[:, 1].astype(np.int64)], names=columns)
+    if not keys.is_unique:
+        raise ValueError("Duplicate (batch, x, y) grid positions.")
+    return keys, features
+
+
+def _axis_names(group: h5py.Group) -> np.ndarray:
+    """Decode only an axis index, including categorical and nullable encodings."""
+    from anndata.io import read_elem
+    key = group.attrs.get('_index', '_index')
+    if isinstance(key, bytes):
+        key = key.decode()
+    values = read_elem(group[key])
+    if pd.isna(values).any():
+        raise ValueError('Axis names contain missing values.')
+    return np.asarray(values, dtype=str)
 
 
 def row_identity(path: Path, data: Mapping[str, Any]) -> dict[str, Any]:
-    """Fingerprint ordered rows and features, guarding saved split positions."""
-    adata = open_backed_anndata(path)
-    try:
+    """Fingerprint the original ordered names, grid columns, and feature index."""
+    from anndata.io import read_elem
+    with h5py.File(path, 'r') as handle:
+        obs = handle['obs']
         columns = [data['batch_column']]
-        columns += [data[k] for k in ('x_column', 'y_column') if data.get(k) in adata.obs]
-        frame = adata.obs[columns].astype(str)
-        digest = hashlib.sha256(pd.util.hash_pandas_object(frame, index=True).values.tobytes()).hexdigest()
-        return {'row_digest': digest, 'rows': adata.n_obs,
-                'feature_order': list(map(str, adata.var_names))}
-    finally:
-        adata.file.close()
+        columns += [data[k] for k in ('x_column', 'y_column') if data.get(k) in obs]
+        frame = pd.DataFrame({column: read_elem(obs[column]) for column in columns},
+                             index=pd.Index(_axis_names(obs)))
+        # AnnData preserves the stored index name except for its reserved _index key.
+        key = obs.attrs.get('_index', '_index')
+        if isinstance(key, bytes):
+            key = key.decode()
+        frame.index.name = None if key == '_index' else key
+        digest = hashlib.sha256(pd.util.hash_pandas_object(frame.astype(str), index=True).values.tobytes()).hexdigest()
+        return {'row_digest': digest, 'rows': len(frame),
+                'feature_order': list(_axis_names(handle['var']))}
 
 
 class SpatialTileDataset(Dataset):
     """Gather full MSI context while exposing labels only for selected core rows."""
     def __init__(self, config: Mapping[str, Any], selected_rows: np.ndarray,
                  metadata: AnnDataMetadata | None = None, input_path: Path | None = None,
-                 geometry: tuple | None = None, resident=None, spatial_cache=None) -> None:
+                 geometry: tuple | None = None, resident=None, spatial_cache=None, progress=None) -> None:
         from dann.config import execution_settings
         from dann.spatial import SparseInferenceDataset
         self.data = config['data']
         self.resident = resident
-        self.performance = config.get('performance', {}) if metadata is not None or resident is not None else {}
+        self.performance = config.get('performance', {}) if metadata is not None or resident is not None or spatial_cache is not None else {}
         self.spatial_cache = spatial_cache if spatial_cache is not None else {}
         self.geometry_bytes = 0
         from dann.config import component_settings
@@ -146,9 +162,25 @@ class SpatialTileDataset(Dataset):
             self.data['intensity_transform'], self.data.get('intensity_clip_max'),
             self.data['nonzero_threshold'])
         if self.performance.get('cache_geometry'):
-            self.context_rows = [self._prepare_geometry(i) for i in range(len(self.tiles))]
+            if progress is not None:
+                progress.set_phase('startup', len(self.tiles) * (2 if self.resident is not None else 1), 'tile preparation steps')
+            self.context_rows = []
+            for i in range(len(self.tiles)):
+                self.context_rows.append(self._prepare_geometry(i))
+                if progress is not None:
+                    progress.update(i + 1)
+                if progress is not None and i % 256 == 0:
+                    from dann.spatial_execution import check_host_budget
+                    check_host_budget(self.performance)
             if self.resident is not None:
-                self.prepared_items = [self._prepared_item(i) for i in range(len(self.tiles))]
+                self.prepared_items = []
+                for i in range(len(self.tiles)):
+                    self.prepared_items.append(self._prepared_item(i))
+                    if progress is not None:
+                        progress.update(len(self.tiles) + i + 1)
+                    if progress is not None and i % 256 == 0:
+                        from dann.spatial_execution import check_host_budget
+                        check_host_budget(self.performance)
             from dann.execution import tensor_bytes
             self.geometry_bytes = sum(
                 sum(v.nbytes for v in g.values() if isinstance(v, np.ndarray))
@@ -282,40 +314,94 @@ def tile_collate(tiles: Sequence[Mapping[str, Any]], include_spectra: bool = Tru
 
 def ordered_spatial_predictions(
     model: AdversarialLatentFusion, loader, selected_rows: int, device: torch.device,
-    directory: Path, output_batch_size: int = 4096,
+    directory: Path, output_batch_size: int = 4096, *, execution=None,
+    density_samples: int = 1000, density_seed: int = 20260719, progress=None,
 ) -> Iterator[dict[str, torch.Tensor]]:
-    """Stage tile-order results on disk and stream bounded, original-row-order blocks."""
+    """Stage tile results, release preparation, then stream ordered density blocks."""
     import tempfile
-    from dann.train import move_batch_to_device
-    width = model.latent_dim
-    targets = model.num_targets
+    from dann.execution import (build_validation_features, device_batches,
+                                pooled_validation_loader, validation_execution)
+    from dann.spatial_execution import density_blocks, release_preparation
+    settings = getattr(loader, 'settings', {}) if execution else {}
+    width, targets = model.latent_dim, model.num_targets
     with tempfile.TemporaryDirectory(prefix='.dann-stage-', dir=directory) as temporary:
-        matrix = np.memmap(Path(temporary) / 'predictions.bin', mode='w+', dtype=np.float32,
+        path = Path(temporary) / 'predictions.bin'
+        matrix = np.memmap(path, mode='w+', dtype=np.float32,
                            shape=(selected_rows, width + 3*targets + 2))
         seen = np.memmap(Path(temporary) / 'seen.bin', mode='w+', dtype=np.uint8, shape=(selected_rows,))
         seen[:] = 0
+        cache = None
+        density = None
         try:
-            with torch.inference_mode():
-                for cpu in loader:
+            with torch.inference_mode(), validation_execution(model, settings), pooled_validation_loader(loader, settings):
+                if settings.get('validation_feature_cache'):
+                    cache = build_validation_features(model, loader, device, progress=progress)
+                if progress is not None:
+                    progress.set_phase('spatial prediction', selected_rows)
+                completed = 0
+                for cpu, batch in device_batches(loader, device):
                     rows = cpu['row_ids'].numpy()
+                    if np.any(rows < 0) or np.any(rows >= selected_rows):
+                        raise ValueError('Output core rows outside selected range.')
                     if np.any(seen[rows]) or len(np.unique(rows)) != len(rows):
                         raise ValueError('Duplicate output core rows.')
-                    outputs = model(move_batch_to_device(cpu, device), grl_strength=0.)
-                    arrays = [outputs[k].cpu().numpy() for k in ('latent', 'pi', 'mu', 'sigma')]
-                    matrix[rows] = np.concatenate([*arrays, cpu['support'].numpy()[:, None],
-                                                    cpu['latent_support'].numpy()[:, None]], axis=1)
+                    if cache is not None:
+                        lookup, features = cache
+                        ids = lookup[cpu['context_row_ids'].numpy()]
+                        if np.any(ids < 0):
+                            raise ValueError('Context row missing from this inference pass.')
+                        batch['pooled_features'] = features[torch.as_tensor(ids, device=device)]
+                    outputs = model(batch, grl_strength=0.)
+                    # A single synchronized device-to-host copy for all model outputs.
+                    packed = torch.cat([outputs[k] for k in ('latent', 'pi', 'mu', 'sigma')], dim=1).cpu().numpy()
+                    matrix[rows, :-2] = packed
+                    matrix[rows, -2] = cpu['support'].numpy()
+                    matrix[rows, -1] = cpu['latent_support'].numpy()
                     seen[rows] = 1
+                    completed += len(rows)
+                    if progress is not None:
+                        progress.update(completed)
+                    if settings and device.type == 'cuda' and torch.cuda.max_memory_allocated(device) > settings['vram_budget_gib'] * 2**30:
+                        raise MemoryError('Spatial inference exceeded allocated VRAM budget.')
+                if completed:
+                    del cpu, batch, outputs, packed
+                if cache is not None:
+                    del lookup, features
+                cache = None
+            for start in range(0, selected_rows, output_batch_size):
+                if not np.all(seen[start:start+output_batch_size]):
+                    raise ValueError('Incomplete spatial prediction export.')
+            matrix.flush()
+            if progress is not None:
+                progress.details.update(preparation_wait_seconds=getattr(loader, 'wait_seconds', 0.),
+                                        max_prepared_batch_bytes=getattr(loader, 'max_batch_bytes', 0))
+            if execution:
+                release_preparation(loader)
+                import gc
+                gc.collect()
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+            if progress is not None:
+                progress.set_phase('density sampling/writing', selected_rows)
+            if execution:
+                density = density_blocks(path, matrix.shape, width, targets, output_batch_size,
+                                         execution['density_workers'], density_samples, density_seed, settings)
             for start in range(0, selected_rows, output_batch_size):
                 stop = min(start+output_batch_size, selected_rows)
-                if not np.all(seen[start:stop]):
-                    raise ValueError('Incomplete spatial prediction export.')
                 values = np.array(matrix[start:stop])
                 boundaries = [0, width, width+targets, width+2*targets, width+3*targets]
                 result = {key: torch.from_numpy(values[:, a:b]) for key, a, b in
                           zip(('latent', 'pi', 'mu', 'sigma'), boundaries[:-1], boundaries[1:])}
                 result.update(row_ids=torch.arange(start, stop), support=torch.from_numpy(values[:, -2]),
                               latent_support=torch.from_numpy(values[:, -1]))
+                if density is not None:
+                    density_start, means = next(density)
+                    if density_start != start:
+                        raise RuntimeError('Density workers changed row order.')
+                    result['density_mean'] = torch.from_numpy(means)
                 yield result
         finally:
+            if density is not None:
+                density.close()
             matrix._mmap.close()
             seen._mmap.close()
