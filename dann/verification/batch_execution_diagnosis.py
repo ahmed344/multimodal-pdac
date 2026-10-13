@@ -266,7 +266,8 @@ def equivalence(reference: AdversarialLatentFusion, flat: dict, tiled: dict, con
         for mode in modes:
             model = adapt(reference, mode, 'unchanged' if checkpoint_dropout else 'off').double().train()
             batch = tiled if mode in ('X3', 'X4') else flat
-            batch = {k: v.double() if v.is_floating_point() else v for k, v in batch.items()}
+            from dann.execution import tree_map
+            batch = tree_map(batch, lambda v: v.double() if v.is_floating_point() else v)
             loss = ZILNLoss.from_config(config).to(device).double()
             opt = optimizer_for(model, config, .001)
             calls = []

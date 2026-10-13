@@ -116,21 +116,13 @@ class DeepSetsEncoder(nn.Module):
 
     def microbatched(self, peak_indices: torch.Tensor, intensities: torch.Tensor,
                      sample_indices: torch.Tensor, peak_counts: torch.Tensor,
-                     peak_budget: int = 65536, checkpointing: bool = True) -> torch.Tensor:
+                     peak_budget: int = 65536, checkpointing: bool = True, chunks=None) -> torch.Tensor:
         """Pool complete spectra in bounded groups; recomputation preserves RNG."""
-        counts = peak_counts.detach().cpu().tolist()
-        boundaries = [0]
-        mass = 0
-        for row, count in enumerate(counts):
-            if mass + count > peak_budget and row > boundaries[-1]:
-                boundaries.append(row)
-                mass = 0
-            mass += count
-        boundaries.append(len(counts))
+        if chunks is None:
+            from dann.execution import spectral_chunks
+            chunks = spectral_chunks(peak_counts.detach().cpu().tolist(), peak_budget)
         pieces = []
-        offset = 0
-        for start, stop in zip(boundaries[:-1], boundaries[1:]):
-            end = offset + sum(counts[start:stop])
+        for start, stop, offset, end in chunks:
             args = (peak_indices[offset:end], intensities[offset:end],
                     sample_indices[offset:end] - start, peak_counts[start:stop])
             if checkpointing and self.training and torch.is_grad_enabled():

@@ -82,7 +82,7 @@ model:
         attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
 
     discriminator:
-      type: gatv2  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
+      type: mlp  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
       mlp:
         hidden_dims: [256, 128, 64]  # Original batch-discriminator hidden widths.
       cnn:
@@ -106,8 +106,9 @@ model:
   sigma_min: 0.0001  # Positive floor in sigma = softplus(raw_sigma) + sigma_min.
 
   # Execution controls change memory use, not the selected architecture.
-  gatv2_tile_budget: 8  # Independent tile graphs per internal attention call; all neighbors and optimizer rows are retained.
-  spectral_peak_budget: 65536  # Spatial spectral microbatch budget in active peaks; complete spectra stay together.
+  gatv2_checkpointing: false  # Independent of spectral checkpointing; preserves parameter names.
+  gatv2_tile_budget: 64  # Independent tile graphs per internal attention call; all neighbors and optimizer rows are retained.
+  spectral_peak_budget: 524288  # Spatial spectral microbatch budget in active peaks; complete spectra stay together.
   spectral_checkpointing: true  # Recompute spectral activations during spatial backward, preserving dropout RNG.
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
 
@@ -158,7 +159,7 @@ training:
   early_stopping_patience: 10  # Epochs without improvement in mean validation CD8 ZILN loss over valid CD8 rows.
   early_stopping_min_delta: 0.001  # Minimum improvement in that selection metric; training still uses all four targets.
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
-  resume_checkpoint: null  # Continue this checkpoint. Epochs, workers, prefetch, and early stopping come from this file; other training values stay in the checkpoint.
+  resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, and early stopping may override.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
 
   # --smoke-test overrides, recorded in resolved_config.yaml under a separate smoke/ run directory.
@@ -202,3 +203,20 @@ results:
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
   run_name: no-residual-gatv2-aggregation  # Human-readable run name; separate experiments should use separate names.
+
+# Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
+# Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.
+performance:
+  ram_cache: true
+  cache_geometry: true
+  torch_threads: 4  # Intra-operation CPU threads; null keeps the process default.
+  preparation_workers: 2  # Threads; requires ram_cache. Start comparisons at 2 or 4.
+  prepared_batches: 2  # Bounded CPU queue; completed results retain sampler order.
+  transfer_prefetch: true  # One pinned staging batch on a dedicated CUDA stream.
+  validation_tiles: 64  # Physical GPU batch; historical tiles_per_batch still defines losses.
+  validation_peak_budget: 262144  # Explicit values also set the inner inference chunk cap; null keeps model limits.
+  validation_gat_tiles: 32  # Null inherits model.gatv2_tile_budget.
+  validation_feature_cache: true  # Pass-local pooled spectra; requires both caches above.
+  feature_cache_rows: 1024
+  host_budget_gib: 128.0
+  vram_budget_gib: 24.0

@@ -162,6 +162,7 @@ class AdversarialLatentFusion(nn.Module):
         for component in (encoder.aggregation_mlp, biology, discriminator):
             if isinstance(component, GATv2Network):
                 component.tile_budget = values.get("gatv2_tile_budget", 8)
+                component.checkpointing = values.get("gatv2_checkpointing", True)
         model = cls(encoder, biology, discriminator)
         model.num_targets, model.sigma_min = num_targets, values["sigma_min"]
         model.latent_dim = int(values["latent_dim"])
@@ -172,24 +173,41 @@ class AdversarialLatentFusion(nn.Module):
         return model
 
     @staticmethod
-    def _on_map(component, value, mask):
+    def _on_map(component, value, mask, batch=None):
+        from dann.model_components.layers_gatv2 import GATv2Network
+        if isinstance(component, GATv2Network):
+            graphs = (batch or {}).get('prepared_graphs', {}).get(component.settings['neighbor_radius'])
+            if (batch or {}).get('graph_tile_budget', component.tile_budget) != component.tile_budget:
+                graphs = None  # Older/external callers may choose a different execution budget.
+            return component(value, mask, graphs)
         if component.radius:
             return component(value, mask)
         result = component(value.movedim(1, -1))
         return result.movedim(-1, 1) * mask
 
+    def _prepared_map(self, component, value, mask, batch):
+        from dann.model_components.layers_gatv2 import GATv2Network
+        if isinstance(component, GATv2Network):
+            return AdversarialLatentFusion._on_map(component, value, mask, batch)
+        return self._on_map(component, value, mask)
+
     def _latent_map(self, batch):
         if "occupancy" not in batch:
             raise ValueError("Spatial components require spatial tiles with occupancy and core indices.")
-        args = [batch[key] for key in ("peak_indices", "intensities", "sample_indices", "peak_counts")]
-        pooled = self.encoder.microbatched(*args, peak_budget=self.peak_budget,
-                                          checkpointing=self.checkpointing)
+        if 'pooled_features' in batch:
+            if self.training or torch.is_grad_enabled():
+                raise ValueError('Pooled feature caches are evaluation-only and require disabled gradients.')
+            pooled = batch['pooled_features']
+        else:
+            args = [batch[key] for key in ("peak_indices", "intensities", "sample_indices", "peak_counts")]
+            pooled = self.encoder.microbatched(*args, peak_budget=self.peak_budget,
+                checkpointing=self.checkpointing, chunks=batch.get('spectral_chunks'))
         mask = batch["occupancy"]
         n, _, h, w = mask.shape
         flat = pooled.new_zeros((n*h*w, pooled.shape[-1]))
         flat = flat.index_copy(0, batch["spatial_positions"], pooled)
         grid = flat.reshape(n, h, w, -1).movedim(-1, 1)
-        return self._on_map(self.encoder.aggregation_mlp, grid, mask)
+        return self._prepared_map(self.encoder.aggregation_mlp, grid, mask, batch)
 
     @staticmethod
     def _select(grid, batch):
@@ -214,10 +232,10 @@ class AdversarialLatentFusion(nn.Module):
         latent = self._select(grid, batch)
         # Keep the latent halo until both heads have consumed their neighborhoods.
         if self.biology_predictor.radius:
-            biology = transform_biology(self._select(self.biology_predictor(grid, mask), batch),
+            biology = transform_biology(self._select(self._prepared_map(self.biology_predictor, grid, mask, batch), batch),
                                         self.num_targets, self.sigma_min)
         else:
             biology = self.biology_predictor(latent)
         reversed_grid = self.gradient_reversal(grid, grl_strength)
-        logits = self._select(self._on_map(self.batch_discriminator, reversed_grid, mask), batch)
+        logits = self._select(self._prepared_map(self.batch_discriminator, reversed_grid, mask, batch), batch)
         return {"latent": latent, **biology, "batch_logits": logits}

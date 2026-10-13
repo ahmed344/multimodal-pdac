@@ -208,6 +208,8 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"model.{name}.cnn.residual must be boolean.")
     if any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in positive):
         raise ValueError("Model widths, depths, and peak budgets must be positive integers.")
+    if not isinstance(model.get("gatv2_checkpointing", True), bool):
+        raise ValueError("model.gatv2_checkpointing must be boolean.")
     if not isinstance(model.get("spectral_checkpointing", True), bool):
         raise ValueError("model.spectral_checkpointing must be boolean.")
     if not 0 <= model["dropout"] < 1 or model["sigma_min"] <= 0:
@@ -234,6 +236,7 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve mode-specific settings and all run paths once, without overrides."""
+    config["performance"] = performance_settings(config)
     settings = component_settings(config["model"])
     if "spectral_encoder" in config["model"]:
         for name, group in [("aggregation", config["model"]["aggregation"]),
@@ -275,6 +278,13 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
             or training["num_workers"] < 0 or not np.isfinite(training["learning_rate"])
             or training["learning_rate"] <= 0):
         raise ValueError("Invalid worker count or learning rate.")
+    performance = config['performance']
+    prepared = any(performance[k] for k in ('ram_cache', 'cache_geometry', 'transfer_prefetch',
+                   'validation_tiles', 'validation_peak_budget', 'validation_gat_tiles'))
+    execution.update(loader_backend='shared_threads' if prepared else 'pytorch_workers',
+                     preparation_workers=performance['preparation_workers'] if prepared else training['num_workers'],
+                     physical_validation_batch_size=(performance['validation_tiles'] or training['validation_batch_size'])
+                         if mode == 'spatial' else training['validation_batch_size'])
     config["execution"] = {**execution, **{key: training[key] for key in
         ("batch_size", "validation_batch_size", "num_workers", "prefetch_factor", "learning_rate")}}
     if mode == "spatial":
@@ -312,3 +322,40 @@ def inference_input(config: Mapping[str, Any], explicit: Path | None = None) -> 
     if not path.is_file():
         raise FileNotFoundError(f"Inference input does not exist: {path}")
     return path
+
+
+PERFORMANCE_DEFAULTS = dict(
+    ram_cache=False, cache_geometry=False, preparation_workers=0, prepared_batches=2, torch_threads=None,
+    transfer_prefetch=False, validation_tiles=None, validation_peak_budget=None,
+    validation_gat_tiles=None, validation_feature_cache=False, feature_cache_rows=1024,
+    host_budget_gib=128., vram_budget_gib=24.,
+)
+
+
+def performance_settings(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate execution-only controls, with backward-compatible disabled defaults."""
+    supplied = config.get('performance', {})
+    if not isinstance(supplied, Mapping):
+        raise ValueError('performance must be a mapping.')
+    settings = {**PERFORMANCE_DEFAULTS, **supplied}
+    if set(settings) != set(PERFORMANCE_DEFAULTS):
+        raise ValueError('Unknown performance setting.')
+    for key in ('ram_cache', 'cache_geometry', 'transfer_prefetch', 'validation_feature_cache'):
+        if not isinstance(settings[key], bool):
+            raise ValueError(f'performance.{key} must be boolean.')
+    for key in ('preparation_workers', 'prepared_batches', 'validation_tiles',
+                'validation_peak_budget', 'validation_gat_tiles', 'feature_cache_rows', 'torch_threads'):
+        value = settings[key]
+        if value is None and (key.startswith('validation_') or key == 'torch_threads'):
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key == 'preparation_workers' else 1):
+            raise ValueError(f'Invalid performance.{key}.')
+    for key in ('host_budget_gib', 'vram_budget_gib'):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+            raise ValueError(f'performance.{key} must be finite and positive.')
+    if settings['preparation_workers'] and not settings['ram_cache']:
+        raise ValueError('Threaded preparation requires ram_cache (HDF5 handles are not shared).')
+    if settings['validation_feature_cache'] and not (settings['ram_cache'] and settings['cache_geometry']):
+        raise ValueError('Validation features require ram_cache and cache_geometry.')
+    return settings

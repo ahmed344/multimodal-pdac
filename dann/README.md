@@ -1,7 +1,7 @@
 # Adversarial Latent Fusion
 
 This package fits sparse MALDI-MSI to four IHC targets and exports a shared latent
-representation. MSI stays in backed CSR form until Deep Sets mean-pools the
+representation. MSI stays sparse, either backed or resident in RAM, until Deep Sets mean-pools the
 intensity-weighted learned peak embeddings. Aggregation and the two prediction
 heads can independently use MLPs, local spatial CNNs, or residual GATv2 attention.
 
@@ -18,8 +18,8 @@ There are three groups and four selectors, all in `dann/config.yaml`:
 |---|---|---|---|
 | Spectral processing | `model.spectral_encoder.type` | `deep_sets` | `deep_sets` |
 | Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
-| Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `cnn` |
-| Prediction heads | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `cnn` |
+| Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
+| Prediction heads | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
 
 All 27 aggregation/head combinations are supported. Selectable neural modules
 live in `dann/model_components/`; `dann/model.py` composes them. The Deep Sets stage uses
@@ -1008,3 +1008,247 @@ After all inference conditions complete, regenerate the CPU tables and report
 with `--summarize-only --output <existing-run>` (checkpoint arguments omitted).
 This verifies frozen checkpoint/data identities and saves a separate reporting
 source snapshot; inference arrays and the original source snapshot are retained.
+
+## Resident execution and validation caching
+
+`performance` controls RAM residency, CPU preparation, CUDA prefetching, and
+validation execution independently of the architecture. Old configurations that
+omit this section retain backed loading. `ram_cache` reads CSR arrays once,
+filters raw entries only when the existing threshold is positive, and applies
+the configured transform and clip once. Stored zeros, peak order, duplicate
+entries, empty spectra, and target masks are preserved. Training, validation,
+and test share the same read-only arrays; the tissue inference file is never
+used for supervised context.
+
+With residency enabled, `preparation_workers` CPU **threads** replace DataLoader
+process workers. `prepared_batches` bounds outstanding work; futures are consumed
+in sampler order. `cache_geometry` shares occupied tile footprints and graphs
+between splits and precomputes core positions and neighborhood support. Complete
+halos and every eligible graph edge remain present. `torch_threads` optionally
+bounds PyTorch's intra-operation CPU threads to avoid oversubscription.
+
+`transfer_prefetch` uses a dedicated CUDA stream and at most two pinned staging
+batches. The compute stream waits on a transfer event, device allocations are
+recorded on the consuming stream, and source buffers stay alive through DMA.
+CPU execution uses the same prepared interface without CUDA pinning. The transfer
+path follows [PyTorch’s pinned-memory and stream guidance](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html).
+
+`model.spectral_peak_budget` and `model.gatv2_tile_budget` tune execution without
+changing spatial dimensions or optimizer rows. `spectral_checkpointing` and
+`gatv2_checkpointing` independently control activation recomputation. FP32 and
+all layer settings are unchanged. With dropout, changing execution groups can
+change random draw ordering and therefore the optimization trajectory.
+
+Validation has separate `validation_tiles`, `validation_peak_budget`, and
+`validation_gat_tiles` controls. Physical tile batches are reassembled into the
+original `training.tiles_per_batch` loss groups before reporting. This preserves
+weighted discriminator reductions, mean/sum biology reductions, and the mean
+valid CD8 early-stopping score, including partial groups. Validation covers the
+entire configured validation split every epoch in evaluation and inference mode.
+
+`validation_feature_cache` requires resident spectra and geometry. It encodes
+only the unique required context rows, stores pooled spectral features on the
+compute device, and skips subsequent spectral gathering and transfer. The cache
+is local to one validation pass, rebuilt after training updates, and rejected by
+model execution with gradients or training mode enabled. Its construction is
+included in validation timing. `feature_cache_rows` bounds each construction
+batch. No cache is saved in checkpoint weights.
+
+The host budget covers resident spectra, graph payloads, and a conservative
+bound on preparation/staging tensors. Construction rejects oversized caches.
+Peak CUDA allocation is checked against `vram_budget_gib`; this is an execution
+acceptance limit, not an allocator reservation. Oversized candidates can still
+raise CUDA OOM and should be reduced. Defaults for the budgets are 128 GiB host
+and 24 GiB CUDA. `execution_startup.json` records preparation cost and residency;
+`resolved_config.yaml` records effective settings. Prepared runs add elapsed
+time, observed rows, rows/second, loader waits, maximum prepared-batch payload,
+process peak RSS, and peak allocated/reserved VRAM to `history.csv`. Process RSS
+is a lifetime high-water mark, not incremental cache size.
+
+Prepared batches optionally carry `spectral_chunks` (CPU boundaries),
+`context_row_ids`, `prepared_graphs`, `graph_tile_budget`, and `reduction_groups`.
+`move_batch_to_device` supports these nested structures; legacy tensor-only
+batches remain valid. `pooled_features` is accepted only in gradient-disabled
+evaluation. These fields are internal execution metadata, not model inputs or
+checkpoint parameters.
+
+Resume keeps the checkpoint's sampling contract, optimizer row budget, learning
+rate, losses, geometry, and epoch-based adversarial schedule. Current
+`performance` controls and model execution budgets/checkpointing can be applied
+without modifying historical checkpoint files or parameter names. Optimizer-row
+experiments belong to fresh fits.
+
+Benchmark production footprints (including the largest stored-entry workload),
+then compare complete matched capped epochs:
+
+```bash
+python -m dann.verification.execution_benchmark \
+  --output data/PDAC/Results/dann/execution-benchmark.json \
+  --warmup 1 --steps 3
+```
+
+The coordinate sweep tests training rows 1,024–8,192, peak budgets
+65,536–524,288, GAT groups 8–64, and both checkpoint switches independently.
+Validation compares 8, 32, 64, and 128 tiles with and without pooled features and
+checks every reported fit metric against an FP32 reference. It does not rewrite
+production YAML. Reuse a sweep for complete uncapped epoch comparisons:
+
+```bash
+python -m dann.verification.execution_benchmark \
+  --selection-from data/PDAC/Results/dann/execution-benchmark.json \
+  --full-epochs --output data/PDAC/Results/dann/execution-full-epochs.json
+```
+
+Matched comparisons start from the same model weights and splits, preserve the
+original optimizer-row budget, and use the configured learning rate, class
+weights, losses, and GRL schedule. Execution regrouping with dropout can produce
+different trained weights; prediction/metric equivalence is checked with frozen
+evaluation weights separately. Generated JSON and datasets stay under `data/`.
+
+
+### Measured production profile (RTX 5090)
+
+One matched full-epoch comparison on the assembled dataset covered 1,358,726
+training rows and all 169,824 validation rows. Both runs used the same initial
+weights, split identities, 2,048-row optimizer batches, and configured objectives.
+The reference used backed loading and the original 65,536-peak / 8-tile execution
+budgets. The selected profile uses 524,288 peaks / 64 GAT tiles, spectral
+checkpointing on, GAT checkpointing off, two preparation threads, and validation
+feature caching with 64 physical tiles (262,144 peaks / 32 GAT tiles internally).
+
+| Measurement | Backed reference | Selected profile |
+|---|---:|---:|
+| Training time | 414.89 s | 300.02 s |
+| Training rows/second | 3,274.87 | 4,528.82 |
+| Full validation, including feature construction | 126.58 s | 18.86 s |
+| Train + validation epoch | 541.47 s | 318.88 s |
+| Training loader wait | 3.48 s | 0.33 s |
+| Validation loader wait | 24.14 s | 0.008 s |
+| Peak allocated VRAM | 0.88 GiB | 4.89 GiB |
+| Peak reserved VRAM | 1.56 GiB | 8.23 GiB |
+
+This is a 1.70× epoch speedup (41% less elapsed time). Cache/geometry startup
+cost 33.04 s separately: 7.69 GiB resident CSR and 2.54 GiB graph/geometry payload.
+Process peak RSS was 26.51 GiB. Both stages ran in one process after constructing
+the cache, so RSS includes it even during the reference stage; it is not a
+measurement of the reference-only working set. The filesystem cache was warm.
+These are single-run timings, not statistical confidence intervals. Disabling
+spectral checkpointing exhausted VRAM and was rejected. Larger optimizer-row
+budgets did not improve the initial throughput sweep, so the existing budget
+was retained.
+
+Raw measurements are in the gitignored
+`data/PDAC/Results/dann/execution-benchmark.json` and
+`data/PDAC/Results/dann/execution-full-epochs.json`. Frozen-model validation
+predictions and metrics are checked separately across physical batch sizes;
+trained weights differ because regrouped dropout changes random draw ordering.
+
+### Repeated larger-batch experiment
+
+The joint sweep compares against the accelerated resident profile in the input
+YAML. It keeps FP32, spatial geometry, learning rate, class weights, losses, and
+the epoch-based adversarial schedule fixed. Run it without a concurrent GPU job:
+
+```bash
+python -m dann.verification.execution_benchmark --larger-batches \
+  --output data/PDAC/Results/dann/larger-batch-benchmark.json
+```
+
+The defaults are five training warmup steps, twenty timed steps, and three
+independent repetitions per candidate. Training tests rows 2,048/4,096/8,192,
+peak budgets 524,288/1,048,576/2,097,152, and GAT groups 64/128/256 jointly;
+identical GAT partitions are skipped. The largest complete sampler request is
+also exercised with transfer prefetching enabled. Timing synchronizes CUDA at
+window boundaries, rather than after each optimizer step. Training-screen
+`seconds` is seconds per supervised row; each trial also records the actual
+`window_seconds`, observed rows, and rows/second.
+
+Validation separately screens complete feature-cache construction and complete
+spatial passes. It tests cache batches 1,024–8,192 rows, peak budgets
+262,144–2,097,152, physical batches 64–512 tiles, and GAT groups 32–256 tiles.
+An explicit `validation_peak_budget` also controls the inner inference chunk
+limit for that validation pass; both encoder limits are restored afterward.
+Winning upper boundaries are doubled until memory rejection or two consecutive
+increases each improve throughput by less than 3%. Invalid outputs/gradients
+and memory-budget violations reject a candidate.
+
+The best cache/spatial combinations undergo full validation, including cache
+construction, prediction comparisons, and every reported metric at FP32
+`rtol=5e-5, atol=5e-5`. The two fastest training candidates then undergo three
+complete training-plus-validation comparisons against the current baseline,
+with independent model/optimizer resets and paired seeds. A selection requires
+at least a 3% reduction in median epoch time; candidates within 3% of the fastest
+are ranked by peak allocated memory. Optimizer-batch changes apply to fresh fits;
+existing resumes retain their saved row budget. Equal trained weights or
+convergence are not implied by these throughput comparisons.
+
+Reports preserve all repetitions, effective configurations, split hashes,
+startup costs, memory peaks, and rejection reasons. Existing report files are
+refused unless `--resume` is supplied. `--stage training`, `--stage validation`,
+and `--stage epochs` allow resuming individual phases using the same output and
+repetition settings. The harness never rewrites production YAML or checkpoints.
+
+### Larger-batch results (2026-10-13)
+
+The expanded experiment completed 18 passing joint training configurations,
+18 cache-construction configurations, 13 spatial-validation configurations,
+and five combined full-validation configurations, each with three measured
+repetitions. A 4,194,304-peak training boundary probe exhausted VRAM and was
+rejected; subsequent candidates ran successfully. All frozen-model validation
+predictions and reported metrics passed the FP32 equivalence checks.
+
+The baseline and two training finalists then completed three independent,
+interleaved training-plus-validation trials each. Every trial covered 1,358,726
+training rows and all 169,824 validation rows, with matched initial weights,
+splits, and paired random seeds. Validation retained the original settings:
+larger validation configurations did not clear the 3% full-pass threshold.
+
+| Measurement | Current: 2,048 rows / 524,288 peaks | 4,096 rows / 1,048,576 peaks | 4,096 rows / 2,097,152 peaks |
+|---|---:|---:|---:|
+| Median training time | 300.47 s | 294.26 s | 292.48 s |
+| Median training rows/second | 4,521.96 | 4,617.48 | 4,645.53 |
+| Median complete validation | 19.27 s | 19.21 s | 19.22 s |
+| Median complete epoch | 319.70 s | 313.44 s | 311.75 s |
+| Complete epoch range | 319.69–321.55 s | 313.39–313.47 s | 311.59–312.04 s |
+| Epoch time reduction | — | 1.96% | 2.48% |
+| Peak allocated VRAM | 4.89 GiB | 9.72 GiB | 18.74 GiB |
+| Peak reserved VRAM | 8.21 GiB | 14.08 GiB | 24.23 GiB |
+| Median training loader wait | 0.360 s | 0.332 s | 0.331 s |
+| Median validation loader wait | 0.0082 s | 0.0083 s | 0.0084 s |
+
+Each table median is calculated independently from the three trials; median
+stage times need not sum exactly to the median total. The full-epoch process
+peaked at 26.51 GiB host RSS, a lifetime high-water mark shared across profiles.
+The separate screening process peaked at 27.06 GiB host RSS.
+Resident/geometry startup cost about 33.4 seconds per process, separately from
+epoch timing. Screening and full-epoch confirmation ran in separate processes
+using the same saved baseline and splits. The filesystem cache was warm; no
+other CUDA compute process was observed during the comparisons.
+
+Larger allocations were feasible: the 8,192-row screening workloads reached
+19.34 GiB allocated VRAM, but did not outperform the training finalists. In
+validation, isolated cache construction improved from about 13.05 to 12.02
+seconds, while the best combined full pass improved only from 19.18 to 19.07
+seconds. GAT groups of 64–256 tiles were slower than 32-tile groups in the
+spatial-stage sweep. Full validation timing includes cache construction,
+spatial execution, and the original loss-reduction/reporting groups.
+
+**Decision: retain the existing production batch and execution settings.**
+Neither training finalist achieved the required 3% median complete-epoch
+reduction, and no validation candidate achieved a 3% full-pass reduction.
+The larger controls remain available for future experiments. The explicit
+validation peak budget now correctly governs both encoder chunk limits;
+its current default equals the prior inner limit, so default execution size
+is unchanged.
+
+Larger optimizer batches also changed the training trajectory: median CD8
+validation loss after the first epoch was 1.2211 for the baseline versus
+1.2490 and 1.2489 for the two 4,096-row profiles. These single-epoch comparisons
+do not establish final convergence. Existing checkpoint sampling contracts
+and weights remain untouched.
+
+The resumable raw report is
+`data/PDAC/Results/dann/larger-batch-benchmark.json`; earlier benchmark reports
+are preserved. Verification: **663 tests passed** across `dann/tests` and
+`ihc_mvn/tests`, including validation chunk restoration, partial groups,
+prediction equivalence, and benchmark selection thresholds.

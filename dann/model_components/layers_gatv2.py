@@ -93,6 +93,7 @@ class GATv2Network(nn.Module):
     def __init__(self, input_dim: int, output_dim: int, **settings: Any) -> None:
         super().__init__()
         self.settings = gatv2_settings(settings)
+        self.checkpointing = True
         self.tile_budget = 8  # Execution-only bound on independent graphs per attention call.
         try:
             from torch_geometric.nn import GATv2Conv
@@ -117,26 +118,28 @@ class GATv2Network(nn.Module):
                           norm: nn.Module) -> torch.Tensor:
         return self.dropout(self.activation(norm(attention(hidden, edges, features))))
 
-    def forward(self, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, value: torch.Tensor, mask: torch.Tensor, graphs=None) -> torch.Tensor:
         """Return masked spatial outputs, bounding independent graph work per call.
 
         Tile grouping retains every node/edge and the full optimizer batch. With
         dropout enabled it changes random draw ordering, not the dropout law.
         """
         if value.shape[0] <= self.tile_budget:
-            return self._forward_tiles(value, mask)
+            return self._forward_tiles(value, mask, graphs[0] if graphs is not None else None)
         return torch.cat([self._forward_tiles(value[start:start+self.tile_budget],
-                                              mask[start:start+self.tile_budget])
-                          for start in range(0, value.shape[0], self.tile_budget)], dim=0)
+                                              mask[start:start+self.tile_budget],
+                                              graphs[i] if graphs is not None else None)
+                          for i, start in enumerate(range(0, value.shape[0], self.tile_budget))], dim=0)
 
-    def _forward_tiles(self, value: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _forward_tiles(self, value: torch.Tensor, mask: torch.Tensor, graph=None) -> torch.Tensor:
         """Build each tile graph once and reuse it across attention layers."""
-        positions, edges, features = grid_graph(mask, self.settings['neighbor_radius'], value.dtype)
+        positions, edges, features = graph if graph is not None else grid_graph(mask, self.settings['neighbor_radius'], value.dtype)
+        features = features.to(dtype=value.dtype)
         n, _, h, w = value.shape
         nodes = value.movedim(1, -1).reshape(n*h*w, -1)[positions]
         hidden = self.dropout(self.activation(self.norms[0](self.input(nodes))))
         for attention, norm in zip(self.attentions, self.norms[1:]):
-            if self.training and torch.is_grad_enabled():
+            if self.checkpointing and self.training and torch.is_grad_enabled():
                 # Edge-wise attention activations dominate memory on complete tile
                 # batches. Recompute them in backward, preserving dropout RNG.
                 update = checkpoint(self._attention_update, hidden, edges, features,

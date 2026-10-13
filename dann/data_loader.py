@@ -245,6 +245,7 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
         intensity_transform: str = "none",
         intensity_clip_max: float | None = None,
         nonzero_threshold: float = 0.0,
+        resident=None,
     ) -> None:
         """Initialize a lazy backed sparse dataset.
 
@@ -264,6 +265,12 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
         if intensity_transform not in {"none", "log1p", "sqrt"}:
             raise ValueError(f"Unsupported intensity transform: {intensity_transform}")
         self.path = Path(path)
+        self.resident = resident
+        if resident is not None:
+            settings = dict(matrix_key=matrix_key, intensity_transform=intensity_transform,
+                            intensity_clip_max=intensity_clip_max, nonzero_threshold=nonzero_threshold)
+            if resident.source_identity != resident.identity(self.path, settings):
+                raise ValueError('Resident spectra source or preprocessing differs from dataset input.')
         self.indices = np.asarray(indices, dtype=np.int64)
         self.metadata = metadata
         self.group_path = _matrix_group_path(matrix_key)
@@ -328,17 +335,22 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
         """
 
         row = int(self.indices[item])
-        group = self._ensure_handle()[self.group_path]
-        start, stop = np.asarray(group["indptr"][row : row + 2], dtype=np.int64)
-        peak_indices = np.asarray(group["indices"][start:stop], dtype=np.int64)
-        intensities = np.asarray(group["data"][start:stop], dtype=np.float32)
-        if self.nonzero_threshold > 0.0:
-            keep = intensities > self.nonzero_threshold
-            peak_indices = peak_indices[keep]
-            intensities = intensities[keep]
-        intensities = self._transform_values(intensities)
-        if not np.isfinite(intensities).all() or np.any(intensities < 0.0):
-            raise ValueError(f"Invalid MSI intensities encountered in row {row}.")
+        if self.resident is not None:
+            start, stop = self.resident.indptr[row:row + 2]
+            peak_indices = self.resident.indices[start:stop]
+            intensities = self.resident.values[start:stop]
+        else:
+            group = self._ensure_handle()[self.group_path]
+            start, stop = np.asarray(group["indptr"][row : row + 2], dtype=np.int64)
+            peak_indices = np.asarray(group["indices"][start:stop], dtype=np.int64)
+            intensities = np.asarray(group["data"][start:stop], dtype=np.float32)
+            if self.nonzero_threshold > 0.0:
+                keep = intensities > self.nonzero_threshold
+                peak_indices = peak_indices[keep]
+                intensities = intensities[keep]
+            intensities = self._transform_values(intensities)
+            if not np.isfinite(intensities).all() or np.any(intensities < 0.0):
+                raise ValueError(f"Invalid MSI intensities encountered in row {row}.")
         return {
             "peak_indices": peak_indices,
             "intensities": intensities,
@@ -380,7 +392,7 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
             None: The file handle is closed if it was open.
         """
 
-        if self._handle is not None:
+        if getattr(self, "_handle", None) is not None:
             self._handle.close()
             self._handle = None
 
@@ -518,7 +530,16 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
             seed + offset + 1,
         )
 
+    from dann.config import performance_settings
+    performance = performance_settings(config)
+    if performance['torch_threads'] is not None:
+        torch.set_num_threads(performance['torch_threads'])
+    resident = None
+    if performance['ram_cache']:
+        from dann.execution import ResidentSpectra
+        resident = ResidentSpectra(path, data_config, int(performance['host_budget_gib'] * 2**30))
     dataset_kwargs = {
+        "resident": resident,
         "path": path,
         "metadata": metadata,
         "matrix_key": data_config["matrix_key"],
@@ -537,8 +558,10 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         from dann.tiles import SpatialTileDataset, tile_collate
         datasets = {}
         geometry = None
+        spatial_cache = {}
         for name, indices in split_indices.items():
-            datasets[name] = SpatialTileDataset(config, indices, metadata, geometry=geometry)
+            datasets[name] = SpatialTileDataset(config, indices, metadata, geometry=geometry,
+                resident=resident, spatial_cache=spatial_cache)
             geometry = datasets[name].geometry
         collator = tile_collate
     num_workers = int(training_config["num_workers"])
@@ -586,6 +609,21 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         batch_kwargs = {k: v for k, v in common_loader_kwargs.items() if k != "collate_fn"}
         loaders["train"] = DataLoader(batch_dataset, batch_size=None, sampler=sampler,
                                      generator=generator, **batch_kwargs)
+    # The threaded path owns preparation and never starts DataLoader processes.
+    from dann.execution import PreparedLoader
+    active = any(performance[k] for k in ('ram_cache', 'cache_geometry', 'transfer_prefetch',
+                 'validation_tiles', 'validation_peak_budget', 'validation_gat_tiles'))
+    if active:
+        for name, loader in list(loaders.items()):
+            if name == 'validation' and execution['mode'] == 'spatial' and performance['validation_tiles']:
+                loader = DataLoader(datasets[name], batch_size=performance['validation_tiles'],
+                                    shuffle=False, collate_fn=collator)
+                # Geometry also supplies historical reduction group identities.
+                dataset = datasets[name]
+                if not hasattr(dataset, 'context_rows'):
+                    dataset.context_rows = [dataset._prepare_geometry(i) for i in range(len(dataset))]
+                    dataset.performance = {**dataset.performance, 'cache_geometry': True}
+            loaders[name] = PreparedLoader(loader, performance, config['model'], validation=name == 'validation')
     return DataBundle(
         metadata=metadata,
         split_indices=split_indices,

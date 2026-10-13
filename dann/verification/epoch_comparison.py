@@ -144,8 +144,9 @@ def equivalence_audit(reference: AdversarialLatentFusion, spatial: SpatialContro
                 layer.p = 0.
     # Float64 removes near-zero AdamW gradient sign sensitivity in the audit.
     a.double(); b.double()
-    flat = {k: v.double() if v.is_floating_point() else v for k, v in flat.items()}
-    tiled = {k: v.double() if v.is_floating_point() else v for k, v in tiled.items()}
+    from dann.execution import tree_map
+    flat = tree_map(flat, lambda v: v.double() if v.is_floating_point() else v)
+    tiled = tree_map(tiled, lambda v: v.double() if v.is_floating_point() else v)
     loss = ZILNLoss.from_config(config).to(next(a.parameters()).device)
     optimizers = [optimizer_for(m, config, .01) for m in (a, b)]
     if class_weights is not None:

@@ -6,6 +6,8 @@ import argparse
 import copy
 import json
 import math
+import resource
+from time import perf_counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -84,6 +86,12 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     requested = requested_config["training"]
     for key in _RESUME_OVERRIDES:
         training[key] = requested[key]
+    from dann.config import performance_settings
+    config['performance'] = performance_settings(requested_config)
+    for key in ('spectral_peak_budget', 'spectral_checkpointing', 'gatv2_tile_budget',
+                'gatv2_checkpointing', 'inference_peak_chunk_size'):
+        if key in requested_config.get('model', {}):
+            config['model'][key] = requested_config['model'][key]
     mode = config.get("execution", {}).get("mode")
     if mode not in {"pixel", "spatial"}:
         from dann.config import execution_settings
@@ -97,6 +105,15 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
         for key in ("num_workers", "prefetch_factor"):
             if key in execution:
                 execution[key] = requested[key]
+    # Refresh execution metadata without changing saved sampling fields.
+    performance = config['performance']
+    if isinstance(execution, dict):
+        prepared = any(performance[k] for k in ('ram_cache', 'cache_geometry', 'transfer_prefetch',
+                       'validation_tiles', 'validation_peak_budget', 'validation_gat_tiles'))
+        execution.update(loader_backend='shared_threads' if prepared else 'pytorch_workers',
+                         preparation_workers=performance['preparation_workers'] if prepared else training['num_workers'],
+                         physical_validation_batch_size=(performance['validation_tiles'] or training.get('validation_batch_size'))
+                             if mode == 'spatial' else training.get('validation_batch_size'))
     return config
 
 
@@ -349,10 +366,8 @@ def move_batch_to_device(
         dict[str, torch.Tensor]: Device-resident tensor dictionary.
     """
 
-    return {
-        key: value.to(device, non_blocking=True)
-        for key, value in batch.items()
-    }
+    from dann.execution import tree_map
+    return tree_map(batch, lambda value: value.to(device, non_blocking=True))
 
 
 def grl_strength(
@@ -493,6 +508,9 @@ def _update_fit_statistics(
     }
     for key, value in updates.items():
         accumulator = metrics[key]
+        if isinstance(accumulator, torch.Tensor):
+            accumulator += value.detach().to(dtype=torch.float64)
+            continue
         if not isinstance(accumulator, np.ndarray):
             raise TypeError(f"Metric accumulator {key!r} must be an array.")
         accumulator += value.detach().to(dtype=torch.float64, device="cpu").numpy()
@@ -693,6 +711,9 @@ def run_epoch(
     """
 
     training = optimizer is not None
+    dataset = getattr(loader, 'dataset', None)
+    resident = getattr(dataset, 'resident', None) or getattr(getattr(dataset, 'tiles', None), 'resident', None)
+    validate_targets = resident is None
     model.train(training)
     num_targets = int(ziln_loss.target_weights.numel())
     if target_columns is None:
@@ -701,7 +722,12 @@ def run_epoch(
         raise ValueError(
             f"Expected {num_targets} target columns, received {len(target_columns)}."
         )
-    metrics = _empty_metrics(num_targets)
+    started = perf_counter()
+    if device.type == 'cuda':
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+    metrics = {key: torch.as_tensor(value, dtype=torch.float64, device=device)
+               for key, value in _empty_metrics(num_targets).items()}
     cd8_loss = ZILNLoss([1.0], ziln_loss.logit_epsilon, "sum",
                         ziln_loss.include_normal_constant).to(device)
     steps_per_epoch = max(len(loader), 1)
@@ -713,9 +739,10 @@ def run_epoch(
     if audit is not None:
         sampling_audit_dir.mkdir(parents=True, exist_ok=True)
         (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").write_text("")
-    with torch.set_grad_enabled(training):
-        for step, cpu_batch in enumerate(loader):
-            batch = move_batch_to_device(cpu_batch, device)
+    from dann.execution import device_batches, evaluation_groups
+    batches = ((cpu, batch, None) for cpu, batch in device_batches(loader, device)) if training else evaluation_groups(model, loader, device)
+    with (torch.enable_grad() if training else torch.inference_mode()):
+        for step, (cpu_batch, batch, outputs) in enumerate(batches):
             progress = (epoch_index * steps_per_epoch + step) / max(
                 total_epochs * steps_per_epoch - 1, 1
             )
@@ -724,21 +751,23 @@ def run_epoch(
             )
             if training:
                 optimizer.zero_grad(set_to_none=True)
-            outputs = model(batch, grl_strength=strength)
+            if outputs is None:
+                outputs = model(batch, grl_strength=strength)
             biology = ziln_loss(
                 outputs["pi_logits"],
                 outputs["mu"],
                 outputs["sigma"],
                 batch["targets"],
                 batch.get("target_valid_mask"),
+                validate_targets=validate_targets,
             )
             with torch.no_grad():
                 selected = slice(cd8_index, cd8_index + 1)
                 mask = batch.get("target_valid_mask", torch.ones_like(batch["targets"], dtype=torch.bool))[:, selected]
                 cd8 = cd8_loss(outputs["pi_logits"][:, selected], outputs["mu"][:, selected],
-                               outputs["sigma"][:, selected], batch["targets"][:, selected], mask)
-                metrics["cd8_sum"] += float(cd8.total)
-                metrics["cd8_count"] += int(mask.sum())
+                               outputs["sigma"][:, selected], batch["targets"][:, selected], mask, validate_targets=validate_targets)
+                metrics["cd8_sum"] += cd8.total.detach()
+                metrics["cd8_count"] += mask.sum()
                 _update_fit_statistics(
                     metrics, outputs, batch, ziln_loss.logit_epsilon
                 )
@@ -746,9 +775,10 @@ def run_epoch(
                 outputs["batch_logits"], batch["batches"], weight=class_weights
             )
             total = biology_weight * biology.total + batch_weight * discriminator
-            if not torch.isfinite(total):
+            finite_outputs = torch.stack([torch.isfinite(value).all() for value in outputs.values()]).all()
+            if not (torch.isfinite(total) & finite_outputs):
                 raise FloatingPointError(
-                    f"Non-finite objective at epoch {epoch_index + 1}, step {step + 1}."
+                    f"Non-finite objective or model output at epoch {epoch_index + 1}, step {step + 1}."
                 )
             if training:
                 total.backward()
@@ -756,33 +786,49 @@ def run_epoch(
                     nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
                 optimizer.step()
                 if audit is not None and "occupancy" in cpu_batch:
-                    composition = audit.update(cpu_batch)
-                    with (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").open("a") as handle:
-                        handle.write(json.dumps(composition) + "\n")
+                    audit.update(cpu_batch)
 
             batch_size = int(batch["targets"].shape[0])
             metrics["samples"] += batch_size
-            metrics["total"] += float(total.detach()) * batch_size
+            metrics["total"] += total.detach() * batch_size
             mass = (
-                float(biology.valid_weight_mass.detach())
+                biology.valid_weight_mass.detach()
                 if ziln_loss.reduction == "mean" else batch_size
             )
             metrics["biology_mass"] += mass
-            metrics["biology"] += float(biology.total.detach()) * mass
-            metrics["hurdle"] += float(biology.hurdle.detach()) * mass
-            metrics["positive"] += float(biology.positive.detach()) * mass
-            metrics["batch"] += float(discriminator.detach()) * batch_size
+            metrics["biology"] += biology.total.detach() * mass
+            metrics["hurdle"] += biology.hurdle.detach() * mass
+            metrics["positive"] += biology.positive.detach() * mass
+            metrics["batch"] += discriminator.detach() * batch_size
             predictions = outputs["batch_logits"].argmax(dim=1)
-            metrics["batch_correct"] += float(
-                (predictions == batch["batches"]).sum().detach()
-            )
+            metrics["batch_correct"] += (predictions == batch["batches"]).sum().detach()
+    # One reporting transfer for all scalar and per-target sufficient statistics.
+    packed = torch.cat([v.reshape(-1) for v in metrics.values()]).cpu().numpy()
+    offset = 0
+    for key, value in list(metrics.items()):
+        size = value.numel()
+        metrics[key] = packed[offset:offset+size].reshape(tuple(value.shape)) if value.ndim else float(packed[offset])
+        offset += size
     finalized = _finalize_metrics(metrics, target_columns)
     finalized["total_loss"] = (
         biology_weight * finalized["biology_loss"] + batch_weight * finalized["batch_loss"]
     )
     if audit is not None and audit.compositions:
+        with (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").open("w") as handle:
+            handle.writelines(json.dumps(row) + "\n" for row in audit.compositions)
         with (sampling_audit_dir / f"epoch_{epoch_index:04d}_summary.json").open("w") as handle:
             json.dump(audit.summary(), handle, indent=2)
+    if hasattr(loader, 'settings'):
+        elapsed = perf_counter() - started
+        peak = torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0
+        if peak > loader.settings['vram_budget_gib'] * 2**30:
+            raise MemoryError('Measured execution exceeded VRAM budget.')
+        finalized.update(seconds=elapsed, observed_rows=metrics['samples'], rows_per_second=metrics['samples'] / max(elapsed, 1e-9),
+                         loader_wait_seconds=loader.wait_seconds,
+                         peak_vram_gib=peak / 2**30,
+                         peak_reserved_vram_gib=(torch.cuda.max_memory_reserved(device) / 2**30 if device.type == 'cuda' else 0),
+                         peak_host_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20,
+                         prepared_batch_mib=loader.max_batch_bytes / 2**20)
     return finalized
 
 
@@ -945,10 +991,17 @@ def train_model(config: Mapping[str, Any]) -> Path:
     device = resolve_device(str(training["device"]))
     if resume_payload:
         validate_training_data_contract(resume_payload, config)
+    preparation_started = perf_counter()
     bundle = create_data_bundle(config, resume_payload.get("split_indices"), resume_payload.get("data_identity"))
     if resume_payload and tuple(resume_payload["batch_names"]) != bundle.metadata.batch_names:
         raise ValueError("Resume batch order is incompatible.")
+    preparation_seconds = perf_counter() - preparation_started
     target_summary = summarize_target_validity(bundle, config)
+    resident = getattr(bundle.datasets['train'], 'resident', None)
+    if resident is not None:
+        print(json.dumps(dict(data_preparation_seconds=preparation_seconds,
+                              resident_spectra_gib=resident.nbytes / 2**30,
+                              performance=config.get('performance', {}))), flush=True)
     model = AdversarialLatentFusion.from_config(
         config,
         num_batches=len(bundle.metadata.batch_names),
@@ -980,6 +1033,10 @@ def train_model(config: Mapping[str, Any]) -> Path:
     )
     output_dir = Path(training["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "execution_startup.json").open('w') as handle:
+        json.dump(dict(preparation_seconds=preparation_seconds,
+                       resident_spectra_bytes=resident.nbytes if resident is not None else 0,
+                       performance=config.get('performance', {})), handle, indent=2)
     with (output_dir / "resolved_config.yaml").open("w", encoding="utf-8") as handle:
         yaml.safe_dump(dict(config), handle, sort_keys=False)
     with (output_dir / "data_schema.json").open("w", encoding="utf-8") as handle:

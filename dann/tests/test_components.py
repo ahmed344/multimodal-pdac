@@ -39,6 +39,8 @@ def spatial_config(tmp_path):
     tissue.write_h5ad(tmp_path/'tissue.h5ad')
     tissue[np.arange(0, len(keys), 2)].copy().write_h5ad(tmp_path/'labels.h5ad')
     config = load_config(Path('dann/config.yaml'))
+    # Exercise the legacy path unless a test explicitly opts into execution caches.
+    config['performance'] = {}
     config['data'].update(path=str(tmp_path/'labels.h5ad'), context_path=str(tmp_path/'tissue.h5ad'),
                           train_fraction=.6, validation_fraction=.2, test_fraction=.2)
     # Spatial tests must not inherit editable architecture selectors from config.yaml.
@@ -49,8 +51,8 @@ def spatial_config(tmp_path):
     config['model']['spectral_encoder']['deep_sets'].update(embedding_dim=4, peak_hidden_dims=[7], peak_output_dim=6)
     for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
         group['mlp']['hidden_dims'] = [7]
-        group['cnn'].update(channels=5, depth=2, dropout=0.)
-        group['gatv2'].update(channels=8, heads=2, depth=2, dropout=0.)
+        group['cnn'].update(channels=5, depth=2, dropout=0., residual=True)
+        group['gatv2'].update(channels=8, heads=2, depth=2, dropout=0., residual=True)
     config['training']['pixel'].update(batch_size=12, validation_batch_size=12, num_workers=0)
     config['training']['spatial'].update(core_size=4, tiles_per_batch=2, num_workers=0)
     config['training'].update(device='cpu', pin_memory=False)

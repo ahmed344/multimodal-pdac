@@ -101,6 +101,7 @@ class ZILNLoss(nn.Module):
         sigma: torch.Tensor,
         targets: torch.Tensor,
         target_valid_mask: torch.Tensor | None = None,
+        *, validate_targets: bool = True,
     ) -> ZILNLossOutput:
         """Evaluate hurdle and positive logit-normal loss branches.
 
@@ -110,6 +111,7 @@ class ZILNLoss(nn.Module):
             sigma (torch.Tensor): Positive-branch scale, strictly positive.
             targets (torch.Tensor): Bounded density targets in ``[0, 1]``.
             target_valid_mask (torch.Tensor | None): Observed target entries.
+            validate_targets (bool): Skip only for fixed targets validated during cache construction.
 
         Returns:
             ZILNLossOutput: Total loss and additive reduced components.
@@ -131,7 +133,7 @@ class ZILNLoss(nn.Module):
         if target_valid_mask.shape != targets.shape or target_valid_mask.dtype != torch.bool:
             raise ValueError("target_valid_mask must be boolean and match targets.")
         targets = torch.where(target_valid_mask, targets, torch.zeros_like(targets))
-        if not torch.isfinite(targets).all() or torch.any((targets < 0.0) | (targets > 1.0)):
+        if validate_targets and (not torch.isfinite(targets).all() or torch.any((targets < 0.0) | (targets > 1.0))):
             raise ValueError("ZILN targets must lie inside [0, 1].")
         if torch.any(sigma <= 0.0):
             raise ValueError("ZILN sigma values must be strictly positive.")
