@@ -369,6 +369,111 @@ annotated figure. Repeated runs replace the three diagnostic output files.
 `analysis.max_samples: null` analyzes all rows in the test and validation splits.
 A positive integer selects a stratified cap.
 
+### Analysis execution and reuse
+
+`analysis.execution.enabled: true` enables the optimized `python -m dann.analyze`
+pipeline. Missing or disabled sections retain the legacy execution path. Model
+architecture, target order, preprocessing and spatial context remain checkpoint
+controlled. Analysis reads the labeled `data.path`, including its full lesion
+context around held-out rows; it does not reuse tissue-wide spatial predictions.
+With the current checkpoint, UMAP uses 169,878 test rows and the prediction scatter
+uses 169,824 validation rows. Peak activity for peptide selection uses all
+1,698,428 labeled lesion rows, including training rows. Splits are within slides,
+not held-out patients; analysis does not add a new `Lesion` filter.
+
+The execution profile uses resident spectra, a shared evaluation-only spectral
+feature cache, independent tile/spectral/GAT budgets, and spawned figure/table
+workers. `analysis.execution.performance` overlays the current `performance`
+controls for this invocation without changing training settings. The default
+RAM budget is 192 GiB and the allocated VRAM budget is 24 GiB. Requested caches
+that exceed their budget fail explicitly. Worker memory and pending buffers are
+included in budget checks. Pixel mode and training-split analysis keep the legacy
+model extraction behavior.
+
+Numerical stage caches live under `<analysis-output>/.analysis-cache/`. Changing
+plot colors, DPI or point size reuses predictions, sampled means and UMAP
+coordinates. Changing the checkpoint, input file, row selection, relevant
+execution settings or numerical software versions invalidates affected stages.
+Arrays and RNG metadata have checksums; incomplete or corrupt entries are
+recomputed. The source identity includes file size, nanosecond modification/change
+times and row/feature fingerprints, rather than a full hash of the large CSR file.
+The cache is regenerable and can be removed between invocations to reclaim disk.
+
+```bash
+# Redirect all artifacts, including loss_curves.png; production outputs stay intact.
+python -m dann.analyze --config dann/config.yaml --output-dir data/analysis-review
+# Recompute numerical stages, or disable persistent cache reads and writes.
+python -m dann.analyze --config dann/config.yaml --cache-policy refresh
+python -m dann.analyze --config dann/config.yaml --cache-policy off
+```
+
+`run_analysis(config, checkpoint_override, *, execution_overrides=None,
+output_override=None)` preserves existing two-argument Python callers. Explicit
+execution overrides take precedence over current YAML controls. Saved training
+execution annotations are not inference settings. Validated temporary outputs
+replace only their own destination files; unrelated spatial artifacts are retained.
+
+The seeded UMAP algorithm is unchanged and fits once per latent input. Density
+sampling preserves the original shared stream: main split first, then the scatter
+split, including on partial cache hits. Identical parameters give bitwise-identical
+float64 means across worker counts. The default remains 1,000 draws. GPU batching
+can change predictions within FP32 tolerance and therefore change the seeded UMAP
+layout; small `pi` changes can also flip rare Monte Carlo hurdles. CSV blocks retain
+the original precision, column order and target-major scatter ordering.
+
+`analysis_execution.json` records source/checkpoint identities, effective settings,
+cache generations, preparation waits, phase times, total runtime through output
+validation, peak allocated/reserved VRAM and sampled parent-plus-worker RSS.
+Five-second heartbeats continue during UMAP and worker execution. RSS includes
+shared mapped pages in each process, so it is a conservative memory measure.
+
+Stage screens use a warmup and three timed repetitions. After generating an
+isolated optimized analysis directory, reproduce them with:
+
+```bash
+python -m dann.verification.analysis_benchmark --stage gpu --output data/analysis-bench/gpu
+python -m dann.verification.analysis_benchmark --stage sampling --analysis-dir data/analysis-review --output data/analysis-bench/sampling
+python -m dann.verification.analysis_benchmark --stage rendering --analysis-dir data/analysis-review --output data/analysis-bench/rendering
+python -m dann.verification.analysis_benchmark --stage compare --reference data/analysis-legacy --analysis-dir data/analysis-review --output data/analysis-bench/comparison
+python -m dann.verification.analysis_benchmark --stage audit-density --reference data/analysis-legacy --analysis-dir data/analysis-review --output data/analysis-bench/comparison
+python -m dann.verification.analysis_benchmark --stage verify-umap --analysis-dir data/analysis-review --output data/analysis-bench/comparison
+```
+
+Run screens separately with other GPU/CPU workloads idle. The density audit replays
+the unchanged sampler against both versions' exported parameters, explicitly
+checking discrete hurdle differences rather than silently relaxing their tolerance.
+
+The [recorded measurements](verification/analysis_benchmark_results.json) use the
+full lesion dataset, checkpoint epoch 47, 1,000 draws, 300-DPI figures, an RTX 5090,
+and 16 physical / 32 logical CPUs with 249 GiB usable RAM. Complete CLI timings
+include imports, startup, every export and final validation:
+
+| Run | Wall time | Peak parent + worker RSS | Peak allocated VRAM |
+| --- | ---: | ---: | ---: |
+| Pre-change legacy | 411.8 s | 18.7 GiB | 0.93 GiB |
+| Optimized, numerical caches rebuilt | 192.5 s | 23.5 GiB | 2.28 GiB |
+| Cached reruns, median of three | 37.4 s | 19.8 GiB | 0.00 GiB |
+
+This is a 2.14× fresh-run and 11.0× cached speedup. Cached repetitions took 37.41,
+37.36 and 37.82 seconds. Filesystem caches were warm for these comparisons. The
+selected profile uses 64 tiles, 262,144 peaks, 32 GAT tiles, 1,024 feature-cache
+rows, two preparation threads, one sampling worker and 16 rendering workers.
+Rendering/table screens with 4/8/16/32 workers took median 31.60/22.98/18.21/22.65
+seconds; extra workers did not improve the selected profile.
+
+All 750 repository tests passed. All 37 scientific artifacts retained their schemas,
+identities, ordering and support; peptide families and raw activity were exact.
+Predicted parameters and latents passed `rtol=5e-5, atol=5e-5`. Of 1,188,808 exported
+sampled means, 13 differed beyond that tolerance after FP32 parameter changes
+(maximum absolute difference 0.000661). Replaying the unchanged sampler reproduced
+both versions' means bitwise, with identical final RNG states. Refitting the full
+169,878-row frozen latent input also reproduced its seeded UMAP coordinates bitwise.
+
+The largest remaining cold-run cost is seeded UMAP (93.4 seconds), followed by
+geometry preparation (20.3 seconds). Cached runs primarily spend time on figure/
+table workers and Python/library startup. The pre-change source/config snapshot
+and isolated full outputs are preserved under `data/verification/analysis_optimization/`.
+
 All adjustable paths, architecture sizes, optimization settings, numerical
 stabilizers, smoke limits, clustering controls, and plot settings are described
 in `dann/config.yaml` and this README.

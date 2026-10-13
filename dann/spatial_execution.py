@@ -18,7 +18,8 @@ import torch
 class InferenceProgress:
     """Report phase progress every five seconds, including during blocking work."""
 
-    def __init__(self) -> None:
+    def __init__(self, label: str = 'Inference') -> None:
+        self.label = label
         self.started = self.phase_started = perf_counter()
         self.phase = 'startup'
         self.completed = self.total = 0
@@ -31,7 +32,7 @@ class InferenceProgress:
         self._thread = Thread(target=self._run, daemon=True, name='dann-progress')
 
     def __enter__(self):
-        print('Inference phase: startup', flush=True)
+        print(f'{self.label} phase: startup', flush=True)
         self._thread.start()
         return self
 
@@ -54,7 +55,7 @@ class InferenceProgress:
             self.durations[self.phase] = self.durations.get(self.phase, 0.) + now - self.phase_started
             self.phase, self.phase_started = phase, now
             self.completed, self.total, self.unit = 0, total, unit
-        print(f'Inference phase: {phase}', flush=True)
+        print(f'{self.label} phase: {phase}', flush=True)
 
     def update(self, completed: int) -> None:
         self.completed = completed
@@ -65,6 +66,7 @@ class InferenceProgress:
                 elapsed = perf_counter() - self.phase_started
                 print(f'{self.phase}: {self.completed:,}/{self.total:,} {self.unit}; '
                       f'{self.completed / max(elapsed, .001):,.1f} {self.unit}/s; '
+                      f'elapsed {elapsed:.1f}s; '
                       f'host including workers {self.memory() / 2**30:.2f} GiB', flush=True)
 
     def snapshot(self, device: torch.device) -> dict[str, Any]:

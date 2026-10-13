@@ -530,6 +530,7 @@ def run_calibration(
     output_dir: Path,
     config: Mapping[str, Any],
     epsilon: float,
+    *, renderer=None,
 ) -> Path:
     """Write the complete calibration report for one split.
 
@@ -563,20 +564,21 @@ def run_calibration(
         target_label(column, extracted.get("target_transform"))
         for column in target_columns
     ]
-    plot_pit(
+    render = renderer or (lambda function, *args, **kwargs: function(*args, **kwargs))
+    render(plot_pit,
         extracted,
         display_columns,
         epsilon,
         output_dir / "calibration_pit.png",
         config,
     )
-    plot_hurdle_reliability(
+    render(plot_hurdle_reliability,
         extracted,
         display_columns,
         output_dir / "calibration_hurdle_reliability.png",
         config,
     )
-    plot_interval_coverage(
+    render(plot_interval_coverage,
         extracted,
         display_columns,
         epsilon,

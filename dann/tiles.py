@@ -163,7 +163,8 @@ class SpatialTileDataset(Dataset):
             self.data['nonzero_threshold'])
         if self.performance.get('cache_geometry'):
             if progress is not None:
-                progress.set_phase('startup', len(self.tiles) * (2 if self.resident is not None else 1), 'tile preparation steps')
+                progress.set_phase(getattr(progress, 'geometry_phase', 'startup'),
+                                   len(self.tiles) * (2 if self.resident is not None else 1), 'tile preparation steps')
             self.context_rows = []
             for i in range(len(self.tiles)):
                 self.context_rows.append(self._prepare_geometry(i))

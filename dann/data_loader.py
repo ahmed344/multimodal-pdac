@@ -77,50 +77,42 @@ def load_anndata_metadata(
         AnnDataMetadata: Validated labels, batches, m/z values, and dimensions.
     """
 
-    from dann.tiles import open_backed_anndata
+    from anndata.io import read_elem
+    import pandas as pd
+    from dann.tiles import _axis_names
 
-    adata = open_backed_anndata(path)
     required = [*target_columns, batch_column]
-    missing = [column for column in required if column not in adata.obs]
-    if missing:
-        adata.file.close()
-        raise KeyError(f"Missing required observation columns: {missing}")
-
-    raw_targets = adata.obs[list(target_columns)].to_numpy(copy=True)
-    try:
-        targets, target_valid_mask, exclusion_reasons = prepare_targets(
-            raw_targets, target_columns, cd8_normalization
-        )
-    except (ValueError, TypeError):
-        adata.file.close()
-        raise
-
-    batch_series = adata.obs[batch_column].astype("category")
+    with h5py.File(path, "r") as handle:
+        missing = [column for column in required if column not in handle['obs']]
+        if missing:
+            raise KeyError(f"Missing required observation columns: {missing}")
+        obs = pd.DataFrame({column: read_elem(handle['obs'][column]) for column in required})
+        features = _axis_names(handle['var'])
+    raw_targets = obs[list(target_columns)].to_numpy(copy=True)
+    targets, target_valid_mask, exclusion_reasons = prepare_targets(
+        raw_targets, target_columns, cd8_normalization
+    )
+    batch_series = obs[batch_column].astype("category")
     if batch_series.isna().any():
-        adata.file.close()
         raise ValueError(f"Batch column {batch_column!r} contains missing values.")
     batch_codes = batch_series.cat.codes.to_numpy(dtype=np.int64, copy=True)
     batch_names = tuple(str(value) for value in batch_series.cat.categories)
     try:
-        mz_values = np.asarray(adata.var_names, dtype=np.float64)
+        mz_values = np.asarray(features, dtype=np.float64)
     except ValueError as error:
-        adata.file.close()
         raise ValueError("AnnData var_names must contain numeric m/z values.") from error
 
     group_path = _matrix_group_path(matrix_key)
     with h5py.File(path, "r") as handle:
         if group_path not in handle:
-            adata.file.close()
             raise KeyError(f"Sparse matrix group {group_path!r} is absent from {path}.")
         group = handle[group_path]
         encoding = group.attrs.get("encoding-type", "")
         if encoding != "csr_matrix":
-            adata.file.close()
             raise TypeError(
                 f"{group_path!r} must be CSR encoded, observed {encoding!r}."
             )
         shape = tuple(int(value) for value in group.attrs["shape"])
-    adata.file.close()
     if shape != (targets.shape[0], mz_values.size):
         raise ValueError(
             f"Matrix shape {shape} disagrees with metadata "
@@ -474,7 +466,8 @@ def compute_batch_class_weights(
     return torch.from_numpy(weights.astype(np.float32))
 
 
-def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_identity=None) -> DataBundle:
+def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_identity=None,
+                       *, requested_splits: Sequence[str] | None = None, progress=None) -> DataBundle:
     """Build metadata, stratified datasets, and DataLoaders from configuration.
 
     Args:
@@ -530,6 +523,11 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
             seed + offset + 1,
         )
 
+    requested = set(split_indices if requested_splits is None else requested_splits)
+    if not requested or requested - set(split_indices):
+        raise ValueError('requested_splits must select existing saved splits.')
+    active_indices = {name: rows for name, rows in split_indices.items() if name in requested}
+
     from dann.config import performance_settings
     performance = performance_settings(config)
     if performance['torch_threads'] is not None:
@@ -549,7 +547,7 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
     }
     datasets = {
         name: SparseAnnDataDataset(indices=indices, **dataset_kwargs)
-        for name, indices in split_indices.items()
+        for name, indices in active_indices.items()
     }
     from dann.config import execution_settings
     execution = execution_settings(config)
@@ -559,9 +557,9 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         datasets = {}
         geometry = None
         spatial_cache = {}
-        for name, indices in split_indices.items():
+        for name, indices in active_indices.items():
             datasets[name] = SpatialTileDataset(config, indices, metadata, geometry=geometry,
-                resident=resident, spatial_cache=spatial_cache)
+                resident=resident, spatial_cache=spatial_cache, progress=progress)
             geometry = datasets[name].geometry
         collator = tile_collate
     num_workers = int(training_config["num_workers"])
@@ -574,32 +572,16 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
     if num_workers > 0:
         common_loader_kwargs["prefetch_factor"] = int(training_config["prefetch_factor"])
     generator = torch.Generator().manual_seed(seed)
-    loaders = {
-        "train": DataLoader(
-            datasets["train"],
-            batch_size=int(training_config["batch_size"]),
-            shuffle=True,
-            generator=generator,
-            **common_loader_kwargs,
-        ),
-        "validation": DataLoader(
-            datasets["validation"],
-            batch_size=int(training_config["validation_batch_size"]),
-            shuffle=False,
-            **common_loader_kwargs,
-        ),
-        "test": DataLoader(
-            datasets["test"],
-            batch_size=int(
-                training_config["tiles_per_batch"]
-                if execution["mode"] == "spatial"
-                else config["analysis"]["batch_size"]
-            ),
-            shuffle=False,
-            **common_loader_kwargs,
-        ),
-    }
-    if (execution["mode"] == "spatial"
+    batch_sizes = dict(train=training_config['batch_size'],
+                       validation=training_config['validation_batch_size'],
+                       test=(training_config['tiles_per_batch'] if execution['mode'] == 'spatial'
+                             else config['analysis']['batch_size']))
+    loaders = {name: DataLoader(dataset, batch_size=int(batch_sizes[name]),
+                               shuffle=name == 'train',
+                               **({'generator': generator} if name == 'train' else {}),
+                               **common_loader_kwargs)
+               for name, dataset in datasets.items()}
+    if ('train' in datasets and execution["mode"] == "spatial"
             and training_config.get("sampling_strategy", "shuffled_tiles") == "proportional_slide_tiles"):
         from dann.sampling import ProportionalSlideTileSampler, SpatialBatchDataset
         tiles = datasets["train"]

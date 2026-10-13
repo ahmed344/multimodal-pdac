@@ -65,6 +65,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Apply the same small-data settings as training --smoke-test.",
     )
+    parser.add_argument('--output-dir', type=Path, help='Redirect every analysis artifact, including loss curves.')
+    parser.add_argument('--cache-policy', choices=('reuse', 'refresh', 'off'))
     return parser.parse_args(argv)
 
 
@@ -97,6 +99,7 @@ def load_model(
     config: Mapping[str, Any],
     bundle: DataBundle,
     device: torch.device,
+    *, checkpoint: Mapping[str, Any] | None = None,
 ) -> tuple[AdversarialLatentFusion, int]:
     """Reconstruct a trained model from a checkpoint.
 
@@ -111,7 +114,8 @@ def load_model(
         checkpoint's one-based training epoch.
     """
 
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if checkpoint is None:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model = AdversarialLatentFusion.from_config(
         config,
         num_batches=len(bundle.metadata.batch_names),
@@ -352,17 +356,14 @@ def build_latent_embeddings_frame(
     """
 
     latent = np.asarray(extracted["latent"])
-    frame = pd.DataFrame(
-        {
-            "row_id": np.asarray(extracted["row_ids"], dtype=np.int64),
-            "split": split,
-            "batch_id": np.asarray(extracted["batches"], dtype=np.int64),
-            "batch": _batch_name_series(extracted["batches"], batch_names),
-        }
-    )
-    for dim in range(latent.shape[1]):
-        frame[f"latent_{dim}"] = latent[:, dim]
-    return frame
+    columns = {
+        'row_id': np.asarray(extracted['row_ids'], dtype=np.int64),
+        'split': split,
+        'batch_id': np.asarray(extracted['batches'], dtype=np.int64),
+        'batch': _batch_name_series(extracted['batches'], batch_names),
+    }
+    columns.update({f'latent_{dim}': latent[:, dim] for dim in range(latent.shape[1])})
+    return pd.DataFrame(columns)
 
 
 def build_ziln_scatter_frame(
@@ -1176,7 +1177,23 @@ def plot_ziln_density_scatter(
     plt.close(figure)
 
 
-def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) -> Path:
+def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None,
+                 *, execution_overrides: Mapping[str, Any] | None = None,
+                 output_override: Path | None = None) -> Path:
+    """Analyze a checkpoint with optional execution-only and destination overrides."""
+    from dann.config import analysis_execution_settings
+    settings = analysis_execution_settings(config['analysis'].get('execution'))
+    if execution_overrides is not None:
+        settings = analysis_execution_settings({**settings, **execution_overrides,
+            'performance': {**settings['performance'], **execution_overrides.get('performance', {})}})
+    if settings['enabled']:
+        from dann.analysis_execution import run_optimized_analysis
+        return run_optimized_analysis(config, checkpoint_override, settings, output_override)
+    return _run_legacy_analysis(config, checkpoint_override, output_override=output_override)
+
+
+def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | None,
+                         *, output_override: Path | None = None) -> Path:
     """Run all checkpoint interpretation exports and required visualizations.
 
     Args:
@@ -1198,12 +1215,14 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
     )
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     config = checkpoint_analysis_config(config, checkpoint)
+    if output_override is not None:
+        config['analysis']['output_dir'] = str(output_override)
     from dann.checkpoints import validate_training_data_contract
     validate_training_data_contract(checkpoint, config)
     bundle = create_data_bundle(config, checkpoint.get("split_indices"), checkpoint.get("data_identity"))
     if tuple(checkpoint["batch_names"]) != bundle.metadata.batch_names:
         raise ValueError("Analysis batch order differs from checkpoint.")
-    model, checkpoint_epoch = load_model(checkpoint_path, config, bundle, device)
+    model, checkpoint_epoch = load_model(checkpoint_path, config, bundle, device, checkpoint=checkpoint)
     split = str(config["analysis"]["split"])
     print(
         f"Analyzing checkpoint epoch {checkpoint_epoch} on {device}; "
@@ -1405,7 +1424,7 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None) ->
         best_epoch = None
     plot_loss_curves(
         history_path,
-        model_dir / "loss_curves.png",
+        (output_dir if output_override is not None else model_dir) / "loss_curves.png",
         int(config["analysis"]["figure_dpi"]),
         best_epoch=best_epoch,
     )
@@ -1432,7 +1451,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = load_config(args.config)
     if args.smoke_test:
         config = apply_smoke_overrides(config)
-    output_dir = run_analysis(config, args.checkpoint)
+    overrides = {'cache_policy': args.cache_policy} if args.cache_policy is not None else None
+    output_dir = run_analysis(config, args.checkpoint, execution_overrides=overrides,
+                             output_override=args.output_dir)
     print(f"Analysis written to {output_dir}", flush=True)
     return 0
 

@@ -172,6 +172,25 @@ training:
   smoke_tiles_per_batch: 2  # Spatial smoke evaluation tiles; training row budget remains unchanged.
 
 analysis:
+  execution:
+    enabled: true
+    cache_policy: reuse  # reuse, refresh, or off; plot settings do not invalidate numerical stages.
+    tiles_per_batch: 64
+    spectral_peak_budget: 262144
+    gat_tiles: 32
+    feature_cache: true
+    feature_cache_rows: 1024
+    sampling_workers: 1  # Ordered RNG producer plus numerical worker; 0 uses serial sampling.
+    render_workers: 16  # Spawned processes, one numerical-library thread each; 0 is serial.
+    performance:
+      ram_cache: true
+      cache_geometry: true
+      preparation_workers: 2  # Measured equivalent to 8 threads; GPU compute dominates.
+      prepared_batches: 4
+      transfer_prefetch: true
+      torch_threads: 4
+      host_budget_gib: 192.0
+      vram_budget_gib: 24.0
   spatial_heatmaps:
     regions: [tissue, lesion]
     lesion_column: Lesion

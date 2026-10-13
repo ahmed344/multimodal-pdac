@@ -85,6 +85,7 @@ def load_config(path: Path) -> dict[str, Any]:
     ):
         raise ValueError("analysis.max_samples must be null or a positive integer.")
     spatial_execution_settings(config["analysis"].get("spatial_execution"))
+    analysis_execution_settings(config['analysis'].get('execution'))
     spatial_heatmap_settings(config["analysis"].get("spatial_heatmaps"))
     count, seed = density_sampling_settings(config["analysis"])
     config["analysis"].update(density_mc_samples=count, density_mc_seed=seed)
@@ -367,6 +368,40 @@ SPATIAL_EXECUTION_DEFAULTS = dict(
     enabled=False, tiles_per_batch=64, spectral_peak_budget=262144, gat_tiles=32,
     feature_cache=True, feature_cache_rows=1024, output_rows=16384, density_workers=16,
 )
+
+
+ANALYSIS_EXECUTION_DEFAULTS = dict(
+    enabled=False, cache_policy='reuse', tiles_per_batch=64,
+    spectral_peak_budget=262144, gat_tiles=32, feature_cache=True,
+    feature_cache_rows=1024, sampling_workers=1, render_workers=16, performance={},
+)
+
+
+def analysis_execution_settings(supplied: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate standalone analysis controls without using training annotations."""
+    if supplied is not None and not isinstance(supplied, Mapping):
+        raise ValueError('analysis.execution must be a mapping.')
+    settings = {**copy.deepcopy(ANALYSIS_EXECUTION_DEFAULTS), **(supplied or {})}
+    if set(settings) != set(ANALYSIS_EXECUTION_DEFAULTS):
+        raise ValueError('Unknown analysis.execution setting.')
+    for key in ('enabled', 'feature_cache'):
+        if not isinstance(settings[key], bool):
+            raise ValueError(f'analysis.execution.{key} must be boolean.')
+    for key in ('tiles_per_batch', 'spectral_peak_budget', 'gat_tiles', 'feature_cache_rows',
+                'sampling_workers', 'render_workers'):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key.endswith('workers') else 1):
+            raise ValueError(f'Invalid analysis.execution.{key}.')
+    if settings['cache_policy'] not in ('reuse', 'refresh', 'off'):
+        raise ValueError('analysis.execution.cache_policy must be reuse, refresh, or off.')
+    overrides = settings['performance']
+    if not isinstance(overrides, Mapping) or set(overrides) - set(PERFORMANCE_DEFAULTS):
+        raise ValueError('Invalid analysis.execution.performance overrides.')
+    # Validate partial overrides in a compatible enabled profile; actual dependencies
+    # are checked again after merging with current runtime performance settings.
+    performance_settings({'performance': {**PERFORMANCE_DEFAULTS, 'ram_cache': True,
+                                         'cache_geometry': True, **overrides}})
+    return settings
 
 
 def spatial_execution_settings(supplied: Mapping[str, Any] | None = None) -> dict[str, Any]:

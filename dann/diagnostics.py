@@ -6,7 +6,7 @@ import pandas as pd
 
 
 def write_density_diagnostics(extracted: Mapping[str, np.ndarray], config: Mapping[str, Any],
-                              output_dir: Path, split: str) -> None:
+                              output_dir: Path, split: str, *, grid_keys=None) -> None:
     """Report density errors by boundary support and observed adjacent-pixel contrasts."""
     targets = extracted['targets']
     predicted = extracted['density_mean']
@@ -32,7 +32,9 @@ def write_density_diagnostics(extracted: Mapping[str, np.ndarray], config: Mappi
     if support is None:
         return
     from dann.tiles import read_grid
-    keys, _ = read_grid(Path(config['data']['path']), config['data'])
+    keys = grid_keys
+    if keys is None:
+        keys, _ = read_grid(Path(config['data']['path']), config['data'])
     keys = keys[extracted['row_ids']]
     lookup = {key: i for i, key in enumerate(keys)}
     pairs = [(i, lookup[neighbor]) for i, (slide, x, y) in enumerate(keys)

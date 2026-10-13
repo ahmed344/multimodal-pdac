@@ -295,7 +295,8 @@ def validation_execution(model: torch.nn.Module, settings: Mapping[str, Any]) ->
 
 
 def build_validation_features(model: torch.nn.Module, loader: PreparedLoader,
-                              device: torch.device, progress=None) -> tuple[np.ndarray, torch.Tensor] | None:
+                              device: torch.device, progress=None, *,
+                              context_datasets=None) -> tuple[np.ndarray, torch.Tensor] | None:
     """Encode every required context row once; return a pass-local GPU/CPU cache."""
     if model.training or torch.is_grad_enabled():
         raise ValueError('Feature caches are evaluation-only and require disabled gradients.')
@@ -305,8 +306,13 @@ def build_validation_features(model: torch.nn.Module, loader: PreparedLoader,
     if not dataset.context_rows:
         return None
     required_rows = np.zeros(len(dataset.keys), dtype=bool)
-    for geometry in dataset.context_rows:
-        required_rows[geometry['context_rows']] = True
+    for context in (context_datasets if context_datasets is not None else [dataset]):
+        if context.geometry[-1] != dataset.geometry[-1]:
+            raise ValueError('Feature cache context sources differ.')
+        if context.resident.source_identity != dataset.resident.source_identity:
+            raise ValueError('Feature cache context preprocessing differs.')
+        for geometry in context.context_rows:
+            required_rows[geometry['context_rows']] = True
     rows = np.flatnonzero(required_rows)
     del required_rows
     if progress is not None:
