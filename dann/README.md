@@ -216,6 +216,16 @@ writes the selected effective settings in `execution` and `resolved_config.yaml`
 Smoke overrides reduce label counts, cores (8×8), tiles (two), epochs, and workers,
 and record all effective values.
 
+Fresh runs use a seeded within-slide 90% training / 10% validation split. Training
+gets `floor(0.9 × slide_pixels)` rows per slide and validation gets every remaining
+row, including rounding remainders. The test array remains present but empty. For
+the current dataset this gives 1,528,567 training and 169,861 validation pixels
+(including the 37 rounding leftovers), with zero test pixels. A positive
+`test_fraction` retains the original rounding rule: floor training and validation
+counts, then assign the remainder to test. Loading or resuming historical
+checkpoints preserves their saved split membership even if configured fractions
+have changed. H&E-mediated transfer is assessed separately.
+
 Checkpoint selection uses **mean validation CD8 ZILN loss over valid CD8 rows**.
 Training still optimizes all four weighted targets plus the adversarial objective.
 Checkpoints save the exact split positions plus an ordered row/feature identity
@@ -366,7 +376,8 @@ annotated figure. Repeated runs replace the three diagnostic output files.
 
 ## Configuration
 
-`analysis.max_samples: null` analyzes all rows in the test and validation splits.
+`analysis.split` and `analysis.ziln_scatter_split` default to `validation`.
+`analysis.max_samples: null` analyzes all rows in the selected saved splits.
 A positive integer selects a stratified cap.
 
 ### Analysis execution and reuse
@@ -376,8 +387,10 @@ pipeline. Missing or disabled sections retain the legacy execution path. Model
 architecture, target order, preprocessing and spatial context remain checkpoint
 controlled. Analysis reads the labeled `data.path`, including its full lesion
 context around held-out rows; it does not reuse tissue-wide spatial predictions.
-With the current checkpoint, UMAP uses 169,878 test rows and the prediction scatter
-uses 169,824 validation rows. Peak activity for peptide selection uses all
+With the default validation-based analysis, UMAP and prediction scatter use the
+saved validation rows: 169,861 for a fresh 90:10 split, or 169,824 for the
+historical 80:10:10 checkpoint. Historical test rows remain saved and can still
+be selected explicitly. Peak activity for peptide selection uses all
 1,698,428 labeled lesion rows, including training rows. Splits are within slides,
 not held-out patients; analysis does not add a new `Lesion` filter.
 
@@ -1787,13 +1800,16 @@ Statistics count distinct positive peaks after sparse duplicate entries are summ
 Prevalence uses all lesion pixels, including empty spectra; detected intensity is
 the positive raw intensity sum divided by detections. The top-frequency heatmap
 retains the older selection based on stored occurrences across all labeled rows.
-Associations use only saved checkpoint test rows intersected with `Lesion=True`.
+Associations use saved checkpoint rows selected by `analysis.split` (default
+`validation`), intersected with `Lesion=True`.
 They compute within-slide Spearman correlations including absent peaks as zero,
 require at least 20 valid observations and nonconstant inputs, and average valid
 slide correlations with equal weight. Frozen target transformations and masks are
 applied, including explicitly labeled normalized CD8. Family correlations use mean
 transformed family signal from labeled spectra on those same saved rows, with a
-separate numerical cache. Plotting options never invalidate numerical stages.
+separate numerical cache. Both correlation cache keys include the selected split;
+`peak_run.json` records `correlation_split` and `correlation_lesion_rows`.
+Plotting options never invalidate numerical stages.
 These are associations on
 held-out pixels, not held-out patients or evidence of causality.
 
@@ -1808,7 +1824,8 @@ rows, with saturation labeled. All-zero families use 0–1. Exports retain uncap
 scores. Feature identities and ordering must exactly match the checkpoint.
 
 Numerical caches are separate from rendering and bind the checkpoint, source file
-identities, feature order, test rows, preprocessing, and annotation settings.
+identities, feature order, selected correlation split and rows, preprocessing,
+and annotation settings.
 Resident CSR arrays and bounded blocks avoid a dense pixels-by-peaks matrix;
 family sums accumulate in float64 before FP32 storage. Figures use shared immutable
 mmap arrays and a single bounded worker pool. The requested 16 workers are reduced

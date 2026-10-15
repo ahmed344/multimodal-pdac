@@ -180,11 +180,14 @@ def test_spawn_renderer_matches_serial_and_failure_cleanup(tmp_path):
         queue.run(1, performance_settings({}), InferenceProgress())
 
 
-def test_end_to_end_cache_reuse_and_failure_preserves_outputs(spatial_config, tmp_path, monkeypatch):
+@pytest.mark.parametrize('split', ['test', 'validation'])
+def test_end_to_end_cache_reuse_and_failure_preserves_outputs(spatial_config, tmp_path, monkeypatch, split):
     from dann import analyze
     from dann import analysis_execution as execution
     config = spatial_config
-    config['analysis'].update(figure_dpi=15, family_count=3, heatmap_top_peaks=4)
+    config['analysis'].update(split=split, figure_dpi=15, family_count=3, heatmap_top_peaks=4)
+    if split == 'validation':
+        config['data'].update(train_fraction=.9, validation_fraction=.1, test_fraction=0.)
     config['analysis']['execution'].update(render_workers=0, sampling_workers=1,
                                          feature_cache_rows=7, spectral_peak_budget=17)
     path = checkpoint(config, tmp_path)
@@ -207,7 +210,8 @@ def test_end_to_end_cache_reuse_and_failure_preserves_outputs(spatial_config, tm
     analyze.run_analysis(config, path, output_override=out)
     assert (out / 'latent.csv').read_bytes() == before
     assert set(json.loads((out / 'analysis_execution.json').read_text())['cache_hits']) == {
-        'extracted-test', 'extracted-validation', 'density-test', 'density-validation', 'umap', 'peptides', 'activity'}
+        'extracted-validation', 'density-validation', 'umap', 'peptides', 'activity'
+    } | ({'extracted-test', 'density-test'} if split == 'test' else set())
     for a, b in zip(*calls):
         np.testing.assert_array_equal(a, b)
     # A cached first split must advance the RNG before a missing second split.
@@ -321,7 +325,7 @@ def test_legacy_extraction_fallback_without_residency(spatial_config, tmp_path, 
     monkeypatch.setattr(analysis_execution, 'write_artifacts', artifacts)
     out = tmp_path / 'fallback'
     analyze.run_analysis(config, path, output_override=out)
-    assert len(used) == 2
+    assert len(used) == (1 if mode == 'pixel' else 2)
     assert not json.loads((out / 'analysis_execution.json').read_text())['feature_cache_active']
 
 

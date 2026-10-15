@@ -296,6 +296,39 @@ def test_stratified_splits_and_embedding_families() -> None:
     assert sorted(order.tolist()) == [0, 1, 2, 3]
 
 
+@pytest.mark.parametrize("fractions", [(0.9, 0.1, 0.0), (0.8, 0.1, 0.1)])
+def test_uneven_slide_split_rounding(fractions):
+    sizes = np.array([1, 7, 11, 23, 40])
+    batches = np.repeat(np.arange(len(sizes)), sizes)
+    splits = stratified_split_indices(batches, *fractions, seed=17)
+    repeated = stratified_split_indices(batches, *fractions, seed=17)
+    np.testing.assert_array_equal(np.sort(np.concatenate(list(splits.values()))),
+                                  np.arange(len(batches)))
+    train_counts = np.floor(sizes * fractions[0]).astype(int)
+    validation_counts = (sizes - train_counts if fractions[2] == 0
+                         else np.floor(sizes * fractions[1]).astype(int))
+    for name, counts in zip(('train', 'validation', 'test'),
+                            (train_counts, validation_counts, sizes - train_counts - validation_counts)):
+        np.testing.assert_array_equal(splits[name], repeated[name])
+        np.testing.assert_array_equal(np.bincount(batches[splits[name]], minlength=len(sizes)), counts)
+        assert splits[name].dtype == np.int64
+    if fractions[2] == 0:
+        assert splits['test'].size == 0
+    else:
+        # Positive test fractions preserve the exact historical RNG and row order.
+        rng = np.random.default_rng(17)
+        expected = {name: [] for name in splits}
+        for batch, n_train, n_validation in zip(range(len(sizes)), train_counts, validation_counts):
+            rows = np.flatnonzero(batches == batch)
+            rng.shuffle(rows)
+            for name, part in zip(expected, np.split(rows, [n_train, n_train + n_validation])):
+                expected[name].append(part)
+        for name, parts in expected.items():
+            rows = np.concatenate(parts)
+            rng.shuffle(rows)
+            np.testing.assert_array_equal(splits[name], rows)
+
+
 @pytest.mark.parametrize("reduction", ["mean", "sum"])
 @pytest.mark.parametrize("constant", [False, True])
 def test_normal_weighted_likelihood_and_gradients(reduction: str, constant: bool) -> None:

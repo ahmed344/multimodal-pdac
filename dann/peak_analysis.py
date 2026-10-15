@@ -157,7 +157,7 @@ def family_correlations(matrix: sparse.csr_matrix, families: np.ndarray, slides:
                         rows: np.ndarray, targets: np.ndarray, data: Mapping[str, Any],
                         block_rows: int = 4096, min_observations: int = 20,
                         progress=None) -> dict[str, np.ndarray]:
-    """Associate mean transformed family signal on saved test-lesion rows only."""
+    """Associate mean transformed family signal on selected saved lesion rows only."""
     signals = family_spatial_scores(matrix[rows], families, data, block_rows)['signal']
     # Retain slides with no selected rows in the exported schema.
     selected_slides = np.asarray(slides, dtype=str)[rows]
@@ -367,9 +367,10 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
         weights = checkpoint['model_state']['encoder.embedding.weight'].detach().cpu().numpy().astype(np.float32, copy=True)
         if len(weights) != len(features):
             raise ValueError('Checkpoint embedding/feature width mismatch.')
-        rows = np.asarray(checkpoint['split_indices']['test'], dtype=np.int64)
+        correlation_split = analysis['split']
+        rows = np.asarray(checkpoint['split_indices'][correlation_split], dtype=np.int64)
         if (rows < 0).any() or (rows >= len(frame)).any() or len(np.unique(rows)) != len(rows):
-            raise ValueError('Invalid saved test rows.')
+            raise ValueError(f'Invalid saved {correlation_split} rows.')
         lesion = frame[settings['lesion_column']].to_numpy(dtype=bool)
         rows = rows[lesion[rows]]
         targets, valid = prepare_observed_targets(frame[data['target_columns']].to_numpy(), data['target_columns'], data.get('cd8_normalization'))
@@ -380,7 +381,8 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
         common = dict(version=1, checkpoint=digest, sources=sources.copy(), identity=identity,
                       versions=versions, matrix=data['matrix_key'])
         progress.details.update(settings=settings, execution=execution, checkpoint=str(checkpoint_path),
-                                source_identity=common, cache_hits=[], test_lesion_rows=len(rows),
+                                source_identity=common, cache_hits=[], correlation_split=correlation_split,
+                                correlation_lesion_rows=len(rows),
                                 target_transform=target_contract(config),
                                 preprocessing={key: data[key] for key in
                                     ('matrix_key', 'nonzero_threshold', 'intensity_transform', 'intensity_clip_max')})
@@ -391,7 +393,8 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
         families, order = tree['families'], tree['order']
         unique = np.unique(families)
         stats_key = dict(common, statistics_version=2, lesion_column=settings['lesion_column'], lesion=fingerprint(lesion))
-        corr_key = dict(stats_key, correlation_version=2, rows=fingerprint(rows), target_transform=target_contract(config),
+        corr_key = dict(stats_key, correlation_version=2, correlation_split=correlation_split,
+                        rows=fingerprint(rows), target_transform=target_contract(config),
                         minimum=settings['min_observations'], targets=fingerprint(targets))
         family_corr_key = dict(corr_key, family_correlation_version=1, families=fingerprint(families),
             preprocessing={k: data[k] for k in ('nonzero_threshold', 'intensity_transform', 'intensity_clip_max')})

@@ -276,14 +276,20 @@ def test_gradient_reversal_only_discriminator_upstream(spatial_config, residual,
     for d in bundle.datasets.values(): d.close()
 
 
-def test_frozen_splits_and_incompatible_resume(spatial_config, tmp_path):
+@pytest.mark.parametrize('fractions', [(.6, .2, .2), (.9, .1, 0.)])
+def test_frozen_splits_and_incompatible_resume(spatial_config, tmp_path, fractions):
     c = spatial_config
+    c['data'].update(zip(('train_fraction', 'validation_fraction', 'test_fraction'), fractions))
     bundle = create_data_bundle(c)
     model = AdversarialLatentFusion.from_config(c, 2, 4)
     optimizer = torch.optim.AdamW(model.parameters())
     path = tmp_path/'checkpoint.pt'
     save_checkpoint(path, model, optimizer, 0, c, bundle, 1.)
     payload = torch.load(path, weights_only=False)
+    c['data'].update(train_fraction=.9, validation_fraction=.1, test_fraction=0.)
+    # Fraction changes must not repartition historical checkpoints on resume.
+    assert load_training_checkpoint(path, model, optimizer, torch.device('cpu'), c,
+                                    bundle.split_indices['train'])[0] == 1
     c['training']['seed'] += 21
     restored = create_data_bundle(c, payload['split_indices'], payload['data_identity'])
     for name in bundle.split_indices:

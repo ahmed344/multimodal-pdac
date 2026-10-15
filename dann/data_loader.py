@@ -140,6 +140,9 @@ def stratified_split_indices(
 ) -> dict[str, np.ndarray]:
     """Create deterministic within-batch train, validation, and test splits.
 
+    Training counts are floored per batch. With no test fraction, validation
+    receives every remaining row; otherwise test receives rounding remainders.
+
     Args:
         batch_codes (np.ndarray): Integer batch label for every observation.
         train_fraction (float): Training fraction.
@@ -167,7 +170,8 @@ def stratified_split_indices(
         rng.shuffle(batch_indices)
         n_batch = batch_indices.size
         n_train = int(np.floor(n_batch * train_fraction))
-        n_validation = int(np.floor(n_batch * validation_fraction))
+        n_validation = (n_batch - n_train if test_fraction == 0.0
+                        else int(np.floor(n_batch * validation_fraction)))
         boundaries = (n_train, n_train + n_validation)
         split_parts["train"].append(batch_indices[: boundaries[0]])
         split_parts["validation"].append(batch_indices[boundaries[0] : boundaries[1]])

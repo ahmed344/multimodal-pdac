@@ -70,13 +70,14 @@ def audit(config: dict, output: Path, checkpoint_path: Path) -> dict:
     np.testing.assert_array_equal(annotations.lesion_detection_count.to_numpy()[peaks], counts)
     np.testing.assert_allclose(annotations.lesion_intensity_sum.to_numpy()[peaks], sums, rtol=1e-12)
     np.testing.assert_allclose(annotations.lesion_prevalence_percent.to_numpy()[peaks], 100*counts/lesion.sum())
-    test = np.asarray(checkpoint['split_indices']['test'])
-    test = test[lesion[test]]
+    correlation_split = config['analysis']['split']
+    selected_rows = np.asarray(checkpoint['split_indices'][correlation_split], dtype=np.int64)
+    selected_rows = selected_rows[lesion[selected_rows]]
     correlations = pd.read_csv(peak_file(output, 'peak_slide_ihc_associations.csv'))
     reference = []
     for slide in np.unique(slides):
         for t, column in enumerate(data['target_columns']):
-            rows = test[(slides[test] == slide) & np.isfinite(observed[test, t])]
+            rows = selected_rows[(slides[selected_rows] == slide) & np.isfinite(observed[selected_rows, t])]
             for j, peak in enumerate(peaks):
                 expected = np.nan
                 if len(rows) >= config['analysis']['peaks'].get('min_observations', 20) and np.ptp(selected[rows, j]) and np.ptp(observed[rows, t]):
@@ -92,7 +93,7 @@ def audit(config: dict, output: Path, checkpoint_path: Path) -> dict:
         for j, family in enumerate(family_ids):
             valid_values = []
             for slide in np.unique(slides):
-                rows = test[(slides[test] == slide) & np.isfinite(observed[test, t])]
+                rows = selected_rows[(slides[selected_rows] == slide) & np.isfinite(observed[selected_rows, t])]
                 expected = np.nan
                 if len(rows) >= config['analysis']['peaks'].get('min_observations', 20) and np.ptp(family_selected[rows, j]) and np.ptp(observed[rows, t]):
                     expected = spearmanr(family_selected[rows, j].astype(float), observed[rows, t].astype(float)).statistic
@@ -134,6 +135,8 @@ def audit(config: dict, output: Path, checkpoint_path: Path) -> dict:
         expected = np.percentile(positive, limits['signal_percentile']) if len(positive) else 1.
         np.testing.assert_equal(limits['signal_vmax'][i], expected)
     run = json.loads((peak_file(output, 'peak_run.json')).read_text())
+    assert run['correlation_split'] == correlation_split
+    assert run['correlation_lesion_rows'] == len(selected_rows)
     from dann.heatmap_execution import validate_png
     assert run['spatial_png_count'] == len(unique)
     assert run['png_count'] == 14+2*len(unique)
@@ -169,7 +172,7 @@ def audit(config: dict, output: Path, checkpoint_path: Path) -> dict:
             expected = float(finite.max()) if len(finite) and finite.max() else 1.
         np.testing.assert_allclose(display[column]['limit'], expected, rtol=1e-12)
         assert display[column]['clipped_count'] == int((finite > expected).sum())
-    result = dict(status='passed', checked_peaks=peaks.tolist(), checked_correlations=len(reference),
+    result = dict(status='passed', correlation_split=correlation_split, checked_peaks=peaks.tolist(), checked_correlations=len(reference),
         checked_family_correlations=checked_families, sampled_tissue_rows=len(sampled), tissue_rows=len(table), actual_family_count=len(unique),
         spatial_png_count=run['spatial_png_count'], comparison_png_count=run['comparison_png_count'], png_count=run['png_count'], html_count=run['html_count'],
         run_seconds=run['total_seconds'], peak_host_gib=run['peak_host_gib'], audit_seconds=time.perf_counter()-started)

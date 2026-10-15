@@ -9,6 +9,7 @@ import pandas as pd
 from PIL import Image
 import pyarrow.parquet as pq
 import pytest
+import torch
 from scipy import sparse
 from scipy.stats import spearmanr
 
@@ -142,7 +143,24 @@ def test_pipeline_cache_exports_and_failure_cleanup(spatial_config, tmp_path, mo
     from dann import peak_analysis as peaks
     import umap
     config = peak_fixture(spatial_config)
+    config['analysis']['split'] = 'validation'
     saved = checkpoint(config, tmp_path)
+    payload = torch.load(saved, weights_only=False)
+    frame, _ = read_peak_metadata(Path(config['data']['path']), config['data'], 'Lesion')
+    from dann.targets import prepare_observed_targets
+    targets, valid = prepare_observed_targets(frame[config['data']['target_columns']].to_numpy(),
+        config['data']['target_columns'], config['data']['cd8_normalization'])
+    expected_targets = np.where(valid, targets, np.nan)
+    assert (~valid).any()
+    calls = []
+    def capture(function, row_position, target_position):
+        def wrapped(*args, **kwargs):
+            calls.append((function.__name__, args[row_position].copy(), args[target_position].copy()))
+            return function(*args, **kwargs)
+        return wrapped
+    monkeypatch.setattr(peaks, 'peak_correlations', capture(peaks.peak_correlations, 2, 3))
+    monkeypatch.setattr(peaks, 'family_correlations', capture(peaks.family_correlations, 3, 4))
+    resident_matrix = peaks.resident_matrix
     monkeypatch.setattr(umap.UMAP, 'fit_transform', lambda self, w: np.column_stack((w[:, 0], w[:, 1])))
     # Exercise real exports and numerical stages; rendering equivalence is tested separately.
     def minimal(queue, output, *args):
@@ -154,7 +172,16 @@ def test_pipeline_cache_exports_and_failure_cleanup(spatial_config, tmp_path, mo
     report = json.loads((out/'peak_run.json').read_text())
     assert report['requested_family_count'] == report['actual_family_count'] == 2
     assert report['embedding_shape'] == [5, 4]
-    assert report['test_lesion_rows'] > 0
+    assert report['correlation_split'] == 'validation'
+    rows = payload['split_indices']['validation']
+    expected_rows = rows[frame.Lesion.to_numpy()[rows]]
+    assert 0 < report['correlation_lesion_rows'] == len(expected_rows) < len(rows)
+    for name in ('peak_correlations', 'family_correlations'):
+        _, actual_rows, actual_targets = next(call for call in calls if call[0] == name)
+        np.testing.assert_array_equal(actual_rows, expected_rows)
+        np.testing.assert_array_equal(actual_targets, expected_targets)
+        assert not np.isin(actual_rows, payload['split_indices']['train']).any()
+        assert not np.isin(actual_rows, payload['split_indices']['test']).any()
     table = pq.read_table(peak_file(out, 'family_spatial_activity.parquet')).to_pandas()
     assert len(table) == 156
     assert not table.filter(like='mean_signal').iloc[0].any()
@@ -175,6 +202,21 @@ def test_pipeline_cache_exports_and_failure_cleanup(spatial_config, tmp_path, mo
     assert (out/'user_note.txt').read_text() == 'preserve'
     report = json.loads((out/'peak_run.json').read_text())
     assert set(report['cache_hits']) == {'peak-hierarchy', 'peak-statistics', 'peak-correlations', 'peak-umap', 'peak-spatial', 'family-correlations'}
+    # Changing the selected split invalidates both correlation stages only.
+    config['analysis']['split'] = 'test'
+    calls.clear()
+    monkeypatch.setattr(peaks, 'resident_matrix', resident_matrix)
+    run_peak_analysis(config, saved, execution, tmp_path/'out')
+    report = json.loads((out/'peak_run.json').read_text())
+    assert report['correlation_split'] == 'test'
+    rows = payload['split_indices']['test']
+    expected_rows = rows[frame.Lesion.to_numpy()[rows]]
+    assert report['correlation_lesion_rows'] == len(expected_rows)
+    for name in ('peak_correlations', 'family_correlations'):
+        _, actual_rows, _ = next(call for call in calls if call[0] == name)
+        np.testing.assert_array_equal(actual_rows, expected_rows)
+    assert set(report['cache_hits']) == {'peak-hierarchy', 'peak-statistics', 'peak-umap', 'peak-spatial'}
+    monkeypatch.setattr(peaks, 'resident_matrix', forbidden)
     monkeypatch.setattr(peaks, 'validate_peak_outputs', lambda *a: (_ for _ in ()).throw(ValueError('incomplete')))
     with pytest.raises(ValueError, match='incomplete'):
         run_peak_analysis(config, saved, execution, tmp_path/'out')

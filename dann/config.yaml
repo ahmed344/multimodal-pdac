@@ -19,9 +19,9 @@ data:
   cd8_normalization:
     enabled: true  # Divide CD8 density by non-tumor area; other targets are unchanged.
     min_non_tumor_fraction: 0.01  # Inclusive eligibility threshold; ratios above one also lose CD8 supervision.
-  train_fraction: 0.80  # Seeded within-slide training fraction.
-  validation_fraction: 0.10  # Withheld labels used for checkpoint selection.
-  test_fraction: 0.10  # Withheld labels reserved for final analysis; never refitted.
+  train_fraction: 0.90  # Seeded within-slide training fraction.
+  validation_fraction: 0.10  # Checkpoint selection and analysis; receives rounding remainders.
+  test_fraction: 0.00  # Empty test split retained for checkpoint compatibility.
   intensity_transform: log1p  # Transform stored MSI intensities: none, log1p, or sqrt.
   intensity_clip_max: null  # Optional upper clip after transformation; null disables clipping.
   nonzero_threshold: 0.0  # A positive threshold filters raw intensities before transformation; zero preserves original stored-entry handling.
@@ -225,7 +225,7 @@ analysis:
     feature_cache_rows: 1024
     output_rows: 16384
     density_workers: 16
-  split: test  # Saved checkpoint split used for latent/prediction analysis.
+  split: validation  # Saved checkpoint split used for latent/prediction and peak–IHC analysis.
   ziln_scatter_split: validation  # Saved held-out split used for prediction scatter and additional calibration.
   max_samples: null  # Optional stratified cap within saved splits; null uses all saved rows.
   batch_size: 4096  # Pixel-mode tissue inference batch size; spatial inference uses spatial_execution or the saved tile default.
