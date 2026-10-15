@@ -129,12 +129,12 @@ def test_ziln_umap_has_normal_and_batch_panels_without_legend(
     titles = {axis.get_title() for axis in panel_axes}
     assert "Latent UMAP by mu_Density_CD8" in titles
     assert "logit(sampled mean density): Density_CD8" in titles
-    mean_points = figure.axes[4].collections[1]
+    mean_points = figure.axes[1].collections[1]
     observed_points = figure.axes[0].collections[1]
     np.testing.assert_array_equal(mean_points.get_array(), observed_points.get_array())
     assert mean_points.get_clim() == observed_points.get_clim()
     assert len(mean_points.get_offsets()) == np.count_nonzero(densities)
-    assert len(figure.axes[4].collections[0].get_offsets()) == 2
+    assert len(figure.axes[1].collections[0].get_offsets()) == 2
     assert "Latent UMAP by batch" in titles
     assert all(axis.get_legend() is None for axis in panel_axes)
     assert all(axis.title.get_fontsize() == 14.0 for axis in panel_axes)
@@ -144,6 +144,10 @@ def test_ziln_umap_has_normal_and_batch_panels_without_legend(
     colorbar_axes = figure.axes[6:]
     assert colorbar_axes
     assert all(axis.get_ylabel() == "" for axis in colorbar_axes)
+    assert [axis.get_title() for axis in figure.axes[:6]] == [
+        'Latent UMAP by Logit_Density_CD8', 'logit(sampled mean density): Density_CD8',
+        'Latent UMAP by batch', 'Latent UMAP by 1-pi_Density_CD8',
+        'Latent UMAP by mu_Density_CD8', 'Latent UMAP by sigma_Density_CD8']
     original_close(figure)
 
 

@@ -106,6 +106,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=None, help="Rendering processes; 1 selects serial.")
     parser.add_argument("--host-budget-gib", type=float, default=None)
     parser.add_argument("--png-compress-level", type=int, default=None)
+    parser.add_argument("--cmap", default=None)
     return parser.parse_args(argv)
 
 
@@ -270,7 +271,7 @@ def plot_density_heatmap(
         heatmap_data = _positive_spatial_grid(
             adata.obs.loc[batch_mask], density, f"logit_{density}"
         )
-        im0 = axes[i, 0].imshow(heatmap_data, cmap="jet", origin="upper")
+        im0 = axes[i, 0].imshow(heatmap_data, cmap="turbo", origin="upper")
         fig.colorbar(im0, ax=axes[i, 0])
         axes[i, 0].set_ylabel(batch, fontsize=12)
 
@@ -279,7 +280,7 @@ def plot_density_heatmap(
             columns="x",
             values=f"mu_{density}",
         )
-        im1 = axes[i, 1].imshow(heatmap_data, cmap="jet", origin="upper")
+        im1 = axes[i, 1].imshow(heatmap_data, cmap="turbo", origin="upper")
         fig.colorbar(im1, ax=axes[i, 1])
 
         heatmap_data = adata.obs.loc[batch_mask].pivot(
@@ -287,7 +288,7 @@ def plot_density_heatmap(
             columns="x",
             values=f"prob_of_presence_{density}",
         )
-        im2 = axes[i, 2].imshow(heatmap_data, cmap="jet", origin="upper")
+        im2 = axes[i, 2].imshow(heatmap_data, cmap="turbo", origin="upper")
         fig.colorbar(im2, ax=axes[i, 2])
 
         heatmap_data = adata.obs.loc[batch_mask].pivot(
@@ -295,14 +296,14 @@ def plot_density_heatmap(
             columns="x",
             values=f"sigma_{density}",
         )
-        im3 = axes[i, 3].imshow(heatmap_data, cmap="jet", origin="upper")
+        im3 = axes[i, 3].imshow(heatmap_data, cmap="turbo", origin="upper")
         fig.colorbar(im3, ax=axes[i, 3])
 
         heatmap_data = _positive_spatial_grid(
             adata.obs.loc[batch_mask], mean_column, mean_logit_column
         )
         im4 = axes[i, 4].imshow(
-            heatmap_data, cmap="jet", origin="upper",
+            heatmap_data, cmap="turbo", origin="upper",
         )
         fig.colorbar(im4, ax=axes[i, 4])
         _plot_hes_context(adata, batch_mask, batch, axes[i, 5])
@@ -466,7 +467,7 @@ def plot_diagnostics_density_heatmap(
                 adata.obs.loc[batch_mask], density, column_name
             )
             image = axes[i, column_index].imshow(
-                heatmap_data, cmap="jet", origin="upper"
+                heatmap_data, cmap="turbo", origin="upper"
             )
             fig.colorbar(image, ax=axes[i, column_index])
         axes[i, 0].set_ylabel(batch, fontsize=12)
@@ -527,6 +528,7 @@ def run_spatial_heatmaps(
     workers: int = 16,
     host_budget_gib: float = 192.0,
     png_compress_level: int = 1,
+    cmap: str = "turbo",
 ) -> Path:
     """Load only plotting inputs and write tissue/lesion figures in parallel.
 
@@ -539,7 +541,7 @@ def run_spatial_heatmaps(
         Path(input_path), Path(predictions_path), Path(output_dir), densities,
         logit_epsilon, dpi, batch_column, dict(
             regions=list(regions), lesion_column=lesion_column, workers=workers,
-            host_budget_gib=host_budget_gib, png_compress_level=png_compress_level,
+            host_budget_gib=host_budget_gib, png_compress_level=png_compress_level, cmap=cmap,
         ),
     )
 

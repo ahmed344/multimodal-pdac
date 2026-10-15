@@ -596,7 +596,7 @@ def load_extracted_from_frame(
     """Rebuild the arrays ``run_calibration`` needs from a saved wide table.
 
     Accepts the schema written by ``analyze.build_latent_umap_frame``, so the
-    report can be regenerated from ``umap/latent_umap.csv`` without repeating
+    report can be regenerated from ``umap/tables/latent_umap.csv`` without repeating
     model inference.
 
     Args:
@@ -680,7 +680,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         "--input",
         type=Path,
         default=None,
-        help="Saved wide table; defaults to analysis.output_dir/umap/latent_umap.csv.",
+        help="Saved wide table; defaults to analysis.output_dir/umap/tables/latent_umap.csv.",
     )
     parser.add_argument(
         "--output-dir",
@@ -706,7 +706,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     config = load_config(args.config)
     analysis = config["analysis"]
-    input_path = args.input or Path(analysis["output_dir"]) / "umap" / "latent_umap.csv"
+    from dann.artifact_layout import analysis_file
+    input_path = args.input or analysis_file(Path(analysis["output_dir"]), "umap/latent_umap.csv")
     output_dir = args.output_dir or Path(analysis["output_dir"]) / "calibration"
     target_columns = list(config["data"]["target_columns"])
     frame = pd.read_csv(input_path)

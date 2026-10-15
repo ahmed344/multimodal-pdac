@@ -265,6 +265,7 @@ def test_partitioned_csv_bytes_match_legacy(tmp_path, block_rows):
 
 
 def test_legacy_dispatch_and_cli_overrides(monkeypatch, tmp_path):
+    monkeypatch.setattr('dann.artifact_layout.organize_analysis', lambda output: None)
     from dann import analyze
     from dann import analysis_execution
     monkeypatch.setattr(analyze, '_run_legacy_analysis', lambda *args, **kwargs: 'legacy')

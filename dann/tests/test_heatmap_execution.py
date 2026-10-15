@@ -76,15 +76,17 @@ def test_serial_parallel_identical_pngs(inputs, tmp_path):
         directory = tmp_path / f"workers-{workers}"
         run_spatial_heatmaps(*inputs, directory, [DENSITY], 1e-4, 8, workers=workers)
         directories.append(directory)
-        names = {path.name for path in directory.glob("*.png")}
+        names = {path.name for path in directory.rglob("*.png")}
         assert names == {f"spatial_heatmap_{prefix}{DENSITY}_{region}.png"
                          for prefix in ("", "diagnostics_") for region in ("tissue", "lesion")}
         assert not list(directory.glob(".heatmaps-*"))
         report = json.loads((directory / "heatmap_run.json").read_text())
         assert report["effective_workers"] == workers
+        assert report["settings"]["cmap"] == "turbo"
+        assert not list(directory.glob("*.png"))
         assert set(report["phase_seconds"]) == {"startup", "preparation", "rendering", "validation"}
-    for path in directories[0].glob("*.png"):
-        with Image.open(path) as left, Image.open(directories[1] / path.name) as right:
+    for path in directories[0].rglob("*.png"):
+        with Image.open(path) as left, Image.open(directories[1] / path.relative_to(directories[0])) as right:
             np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
@@ -239,4 +241,4 @@ def test_unused_spatial_libraries_are_not_read(inputs, tmp_path):
         handle["uns/spatial"].create_group("unused-library-without-images")
     directory = tmp_path / "unused-library"
     run_spatial_heatmaps(*inputs, directory, [DENSITY], 1e-4, 8, workers=1, regions=["tissue"])
-    assert len(list(directory.glob("*.png"))) == 2
+    assert len(list(directory.rglob("*.png"))) == 2

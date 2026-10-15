@@ -172,6 +172,24 @@ training:
   smoke_tiles_per_batch: 2  # Spatial smoke evaluation tiles; training row budget remains unchanged.
 
 analysis:
+  latent_interactive: true  # Offline sample and feature viewers from saved analysis exports.
+  peaks:
+    enabled: true
+    spatial: true
+    lesion_column: Lesion
+    block_rows: 4096
+    correlation_block_peaks: 64
+    min_observations: 20
+    umap_neighbors: 30
+    umap_min_dist: 0.30
+    umap_metric: cosine
+    umap_random_state: 20260719
+    signal_percentile: 99.0
+    sequential_cmap: turbo
+    detection_cmap: turbo
+    ihc_cmap: RdBu_r
+    ihc_percentile: 99.0
+    ihc_gamma: 0.5
   execution:
     enabled: true
     cache_policy: reuse  # reuse, refresh, or off; plot settings do not invalidate numerical stages.
@@ -192,6 +210,7 @@ analysis:
       host_budget_gib: 192.0
       vram_budget_gib: 24.0
   spatial_heatmaps:
+    cmap: turbo
     regions: [tissue, lesion]
     lesion_column: Lesion
     workers: 16
@@ -219,8 +238,8 @@ analysis:
   umap_random_state: 20260719  # UMAP reproducibility seed.
   activity_chunk_size: 5000000  # Sparse values processed per peak-activity scan chunk.
   activity_max_nonzeros: null  # Optional activity-scan cap; null scans the full labeled dataset.
-  heatmap_top_peaks: 200  # Most frequently active peaks shown in the embedding-similarity heatmap.
-  family_count: 20  # Number of hierarchical cosine peak-embedding families.
+  heatmap_top_peaks: 512  # Most frequently active peaks shown in peaks/similarity/global/.
+  family_count: 32  # Number of hierarchical cosine peak-embedding families.
   clustering_linkage: average  # Hierarchical linkage method for embedding cosine distances.
   figure_dpi: 300  # Resolution of saved analysis PNGs.
   point_size: 0.1  # Marker size in UMAP and validation scatter plots.
@@ -233,7 +252,7 @@ analysis:
 
 results:
   # All paths derive from root/<spectral>__agg-<type>__bio-<type>__disc-<type>/<run_name>/.
-  # Subdirectories: model/, analysis/, analysis/spatial/, and latent_variance/.
+  # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
   run_name: no-residual-gatv2-aggregation  # Human-readable run name; separate experiments should use separate names.

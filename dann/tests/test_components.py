@@ -42,6 +42,7 @@ def spatial_config(tmp_path):
     # Exercise the legacy path unless a test explicitly opts into execution caches.
     config['performance'] = {}
     config['analysis'].pop('spatial_execution', None)
+    config['analysis'].pop('peaks', None)  # Peak fixtures supply lesion/HES metadata separately.
     config['data'].update(path=str(tmp_path/'labels.h5ad'), context_path=str(tmp_path/'tissue.h5ad'),
                           train_fraction=.6, validation_fraction=.2, test_fraction=.2)
     # Spatial tests must not inherit editable architecture selectors from config.yaml.
@@ -57,7 +58,7 @@ def spatial_config(tmp_path):
     config['training']['pixel'].update(batch_size=12, validation_batch_size=12, num_workers=0)
     config['training']['spatial'].update(core_size=4, tiles_per_batch=2, num_workers=0)
     config['training'].update(device='cpu', pin_memory=False)
-    config['analysis'].update(num_workers=0, density_mc_samples=7)
+    config['analysis'].update(num_workers=0, density_mc_samples=7, latent_interactive=False)
     config['results']['root'] = str(tmp_path/'results')
     return resolve_execution(config)
 

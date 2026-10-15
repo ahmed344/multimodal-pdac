@@ -157,7 +157,7 @@ def prepare_grids(
     add_logit_columns(adata, [f"density_mean_{d}" for d in densities], epsilon)
     add_residual_columns(adata, densities)
     add_interval_width_columns(adata, densities)
-    manifest = {"slides": [], "contract": adata.uns.get("dann_target_transform"), "bytes": 0}
+    manifest = {"slides": [], "contract": adata.uns.get("dann_target_transform"), "bytes": 0, "cmap": settings["cmap"]}
 
     def save(name, values):
         path = directory / f"{name}.npy"
@@ -282,7 +282,7 @@ def render_task(task: tuple[str, str, str, str, int, int]) -> dict[str, Any]:
             empty = region == "lesion" and slide["crop"] is None
             for col, index in enumerate(indices):
                 values = region_grid(slide["grids"][density], slide["lesion"], slide["crop"], index, region)
-                options = dict(cmap="jet", origin="upper")
+                options = dict(cmap=data.get("cmap", "turbo"), origin="upper")
                 if diagnostic and index == 6:
                     finite = values[np.isfinite(values)]
                     limit = max(float(np.abs(finite).max()), 1e-6) if finite.size else 1.
@@ -444,8 +444,13 @@ def run_heatmaps(
             # No final PNG is touched until every requested image is complete.
             for result in results:
                 source = Path(result["path"])
-                destination = output_dir / source.name
+                region = source.stem.rsplit('_', 1)[-1]
+                destination = output_dir / region / source.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 source.replace(destination)
+                (output_dir/source.name).unlink(missing_ok=True)
+                # Retire the old unsuffixed renderer's generated counterpart.
+                (output_dir/(source.stem.rsplit('_', 1)[0]+'.png')).unlink(missing_ok=True)
                 result["path"] = str(destination)
         progress.close()
         report = dict(settings=settings, effective_workers=workers, memory_estimates=memory,

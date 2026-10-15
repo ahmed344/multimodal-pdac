@@ -10,6 +10,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
+from dann.artifact_layout import analysis_file, analysis_relative_path
 import statistics
 import time
 
@@ -172,15 +173,19 @@ def compare_exports(reference: Path, actual: Path) -> dict:
     """Compare identities/schemas exactly; expose UMAP and sampling differences."""
     import pandas as pd
     from PIL import Image
-    expected = {path.relative_to(reference) for path in reference.rglob('*')
+    expected = {analysis_relative_path(path.relative_to(reference)) for path in reference.rglob('*')
                 if path.is_file() and not any(part.startswith('.') for part in path.relative_to(reference).parts)}
-    observed = {path.relative_to(actual) for path in actual.rglob('*')
+    observed = {analysis_relative_path(path.relative_to(actual)) for path in actual.rglob('*')
                 if path.is_file() and not any(part.startswith('.') for part in path.relative_to(actual).parts)}
     assert expected == observed - {Path('analysis_execution.json')}, (expected-observed, observed-expected)
     report = dict(files=len(expected), tables={}, umap_coordinates_compared=False,
                   fp32_tolerance=dict(rtol=5e-5, atol=5e-5))
     for relative in sorted(expected):
-        a, b = reference / relative, actual / relative
+        # Canonical layout keys may correspond to legacy files in older runs.
+        a = next(path for path in reference.rglob(relative.name)
+                 if analysis_relative_path(path.relative_to(reference)) == relative)
+        b = next(path for path in actual.rglob(relative.name)
+                 if analysis_relative_path(path.relative_to(actual)) == relative)
         if relative.suffix == '.png':
             with Image.open(a) as first, Image.open(b) as second:
                 assert first.size == second.size, relative
@@ -242,7 +247,7 @@ def audit_density(reference, actual, config, progress):
         np.testing.assert_array_equal(verified, means)
         if split == main:
             columns = ['row_id', *[prefix+target for prefix in ('pi_', 'mu_', 'sigma_', 'density_mean_') for target in names]]
-            frame = pd.read_csv(reference / 'umap/latent_umap.csv', usecols=columns, float_precision='round_trip')
+            frame = pd.read_csv(analysis_file(reference, 'umap/latent_umap.csv'), usecols=columns, float_precision='round_trip')
             np.testing.assert_array_equal(frame.row_id, arrays['row_ids'])
             old_values = [frame[[prefix+target for target in names]].to_numpy(dtype='float32')
                           for prefix in ('pi_', 'mu_', 'sigma_')]
@@ -250,7 +255,7 @@ def audit_density(reference, actual, config, progress):
             np.testing.assert_array_equal(old, frame[['density_mean_'+target for target in names]].to_numpy())
             old_export, new_export = old, means
         else:
-            frame = pd.read_csv(reference / 'ziln_density_scatter.csv', float_precision='round_trip')
+            frame = pd.read_csv(analysis_file(reference, 'ziln_density_scatter.csv'), float_precision='round_trip')
             lookup = np.full(int(arrays['row_ids'].max())+1, -1, dtype=np.int64)
             lookup[arrays['row_ids']] = np.arange(len(means))
             rows = lookup[frame.row_id.to_numpy()]

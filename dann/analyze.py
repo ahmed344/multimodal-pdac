@@ -66,6 +66,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Apply the same small-data settings as training --smoke-test.",
     )
     parser.add_argument('--output-dir', type=Path, help='Redirect every analysis artifact, including loss curves.')
+    parser.add_argument('--peaks-only', action='store_true', help='Analyze peak embeddings and measured family activity without inference.')
+    parser.add_argument('--peak-spatial-input', type=Path, help='Override data.context_path for measured family maps.')
     parser.add_argument('--cache-policy', choices=('reuse', 'refresh', 'off'))
     return parser.parse_args(argv)
 
@@ -794,9 +796,9 @@ def plot_latent_umap_ziln_per_target(
     plot_logit_panel(axes[0][0], densities, f"Latent UMAP by Logit_{target_column}")
 
     parameter_panels = (
-        (axes[0][1], 1.0 - pi, f"1-pi_{target_column}", cmap),
-        (axes[0][2], mu, f"mu_{target_column}", cmap),
-        (axes[1][0], sigma, f"sigma_{target_column}", cmap),
+        (axes[1][0], 1.0 - pi, f"1-pi_{target_column}", cmap),
+        (axes[1][1], mu, f"mu_{target_column}", cmap),
+        (axes[1][2], sigma, f"sigma_{target_column}", cmap),
     )
     for axis, values, label, panel_cmap in parameter_panels:
         vmin, vmax = _robust_color_limits(values, lower_percentile, upper_percentile)
@@ -814,10 +816,10 @@ def plot_latent_umap_ziln_per_target(
         figure.colorbar(scatter, ax=axis)
 
     plot_logit_panel(
-        axes[1][1], density_mean, f"logit(sampled mean density): {target_column}"
+        axes[0][1], density_mean, f"logit(sampled mean density): {target_column}"
     )
 
-    batch_axis = axes[1][2]
+    batch_axis = axes[0][2]
     batch_colors = _categorical_batch_colors(len(batch_names))
     for batch_id in range(len(batch_names)):
         mask = batches == batch_id
@@ -987,57 +989,6 @@ def plot_latent_umap_ziln_diagnostics_per_target(
     plt.close(figure)
 
 
-def plot_similarity_heatmap(
-    similarity: np.ndarray,
-    activity: np.ndarray,
-    hierarchy_order: np.ndarray,
-    mz_values: np.ndarray,
-    output_path: Path,
-    config: Mapping[str, Any],
-) -> np.ndarray:
-    """Plot clustered embedding cosine similarity for the most active peaks.
-
-    Args:
-        similarity (np.ndarray): Full all-peak cosine similarity matrix.
-        activity (np.ndarray): Peak occurrence counts.
-        hierarchy_order (np.ndarray): Global hierarchical leaf ordering.
-        mz_values (np.ndarray): Numeric m/z values.
-        output_path (Path): Destination PNG path.
-        config (Mapping[str, Any]): Analysis settings.
-
-    Returns:
-        np.ndarray: Ordered peak indices displayed in the heatmap.
-    """
-
-    top_count = min(int(config["heatmap_top_peaks"]), activity.size)
-    active = np.argpartition(activity, -top_count)[-top_count:]
-    rank = np.empty(hierarchy_order.size, dtype=np.int64)
-    rank[hierarchy_order] = np.arange(hierarchy_order.size)
-    ordered = active[np.argsort(rank[active])]
-    subset = similarity[np.ix_(ordered, ordered)]
-    figure, axis = plt.subplots(figsize=(12, 10), constrained_layout=True)
-    sns.heatmap(
-        subset,
-        ax=axis,
-        cmap="vlag",
-        center=0.0,
-        vmin=-1.0,
-        vmax=1.0,
-        xticklabels=False,
-        yticklabels=False,
-        cbar_kws={"label": "Cosine similarity"},
-    )
-    axis.set_title(f"Learned peptide similarity: {top_count} most active m/z bins")
-    axis.set_xlabel(
-        f"Hierarchically ordered peaks ({mz_values[ordered].min():.1f}–"
-        f"{mz_values[ordered].max():.1f} m/z)"
-    )
-    axis.set_ylabel("Peaks")
-    figure.savefig(output_path, dpi=int(config["figure_dpi"]))
-    plt.close(figure)
-    return ordered
-
-
 def plot_loss_curves(
     history_path: Path,
     output_path: Path,
@@ -1179,17 +1130,36 @@ def plot_ziln_density_scatter(
 
 def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None,
                  *, execution_overrides: Mapping[str, Any] | None = None,
-                 output_override: Path | None = None) -> Path:
+                 output_override: Path | None = None, peaks_only: bool = False,
+                 peak_spatial_input: Path | None = None) -> Path:
     """Analyze a checkpoint with optional execution-only and destination overrides."""
     from dann.config import analysis_execution_settings
     settings = analysis_execution_settings(config['analysis'].get('execution'))
     if execution_overrides is not None:
         settings = analysis_execution_settings({**settings, **execution_overrides,
             'performance': {**settings['performance'], **execution_overrides.get('performance', {})}})
+    from dann.config import peak_analysis_settings
+    peaks = peak_analysis_settings(config['analysis'].get('peaks'))
+    if peaks_only:
+        from dann.peak_analysis import run_peak_analysis
+        output = run_peak_analysis(config, checkpoint_override, settings, output_override, peak_spatial_input).parent
+        from dann.artifact_layout import remove_retired_similarity_heatmap
+        remove_retired_similarity_heatmap(output)
+        return output
     if settings['enabled']:
         from dann.analysis_execution import run_optimized_analysis
-        return run_optimized_analysis(config, checkpoint_override, settings, output_override)
-    return _run_legacy_analysis(config, checkpoint_override, output_override=output_override)
+        output = run_optimized_analysis(config, checkpoint_override, settings, output_override)
+    else:
+        output = _run_legacy_analysis(config, checkpoint_override, output_override=output_override)
+    from dann.artifact_layout import organize_analysis
+    organize_analysis(output)
+    if config['analysis'].get('latent_interactive', False):
+        from dann.latent_analysis import run_latent_analysis
+        run_latent_analysis(config, output)
+    if peaks["enabled"]:
+        from dann.peak_analysis import run_peak_analysis
+        run_peak_analysis(config, checkpoint_override, settings, output, peak_spatial_input)
+    return output
 
 
 def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | None,
@@ -1389,14 +1359,9 @@ def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | 
         int(config["analysis"]["activity_chunk_size"]),
         config["analysis"].get("activity_max_nonzeros"),
     )
-    displayed = plot_similarity_heatmap(
-        similarity,
-        activity,
-        hierarchy_order,
-        bundle.metadata.mz_values,
-        output_dir / "peptide_similarity_heatmap.png",
-        config["analysis"],
-    )
+    # Preserve the exported top-peak membership used by peaks/similarity/.
+    top_count = min(int(config["analysis"]["heatmap_top_peaks"]), activity.size)
+    displayed = np.argpartition(activity, -top_count)[-top_count:]
     family_table = pd.DataFrame(
         {
             "peak_index": np.arange(bundle.metadata.num_peaks),
@@ -1453,7 +1418,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = apply_smoke_overrides(config)
     overrides = {'cache_policy': args.cache_policy} if args.cache_policy is not None else None
     output_dir = run_analysis(config, args.checkpoint, execution_overrides=overrides,
-                             output_override=args.output_dir)
+                             output_override=args.output_dir, peaks_only=args.peaks_only,
+                             peak_spatial_input=args.peak_spatial_input)
     print(f"Analysis written to {output_dir}", flush=True)
     return 0
 

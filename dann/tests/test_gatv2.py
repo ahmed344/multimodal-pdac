@@ -243,7 +243,7 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     assert (Path(c['latent_variance']['output_dir'])/'explained_variance.png').is_file()
     heatmaps = run_spatial_heatmaps(input_path, predictions, tmp_path/'heatmaps',
                                    c['data']['target_columns'], c['loss']['logit_epsilon'], 20, workers=1)
-    assert len(list(heatmaps.glob('*.png'))) == 16
+    assert len(list(heatmaps.rglob('*.png'))) == 16
     assert not list(predictions.parent.glob('.dann-stage-*'))
 
 

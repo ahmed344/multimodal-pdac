@@ -263,7 +263,7 @@ data/PDAC/Results/dann/<combination>/<run_name>/
     model/
     analysis/
     analysis/spatial/
-    latent_variance/
+    analysis/latent_variance/
 ```
 
 The default run is
@@ -335,7 +335,7 @@ python -m dann.latent_variance --latents /path/to/spatial_latent.parquet \
 
 This independent script does not run inference or require a checkpoint/GPU.
 Settings live in `latent_variance` in the YAML. Defaults write to
-`<run-root>/latent_variance/`, separately from analysis:
+`<run-root>/analysis/latent_variance/`:
 
 - `explained_variance.png`: stacked per-PC (logarithmic y-axis) and cumulative
   explained variance, with 90%, 99%, 99.9%, 99.99%, and 99.999% thresholds marked.
@@ -557,22 +557,21 @@ under `analysis/` (UMAP exports in `analysis/umap/`):
 
 `analysis/umap/`:
 
-- `latent_umap_batch.png`
-- `latent_umap_densities.png`
-- `latent_umap_densities_logit.png`
-- `latent_umap_density_means.png` (logit of sampled density means for every target)
-- `latent_umap_ziln_Density_*.png` (one 2x3 Logit/1-pi/mu/sigma/sampled-mean/batch figure per target)
-- `latent_umap_ziln_diagnostics_Density_*.png` (one 2x3 Logit/logit_mean/presence/residual/interval-width/batch figure per target, masked to observed positives)
-- `latent_umap.csv`
+- `overview/latent_umap_batch.png`
+- `overview/latent_umap_densities.png`
+- `overview/latent_umap_densities_logit.png`
+- `overview/latent_umap_density_means.png` (logit of sampled density means for every target)
+- `parameters/latent_umap_ziln_Density_*.png` (top: logit/sampled-mean/batch; bottom: 1-pi/mu/sigma)
+- `diagnostics/latent_umap_ziln_diagnostics_Density_*.png` (one 2x3 Logit/logit_mean/presence/residual/interval-width/batch figure per target, masked to observed positives)
+- `tables/latent_umap.csv`
 
 `analysis/` (non-UMAP):
 
-- `peptide_similarity_heatmap.png`
-- `ziln_density_scatter.png`
-- `latent_embeddings.csv`
-- `ziln_density_scatter.csv`
-- `peptide_families.csv`
-- `embedding_cosine_similarity.npy`
+- `density/ziln_density_scatter.png`
+- `tables/latent_embeddings.csv`
+- `tables/ziln_density_scatter.csv`
+- `similarity/peptide_families.csv`
+- `similarity/embedding_cosine_similarity.npy`
 
 `analysis/calibration/` (test metrics; validation reports in `validation/`):
 
@@ -585,8 +584,8 @@ under `analysis/` (UMAP exports in `analysis/umap/`):
 - `spatial_predictions.parquet` (ordered mu/presence/sigma plus the derived
   logit_mean/logit_sd/logit_median/logit_q05/logit_q95 summaries and density_mean)
 - `spatial_latent.parquet` (ordered full latent vectors)
-- `heatmaps/spatial_heatmap_Density_*_{tissue,lesion}.png` (6-column parameter/sampled-mean/HES figures)
-- `heatmaps/spatial_heatmap_diagnostics_Density_*_{tissue,lesion}.png` (5-column diagnostic figures)
+- `heatmaps/{tissue,lesion}/spatial_heatmap_Density_*_{tissue,lesion}.png` (6-column parameter/sampled-mean/HES figures)
+- `heatmaps/{tissue,lesion}/spatial_heatmap_diagnostics_Density_*_{tissue,lesion}.png` (5-column diagnostic figures)
 
 ## Predictions versus parameters
 
@@ -1585,9 +1584,12 @@ implementation/configuration and source hashes.
 and lesion views from the existing spatial prediction Parquet. Four targets
 produce 16 PNGs: `spatial_heatmap_<density>_{tissue,lesion}.png` and
 `spatial_heatmap_diagnostics_<density>_{tissue,lesion}.png`. Existing unsuffixed
-figures are left intact. No inference or density resampling is performed.
+figures and replaced flat copies are removed after successful validation. Outputs
+are grouped into `heatmaps/tissue/` and `heatmaps/lesion/`. No inference or density
+resampling is performed.
 
-Tissue views retain the existing grid, masks, colors, and HES orientation. Lesion
+Tissue views retain the existing grid, masks, and HES orientation. Sequential
+IHC spatial panels use `turbo`; signed residual panels retain their diverging scale. Lesion
 views use the boolean `Lesion` observation column, zoom each slide to its lesion
 bounds, and calculate each panel's color limits from visible lesion values.
 Non-lesion pixels and holes remain gray inside the crop. The HES image is cropped
@@ -1613,7 +1615,7 @@ validated. Publication uses individual atomic file replacements, not an atomic
 transaction across the entire set.
 
 `analysis.spatial_heatmaps` controls `regions`, `lesion_column`, `workers`,
-`host_budget_gib`, and `png_compress_level`. Explicit CLI options override YAML;
+`host_budget_gib`, `png_compress_level`, and `cmap` (default `turbo`). Explicit CLI options override YAML;
 Python callers may pass the same settings as keyword-only arguments to
 `run_spatial_heatmaps`. One worker uses the identical renderer serially.
 
@@ -1708,3 +1710,215 @@ worker/initializer failures, cleanup, budgets, and CLI precedence.
 `source_sha256.json` under the benchmark directory retain the verification
 results, software versions, measurements, and final source hashes. `final_source/`
 contains the implemented source/config snapshot.
+
+### Peak families and measured spatial activity
+
+The project configuration enables `analysis.peaks` and requests **32** families.
+The stage interprets the saved Deep Sets embedding dictionary without retraining.
+To run it without latent inference or Monte Carlo prediction sampling:
+
+```bash
+python -m dann.analyze --config dann/config.yaml --peaks-only
+python -m dann.analyze --config dann/config.yaml --peaks-only \
+  --peak-spatial-input data/PDAC/Raw/adata_assembled_tissue.h5ad \
+  --output-dir data/peak-review --cache-policy reuse
+```
+
+Normal analysis also runs this stage after its existing outputs. Configurations
+without `analysis.peaks` retain their previous behavior; `--peaks-only` explicitly
+requests the stage regardless of `enabled`. `spatial: false` omits tissue exports.
+The existing `analysis.execution.render_workers` and
+`analysis.execution.performance.host_budget_gib` govern execution (the project
+uses 16 workers and 192 GiB). Peak statistics and scores ignore smoke sample caps:
+statistics always cover all labeled lesion pixels, and spatial scores always
+cover the supplied full tissue input.
+
+Outputs live in `analysis/peaks/`:
+
+- `peak_embeddings.csv` contains peak identity and every FP32 embedding coordinate,
+  with enough decimal precision for exact FP32 round-tripping.
+- `peak_annotations.csv`, `peak_slide_statistics.csv`, and
+  `peak_slide_ihc_associations.csv` provide lesion statistics and associations.
+  Missing correlations remain NaN; contributing slide counts are exported.
+- `family_membership.csv`, `family_sizes.csv`, `peak_linkage.npy`, and
+  `peak_order.npy` preserve the average-linkage cosine hierarchy and `maxclust`
+  cut. `peak_run.json` records both requested and actual counts (ties may give
+  fewer families). Family colors are shared across tables and figures.
+- `peak_umap.csv` stores the single cosine UMAP used by every color variant
+  (30 neighbors, minimum distance 0.30, seed 20260719). PNG panels and standalone
+  offline HTML include family, m/z, prevalence, detected intensity, embedding norm,
+  held-out IHC associations, and slide prevalence. HTML includes a color/slide
+  selector. Prevalence-versus-intensity plots use a logarithmic intensity axis;
+  never-detected peaks remain in tables and their plot exclusion count is reported.
+- Heatmaps include every embedding coordinate, the full cosine overview, the
+  original top-frequency selection with its pruned original dendrogram, every
+  complete family matrix (also in zoomable offline HTML), family mean pairwise
+  similarity, and batch prevalence. Family-summary diagonals exclude self pairs;
+  singleton diagonals are missing. Global PNGs omit m/z ticks; family PNGs retain spaced m/z labels. Every matrix retains all selected members.
+- `family_spatial_activity.parquet` preserves original row positions, observation
+  names, slide/coordinates, lesion flags, and FP32 mean signal and detection
+  percentage for every family. `family_spatial_settings.json` records common limits.
+  `family_01_spatial.png` contains all slides as rows and six columns: tissue
+  signal/detection/HES and lesion signal/detection/HES. Each canvas is 36 inches
+  wide and 4 inches per slide at the configured 300 DPI. At 43 slides and 32
+  families, there are 32 family spatial PNGs plus two CD8 comparison PNGs,
+  78 total PNGs, and 36 offline HTML files.
+- UMAP and prevalence–intensity each produce three PNGs: all slides in six
+  columns, four IHC targets in 2×2 panels, and five other annotations in 2×3 panels.
+  Sequential colors use `turbo`; detection remains linear from 0–100%.
+- `ihc_display_settings.json` records per-target symmetric limits at the 99th
+  percentile of absolute finite peak correlations, `RdBu_r`, and signed square-root
+  coloring. These limits are shared across every view and strip. Colorbar ticks
+  and hover show original correlations, with clipped tails indicated. Missing or
+  all-zero targets use ±1. CSV exports retain unmodified correlations.
+- `full_similarity.html` stores the symmetric FP32 upper triangle once (about
+  86 MiB of base64 for 5,808 peaks). Its bounded 800×800 overview samples cell
+  centers and redraws on zoom; hover reads the exact original cells. Matrix,
+  annotation strips, and original dendrogram share one row viewport. The top-512
+  and family viewers use offline Plotly with vertically rotated strip headings;
+  top-512 retains the pruned original tree. Global full/top PNGs also show trees.
+- `family_slide_ihc_associations.csv` and `family_ihc_associations.csv` contain
+  associations of mean transformed family signal, including valid observation
+  and contributing-slide counts. `peak_family_ihc_correlations.png` compares
+  lightly jittered individual peak dots with outlined family-signal diamonds in
+  four target panels. Family colors remain consistent and correlation axes linear.
+
+Statistics count distinct positive peaks after sparse duplicate entries are summed.
+Prevalence uses all lesion pixels, including empty spectra; detected intensity is
+the positive raw intensity sum divided by detections. The top-frequency heatmap
+retains the older selection based on stored occurrences across all labeled rows.
+Associations use only saved checkpoint test rows intersected with `Lesion=True`.
+They compute within-slide Spearman correlations including absent peaks as zero,
+require at least 20 valid observations and nonconstant inputs, and average valid
+slide correlations with equal weight. Frozen target transformations and masks are
+applied, including explicitly labeled normalized CD8. Family correlations use mean
+transformed family signal from labeled spectra on those same saved rows, with a
+separate numerical cache. Plotting options never invalidate numerical stages.
+These are associations on
+held-out pixels, not held-out patients or evidence of causality.
+
+Spatial scores sum transformed measured intensities over family members, divided
+by total family size. Positivity and the saved raw threshold determine detection;
+the saved intensity transform and clipping determine signal. Duplicates are
+coalesced before thresholding and transformation. All-zero spectra remain valid
+zero-valued pixels, while missing tissue and lesion holes remain blank. Lesion
+views mask and crop the exact same tissue scores. Detection uses 0–100% everywhere;
+signal uses zero to the family's positive-score 99th percentile over all tissue
+rows, with saturation labeled. All-zero families use 0–1. Exports retain uncapped
+scores. Feature identities and ordering must exactly match the checkpoint.
+
+Numerical caches are separate from rendering and bind the checkpoint, source file
+identities, feature order, test rows, preprocessing, and annotation settings.
+Resident CSR arrays and bounded blocks avoid a dense pixels-by-peaks matrix;
+family sums accumulate in float64 before FP32 storage. Figures use shared immutable
+mmap arrays and a single bounded worker pool. The requested 16 workers are reduced
+when actual tall canvases and encoding buffers would exceed the 192 GiB budget.
+The legacy `slides_per_page` setting is accepted but no longer paginates. Outputs are staged and validated
+before publication; failures clean up invocation-owned temporary files.
+`peak_run.json` records cache reuse, effective settings, phase times, parent-plus-
+worker peak RSS, artifact names, and exclusion counts. Progress prints every five
+seconds, including during long computations and rendering.
+
+After a complete real-data run, an independent reference audit is available:
+
+```bash
+python -m dann.verification.peak_analysis_audit --config dann/config.yaml
+```
+
+It checks selected peaks over every labeled row, all corresponding slide/target
+Spearman associations, sampled tissue spectra, all family display percentiles,
+family-signal correlations, exact output counts, and spatial canvas dimensions. Its results and the measured run time/memory are saved
+in `analysis/peaks/peak_audit.json`.
+
+For browser verification with Playwright and Chromium installed, run:
+
+```bash
+python -m dann.verification.peak_browser_audit --output-dir path/to/analysis/peaks
+```
+
+The audit opens all HTML files with network access disabled, checks exact matrix
+and annotation values, and exercises zoom alignment and selectors. It writes
+`peak_browser_audit.json`; optional `--screenshots` saves browser previews outside
+the peak output directory.
+
+
+### Organized figure outputs
+
+Peak outputs are grouped under `analysis/peaks/`:
+
+- `spatial/families/`: one six-column tissue/lesion figure per family.
+- `spatial/cd8_comparison/`: `cd8_families_tissue.png` and `cd8_families_lesion.png`.
+  Each has one row per slide and 33 columns: observed checkpoint-normalized CD8
+  density followed by mean signal from all 32 families. All columns use `turbo`.
+  Overview PNGs are capped at an 8,000-pixel longest edge. Companion offline HTML
+  viewers load lossless native-grid panels only near the visible viewport; keep
+  each HTML file beside its `_assets` directory when copying the outputs.
+  CD8 uses a linear zero-to-positive-P99 density scale; family signals reuse their
+  established tissue limits. Each column shares its scale across slides and regions.
+  Missing observations, physical holes, valid zeros, and empty lesions are preserved.
+  The overviews and detail panels run in a separate memory-budgeted render queue.
+- `umap/`, `prevalence_intensity/`, and `correlations/`: consolidated figures.
+- `similarity/global/` and `similarity/families/`: PNG and offline HTML matrices.
+- `tables/`, `hierarchy/`, `settings/`, and `reports/`: numerical exports, saved
+  ordering, display settings, and audits. `peak_run.json` remains at the peak root.
+
+Latent UMAP figures live in `analysis/umap/overview/`, `parameters/`, and
+`diagnostics/`; the saved UMAP table is in `umap/tables/`. The six parameter
+panels are **logit | sampled mean | batch** above **1-pi | mu | sigma**. Reordering
+uses the same saved values and coordinates. Other recognized analysis artifacts
+are grouped into `tables/`, `similarity/`, `density/`, and split-specific
+`diagnostics/` directories. Generated flat copies are moved or replaced, while
+unrecognized files and numerical caches are preserved.
+
+
+### Offline latent explorers and number formatting
+
+`analysis.latent_interactive: true` generates five viewers under `analysis/latent/`:
+`sample_umap.html`, `latent_ihc_scatter.html`, `prediction_scatter.html`,
+`feature_correlations.html`, and `feature_umap.html`. Open these directly from
+disk; retain the accompanying `assets/` directory. Sample UMAP coordinates and
+all saved samples are preserved. Feature columns load on demand, with at most
+twelve columns retained in the browser cache. Prediction scatter uses the
+configured scatter split; sample UMAP and latent–IHC scatter use the analysis split.
+
+Regenerate these viewers without model inference:
+
+```bash
+python -m dann.latent_analysis --config dann/config.yaml
+```
+
+Feature correlations use saved analysis rows intersected with lesions, FP64
+Spearman ranks, at least 20 observations, and equal weighting across valid slides.
+IHC masks and normalized target values come from the saved export. The new
+`latent-feature-associations` and `latent-feature-umap` caches are independent of
+existing peak and inference caches. Undefined correlations remain missing;
+layout alone uses neutral distance 1 for undefined pairs. Constant features stay
+in the heatmap and are reported as unavailable for feature UMAP.
+
+HTML displays integer identifiers/counts without decimals, m/z with four decimals,
+and other values with two decimals at absolute values ≥1, three at 0.01–1, and
+four below 0.01. Values below 0.0001 use scientific notation. Raw embedded values
+and exported numerical tables retain their precision.
+
+Recognized legacy variance files migrate into `analysis/latent_variance/` without
+recomputation. Conflicting destination contents stop migration; unrelated files
+remain untouched. Explicit standalone `--output-dir` overrides remain supported.
+
+### Repeat analysis for existing checkpoints
+
+`python -m dann.verification.rerun_analysis --roots COMBINATION_DIRECTORY ...
+--archive-root data/temp` discovers each immediate run's `model/best.pt`, validates
+all destinations, and moves old `analysis/` and sibling `latent_variance/` trees
+into a timestamped archive. It preserves `model/` byte-for-byte and never trains.
+Fresh outputs use current analysis settings with each checkpoint's frozen model,
+preprocessing, target contract, and saved splits.
+
+The runner executes analysis, spatial inference, spatial heatmaps, latent variance,
+and numerical/browser audits sequentially. Browser audits require Playwright and
+Chromium in the calling environment. Configurations, logs, stage timings, sampled
+process-tree memory peaks, and a summary live in the archive's `batch_records/`
+and manifest. Resume with `python -m dann.verification.rerun_analysis --resume
+ARCHIVE_DIRECTORY`; completed stages are skipped only when their recorded files,
+configuration, inputs, and training artifacts remain unchanged. Archived caches
+are never reused. A failed stage skips that run's dependent stages and allows
+the remaining runs to proceed.

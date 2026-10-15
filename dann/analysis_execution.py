@@ -369,7 +369,14 @@ class RenderQueue:
         # Imports, Agg canvases and temporary plotting arrays dominate worker RAM.
         largest = max((value.nbytes for value, _ in self.arrays.values()), default=0)
         per_worker = max(2 * 2**30, 2**30 + 4*self.canvas_bytes + 3*largest)
-        check_host_budget(performance, min(workers, len(self.tasks)) * per_worker)
+        import psutil
+        available = min(performance['host_budget_gib'] * 2**30 - psutil.Process().memory_info().rss,
+                        psutil.virtual_memory().available)
+        requested = workers
+        workers = min(workers, max(1, len(self.tasks)), max(1, int(available // per_worker)))
+        progress.details.update(requested_render_workers=requested, effective_render_workers=workers,
+                                render_worker_budget_bytes=per_worker, render_canvas_bytes=self.canvas_bytes)
+        check_host_budget(performance, workers * per_worker)
         import matplotlib
         colormaps = {name: (cmap(np.arange(cmap.N)).tolist(), cmap.get_bad().tolist(),
                            cmap.get_under().tolist(), cmap.get_over().tolist())
@@ -434,8 +441,11 @@ def validate_outputs(directory: Path, *, expected_rows: Mapping[Path, int] | Non
         if path.stat().st_size == 0:
             raise ValueError(f'Empty analysis output: {path}')
         if path.suffix == '.png':
-            with Image.open(path) as picture:
-                picture.verify()
+            from dann.heatmap_execution import validate_png
+            validate_png(path)
+        elif path.suffix == '.webp':
+            with Image.open(path) as image:
+                image.load()
         elif path.suffix == '.csv':
             rows = sum(len(frame) for frame in pd.read_csv(path, chunksize=16384))
             if expected_rows and path in expected_rows and rows != expected_rows[path]:
@@ -506,12 +516,10 @@ def write_artifacts(config, checkpoint_path, epoch, metadata, extracted, scatter
     render(a.plot_ziln_density_scatter, scatter_data['mu'], scatter_data['targets'], labels,
            epsilon, output / 'ziln_density_scatter.png', analysis)
 
-    similarity, families, order = [peptides[name] for name in ('similarity', 'families', 'order')]
+    similarity, families = [peptides[name] for name in ('similarity', 'families')]
     counts, sums = activity['counts'], activity['sums']
     np.save(output / 'embedding_cosine_similarity.npy', similarity)
-    render(a.plot_similarity_heatmap, similarity, counts, order, metadata.mz_values,
-           output / 'peptide_similarity_heatmap.png', analysis)
-    # Use the same argpartition tie behavior as plot_similarity_heatmap.
+    # Preserve top-peak membership for the consolidated peaks/similarity/ views.
     count = min(int(analysis['heatmap_top_peaks']), counts.size)
     displayed = np.argpartition(counts, -count)[-count:]
     pd.DataFrame(dict(peak_index=np.arange(metadata.num_peaks), mz=metadata.mz_values,

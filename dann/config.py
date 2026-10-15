@@ -33,7 +33,7 @@ def latent_variance_settings(settings: Mapping[str, Any] | None = None) -> dict[
     defaults = {
         "input": f"{root}/Raw/adata_assembled_tissue.h5ad",
         "latents": f"{root}/Results/dann/analysis/spatial/spatial_latent.parquet",
-        "output_dir": f"{root}/Results/dann/latent_variance",
+        "output_dir": f"{root}/Results/dann/analysis/latent_variance",
         "slide_column": "batch",
         "chunk_size": 8192,
         "figure_dpi": 300,
@@ -84,9 +84,18 @@ def load_config(path: Path) -> dict[str, Any]:
         or max_samples <= 0
     ):
         raise ValueError("analysis.max_samples must be null or a positive integer.")
+    if not isinstance(config['analysis'].get('latent_interactive', False), bool):
+        raise ValueError('analysis.latent_interactive must be a boolean.')
     spatial_execution_settings(config["analysis"].get("spatial_execution"))
     analysis_execution_settings(config['analysis'].get('execution'))
     spatial_heatmap_settings(config["analysis"].get("spatial_heatmaps"))
+    peak_analysis_settings(config["analysis"].get("peaks"))
+    if "peaks" in config["analysis"]:
+        count = config["analysis"].get("family_count")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError("analysis.family_count must be a positive integer.")
+        if config["analysis"].get("clustering_linkage") != "average":
+            raise ValueError("Peak analysis requires average cosine linkage.")
     count, seed = density_sampling_settings(config["analysis"])
     config["analysis"].update(density_mc_samples=count, density_mc_seed=seed)
     config["latent_variance"] = latent_variance_settings(config.get("latent_variance"))
@@ -311,7 +320,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
                              "latents": str(root / "analysis/spatial/spatial_latent.parquet")}
         config.setdefault("latent_variance", {}).update(
             input=config["data"].get("context_path"),
-            latents=config["spatial"]["latents"], output_dir=str(root / "latent_variance"))
+            latents=config["spatial"]["latents"], output_dir=str(root / "analysis/latent_variance"))
         result["run_dir"] = str(root)
     return config
 
@@ -422,7 +431,7 @@ def spatial_execution_settings(supplied: Mapping[str, Any] | None = None) -> dic
 
 SPATIAL_HEATMAP_DEFAULTS = dict(
     regions=["tissue", "lesion"], lesion_column="Lesion", workers=16,
-    host_budget_gib=192.0, png_compress_level=1,
+    host_budget_gib=192.0, png_compress_level=1, cmap="turbo",
 )
 
 
@@ -446,7 +455,53 @@ def spatial_heatmap_settings(supplied: Mapping[str, Any] | None = None) -> dict[
         if (isinstance(value, bool) or not isinstance(value, int) or value < minimum
                 or (maximum is not None and value > maximum)):
             raise ValueError(f"Invalid spatial_heatmaps.{key}.")
+    from matplotlib import colormaps
+    if not isinstance(settings['cmap'], str) or settings['cmap'] not in colormaps:
+        raise ValueError('spatial_heatmaps.cmap must name a registered colormap.')
     budget = settings["host_budget_gib"]
     if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not np.isfinite(budget) or budget <= 0:
         raise ValueError("spatial_heatmaps.host_budget_gib must be finite and positive.")
+    return settings
+
+
+PEAK_ANALYSIS_DEFAULTS = dict(
+    enabled=False, spatial=True, lesion_column="Lesion", block_rows=4096,
+    correlation_block_peaks=64, min_observations=20, umap_neighbors=30,
+    umap_min_dist=0.30, umap_metric="cosine", umap_random_state=20260719,
+    signal_percentile=99.0, slides_per_page=6,  # Accepted legacy field; no pagination.
+    sequential_cmap="turbo", detection_cmap="turbo", ihc_cmap="RdBu_r",
+    ihc_percentile=99.0, ihc_gamma=0.5,
+)
+
+
+def peak_analysis_settings(supplied: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate optional peak interpretation settings; old configurations opt out."""
+    if supplied is not None and not isinstance(supplied, Mapping):
+        raise ValueError("analysis.peaks must be a mapping.")
+    settings = {**PEAK_ANALYSIS_DEFAULTS, **(supplied or {})}
+    if set(settings) != set(PEAK_ANALYSIS_DEFAULTS):
+        raise ValueError("Unknown analysis.peaks setting.")
+    for key in ("enabled", "spatial"):
+        if not isinstance(settings[key], bool):
+            raise ValueError(f"analysis.peaks.{key} must be boolean.")
+    for key in ("block_rows", "correlation_block_peaks", "min_observations", "umap_neighbors",
+                "umap_random_state", "slides_per_page"):
+        minimum = 0 if key == "umap_random_state" else 2 if key in ("min_observations", "umap_neighbors") else 1
+        if isinstance(settings[key], bool) or not isinstance(settings[key], int) or settings[key] < minimum:
+            raise ValueError(f"Invalid analysis.peaks.{key}.")
+    for key, low, high in (("umap_min_dist", 0, 1), ("signal_percentile", 0, 100),
+                           ("ihc_percentile", 0, 100), ("ihc_gamma", 0, 1)):
+        value = settings[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or not low <= value <= high:
+            raise ValueError(f"Invalid analysis.peaks.{key}.")
+    from matplotlib import colormaps
+    for key in ('sequential_cmap', 'detection_cmap', 'ihc_cmap'):
+        if not isinstance(settings[key], str) or settings[key] not in colormaps:
+            raise ValueError(f'Invalid analysis.peaks.{key}.')
+    if settings['ihc_percentile'] == 0 or settings['ihc_gamma'] == 0:
+        raise ValueError('IHC percentile and gamma must be positive.')
+    if settings['signal_percentile'] == 0 or settings['umap_metric'] != 'cosine':
+        raise ValueError("Peak UMAP requires cosine distance and a positive signal percentile.")
+    if not isinstance(settings['lesion_column'], str) or not settings['lesion_column'].strip():
+        raise ValueError("analysis.peaks.lesion_column must be nonempty.")
     return settings
