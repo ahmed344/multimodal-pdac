@@ -1088,6 +1088,9 @@ def _run_inference(
             "density_mc_samples": mc_samples, "density_mc_seed": mc_seed,
             "source_identity": _file_identity(input_path),
             "checkpoint_identity": _file_identity(checkpoint_path),
+            # Renaming keeps the stat identity; bind each export to this invocation.
+            "prediction_identity": {**_file_identity(temporary_path), "path": str(output_path.resolve())},
+            "latent_identity": {**_file_identity(latent_temporary_path), "path": str(latent_output_path.resolve())},
         }, indent=2))
         os.replace(temporary_path, output_path)
         os.replace(latent_temporary_path, latent_output_path)

@@ -268,6 +268,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         if value is not None:
             settings[key] = str(value)
     settings = latent_variance_settings(settings)
+    config["latent_variance"] = settings
+    run_latent_variance(config)
+    return 0
+
+
+def run_latent_variance(config: Mapping[str, Any]) -> Path:
+    """Write variance diagnostics from configured, existing spatial latents."""
+    settings = latent_variance_settings(config.get("latent_variance"))
+    from dann.config import inference_input
+    settings["input"] = str(inference_input(
+        config, Path(settings["input"]) if settings["input"] else None))
     summary, spectrum = compute_latent_variance(
         Path(settings["latents"]), Path(settings["input"]),
         settings["slide_column"], settings["chunk_size"],
@@ -278,7 +289,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     spectrum.to_csv(output_dir / "pca_variance.csv", index=False)
     plot_explained_variance(spectrum, summary, output_dir / "explained_variance.png", settings["figure_dpi"])
     print(f"Latent variance diagnostics written to {output_dir}", flush=True)
-    return 0
+    return output_dir
 
 
 if __name__ == "__main__":

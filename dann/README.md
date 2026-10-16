@@ -501,6 +501,65 @@ Rare exact-one target values are clamped only for the otherwise undefined logit
 operation. The normal-density constant remains disabled by default because the
 PDF omits it.
 
+## Automatic post-training workflow
+
+`python -m dann.train --config dann/config.yaml` runs the enabled downstream
+stages after successful training and resource cleanup, using the **best validation
+checkpoint returned by training** (including resumes and early stopping). The
+order is analysis → spatial inference → spatial heatmaps → latent variance.
+Programmatic `train_model(config)` remains training-only. The reusable entry point
+is `dann.workflow.run_post_training_workflow(config, checkpoint_path)`; it returns
+a mapping of completed output names to `Path` locations and prints those locations.
+
+```yaml
+post_training:
+  enabled: true
+  run_analysis: true
+  run_inference: true
+  run_spatial_heatmaps: true
+  run_latent_variance: true
+  overwrite_inference: true
+```
+
+Omitted fields default to `true`, including when the entire section is absent.
+All values must be YAML booleans; unknown keys are rejected. Set `enabled: false`
+to disable the workflow, or disable individual stages with their `run_*` switch.
+`--smoke-test` always sets `post_training.enabled: false`.
+
+Analysis runs once. Peak analysis, calibration, density diagnostics, and the
+interactive latent reports remain within that stage under their existing
+`analysis` controls, including `analysis.peaks.enabled` and
+`analysis.latent_interactive`. Numerical and browser audits remain manual.
+Each stage retains its configured execution and memory budgets.
+
+The current YAML supplies downstream switches, report settings, execution
+settings, and density sampling settings. The checkpoint supplies frozen model,
+preprocessing, targets, training data, and splits. Inference uses the runtime
+`data.context_path` tissue input and the configured `spatial.output` and
+`spatial.latents` destinations. Resolved paths within the requested run tree are
+rebased into the actual returned checkpoint's run tree, so a resume with a changed
+run name still writes beside its original model. Explicit destinations outside
+the run tree remain explicit. Latent variance consumes that same spatial latent
+export and runtime tissue input; its standalone CLI delegates to
+`dann.latent_variance.run_latent_variance(config)`.
+
+With `run_inference: false`, enabled heatmaps and latent variance consume existing
+exports. They require complete tissue coverage, matching schemas and row order,
+and the prediction-adjacent `.provenance.json` sidecar matching the checkpoint and
+tissue file identities. The sidecar also binds the required prediction/latent
+file identities; prediction reuse checks target semantics and current density
+sampling settings. Heatmaps require only predictions; latent variance requires
+only latents plus the provenance sidecar. Missing, changed, partial, or older
+exports without these identities fail with instructions to regenerate them.
+Inference is never implicitly enabled. With inference enabled,
+`overwrite_inference: false` preserves its refusal to replace existing artifacts;
+the default `true` permits replacement after successful inference validation.
+
+The first failed stage stops the workflow, identifies the stage, and gives the
+training CLI a nonzero exit status. Completed training artifacts and completed
+downstream outputs remain available. Failed training never starts downstream
+work. This workflow does not change the independent IHC-MVN pipeline.
+
 ## Commands
 
 Run from the repository root:

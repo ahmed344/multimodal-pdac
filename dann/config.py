@@ -53,6 +53,24 @@ def latent_variance_settings(settings: Mapping[str, Any] | None = None) -> dict[
     return resolved
 
 
+def post_training_settings(settings: Mapping[str, Any] | None = None) -> dict[str, bool]:
+    """Resolve automatic workflow switches, rejecting typos and non-booleans."""
+    defaults = dict(enabled=True, run_analysis=True, run_inference=True,
+                    run_spatial_heatmaps=True, run_latent_variance=True,
+                    overwrite_inference=True)
+    if settings is not None and not isinstance(settings, Mapping):
+        raise ValueError("post_training must be a mapping.")
+    supplied = dict(settings or {})
+    unknown = supplied.keys() - defaults.keys()
+    if unknown:
+        raise ValueError(f"Unknown post_training settings: {sorted(unknown)}")
+    resolved = {**defaults, **supplied}
+    for key, value in resolved.items():
+        if not isinstance(value, bool):
+            raise ValueError(f"post_training.{key} must be a boolean.")
+    return resolved
+
+
 def load_config(path: Path) -> dict[str, Any]:
     """Load and minimally validate a YAML configuration.
 
@@ -98,6 +116,9 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ValueError("Peak analysis requires average cosine linkage.")
     count, seed = density_sampling_settings(config["analysis"])
     config["analysis"].update(density_mc_samples=count, density_mc_seed=seed)
+    if "post_training" in config and not isinstance(config["post_training"], Mapping):
+        raise ValueError("post_training must be a mapping.")
+    config["post_training"] = post_training_settings(config.get("post_training"))
     config["latent_variance"] = latent_variance_settings(config.get("latent_variance"))
     config["data"]["cd8_normalization"] = normalization_settings(config["data"].get("cd8_normalization"))
     target_contract(config)
@@ -115,6 +136,8 @@ def apply_smoke_overrides(config: Mapping[str, Any]) -> dict[str, Any]:
     """
 
     updated = copy.deepcopy(dict(config))
+    updated["post_training"] = post_training_settings(updated.get("post_training"))
+    updated["post_training"]["enabled"] = False
     data = updated["data"]
     training = updated["training"]
     data["max_train_samples"] = int(training["smoke_train_samples"])

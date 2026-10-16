@@ -78,7 +78,8 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     Returns:
         dict[str, Any]: Checkpoint configuration with epochs, workers, prefetch,
         early-stopping patience, minimum improvement, and the resume path replaced
-        by the requested values. The checkpoint learning rate stays in place.
+        by the requested values, plus current post-training switches. The
+        checkpoint learning rate stays in place.
     """
 
     config = copy.deepcopy(dict(saved_config))
@@ -86,8 +87,9 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     requested = requested_config["training"]
     for key in _RESUME_OVERRIDES:
         training[key] = requested[key]
-    from dann.config import performance_settings
+    from dann.config import performance_settings, post_training_settings
     config['performance'] = performance_settings(requested_config)
+    config['post_training'] = post_training_settings(requested_config.get('post_training'))
     for key in ('spectral_peak_budget', 'spectral_checkpointing', 'gatv2_tile_budget',
                 'gatv2_checkpointing', 'inference_peak_chunk_size'):
         if key in requested_config.get('model', {}):
@@ -1192,6 +1194,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         config = apply_smoke_overrides(config)
     best_path = train_model(config)
     print(f"Best checkpoint: {best_path}", flush=True)
+    # The training frame and datasets have been released before downstream work.
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    from dann.workflow import PostTrainingError, run_post_training_workflow
+    try:
+        run_post_training_workflow(config, best_path)
+    except PostTrainingError as error:
+        print(str(error), flush=True)
+        return 1
     return 0
 
 
