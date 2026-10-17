@@ -12,10 +12,14 @@ def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     selected = {'spectral_encoder': settings['spectral_encoder']}
     for name, group in [('aggregation', settings['aggregation']), *settings['heads'].items()]:
         selected[name] = {'type': group['type'], group['type']: group[group['type']]}
+        if name == 'he':
+            selected[name].update(output_dim=group['output_dim'],
+                                  target_key=config['data'].get('he_features_key', 'hes_features'),
+                                  target_convention='raw_stored_values')
         if group['type'] == 'gatv2':
             selected[name]['graph_semantics'] = copy.deepcopy(GRAPH_SEMANTICS)
             selected[name]['reach'] = graph_reach(group['gatv2']['depth'], group['gatv2']['neighbor_radius'])
-    return {'version': 5, 'components': selected,
+    return {'version': 6 if 'he' in selected else 5, 'components': selected,
             'numerics': {key: config['model'][key] for key in
                          ('num_peaks', 'latent_dim', 'activation', 'dropout', 'use_layer_norm', 'sigma_min')},
             'spatial': execution_settings(config)}
@@ -31,11 +35,13 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(checkpoint['config'])
     saved = copy.deepcopy(checkpoint.get('architecture'))
     version = saved['version'] if saved is not None else 2
-    if version not in (2, 3, 4, 5):
+    if version not in (2, 3, 4, 5, 6):
         raise ValueError('Unsupported checkpoint architecture version.')
     if 'spectral_encoder' in config['model']:
         for name, group in [('aggregation', config['model']['aggregation']),
                             *config['model']['heads'].items()]:
+            if name == 'he' and not group.get('enabled', False):
+                continue
             if group['type'] == 'gatv2':
                 if version < 5:
                     raise ValueError('GATv2 requires checkpoint architecture version 5.')
@@ -63,7 +69,7 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
                     group['cnn'].setdefault('residual', False)
                 if not isinstance(group['cnn'].get('residual'), bool):
                     raise ValueError(f'Checkpoint architecture requires a boolean {name} CNN residual setting.')
-        saved['version'] = 5
+        saved['version'] = 6 if version == 6 else 5
         if saved != architecture_contract(config):
             raise ValueError('Checkpoint configuration disagrees with architecture metadata.')
     return config
@@ -80,7 +86,7 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
     saved = architecture_contract(checkpoint_config(checkpoint))
     requested = architecture_contract(config)
     if saved != requested:
-        message = 'Checkpoint components or numerical settings are incompatible.'
+        message = 'Checkpoint components or numerical settings are incompatible; adding or changing H&E requires fresh training.'
         for name in ('aggregation', 'biology', 'discriminator'):
             saved_group = saved['components'][name]
             requested_group = requested['components'][name]
@@ -92,7 +98,8 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
     if model is not None:
         for name, module in [('aggregation', model.encoder.aggregation_mlp),
                              ('biology', model.biology_predictor),
-                             ('discriminator', model.batch_discriminator)]:
+                             ('discriminator', model.batch_discriminator),
+                             *([('he', model.he_predictor)] if 'he' in requested['components'] else [])]:
             group = requested['components'][name]
             if group['type'] == 'gatv2':
                 from dann.model_components.layers_gatv2 import GATv2Network

@@ -11,6 +11,7 @@ latent_variance:
 data:
   path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled.h5ad  # Sole source of supervised spectra, neighborhoods, labels, and split masks.
   context_path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled_tissue.h5ad  # Inference-only input; never used by supervised training, validation, or test.
+  he_features_key: hes_features  # Raw ordered UNI2-h targets in obsm.
   matrix_key: X  # CSR source: X or layers/<layer_name>; feature order must match across files.
   batch_column: batch  # Slide identity for splitting, grid alignment, and adversarial labels; never a model input.
   x_column: x  # Integer grid coordinate; (batch, x, y) must be unique in each file.
@@ -44,7 +45,7 @@ model:
 
   # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
-    type: gatv2  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
+    type: mlp  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
       hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
@@ -61,10 +62,30 @@ model:
       dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
       attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
 
-  # 3. Prediction heads: choices are independent; both consume aggregation latents.
+  # 3. Prediction heads: choices are independent; all consume aggregation latents.
   heads:
     biology:
-      type: gatv2  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
+      type: mlp  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
+      mlp:
+        hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
+      cnn:
+        channels: 128  # Hidden spatial width; final pointwise projection emits target parameters.
+        depth: 3  # Neighborhood radius in latent-grid pixels.
+        residual: true  # Disabling may prevent learning: the tested plain CNN collapsed pixel-to-pixel feature variation.
+        dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
+      gatv2:
+        channels: 128  # Total hidden width across concatenated heads; divisible by heads.
+        depth: 3  # Number of local attention layers.
+        heads: 4  # Each attention head emits channels / heads channels.
+        neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
+        residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+        dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
+        attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
+
+    he:
+      enabled: true  # Auxiliary raw UNI2-h feature prediction.
+      output_dim: 1536
+      type: mlp  # Choices: mlp, cnn, gatv2. Emits unrestricted linear feature predictions.
       mlp:
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
@@ -82,7 +103,7 @@ model:
         attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
 
     discriminator:
-      type: gatv2  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
+      type: mlp  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
       mlp:
         hidden_dims: [256, 128, 64]  # Original batch-discriminator hidden widths.
       cnn:
@@ -113,6 +134,7 @@ model:
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
 
 loss:
+  he_weight: 1.0  # Baseline auxiliary MSE weight; not tuned.
   ziln_reduction: mean  # Reduction over valid weighted target entries: mean or sum.
   target_weights: [8.0, 4.0, 2.0, 1.0]  # Relative weights in data.target_columns order.
   logit_epsilon: 0.00001  # Clamp positive target densities before taking their logits.
@@ -143,7 +165,7 @@ training:
     learning_rate: 0.001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
     num_workers: 20  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
     prefetch_factor: 4  # Tile batches prefetched per worker; larger batches also increase host-memory use.
-    # Halo is derived: aggregation radius + max(biology radius, discriminator radius).
+    # Halo is derived: aggregation radius + max(biology radius, discriminator radius, H&E radius).
     # Default radii give halo 6, a 20x20 input, 13x13 biology support, and 7x7 latent support.
     # Only occupied, selected core rows supply labels; all occupied halo MSI remains context.
 
@@ -169,7 +191,8 @@ training:
   smoke_epochs: 1  # Epoch count for smoke training.
   smoke_num_workers: 0  # Worker count for smoke training and analysis.
   smoke_core_size: 8  # Spatial smoke core side length; the halo is still derived from component radii.
-  smoke_tiles_per_batch: 2  # Spatial smoke evaluation tiles; training row budget remains unchanged.
+  smoke_tiles_per_batch: 2  # Spatial smoke evaluation tiles.
+  smoke_supervised_rows_per_batch: 64  # Scattered capped labels occupy many tiles; bound smoke training memory.
 
 # CLI-only workflow after successful training; --smoke-test disables it.
 post_training:
@@ -181,6 +204,7 @@ post_training:
   overwrite_inference: true
 
 analysis:
+  export_he_predictions: false
   latent_interactive: true  # Offline sample and feature viewers from saved analysis exports.
   peaks:
     enabled: true
@@ -226,6 +250,7 @@ analysis:
     host_budget_gib: 192.0
     png_compress_level: 1  # Lossless; faster encoding with larger files.
   spatial_execution:
+    export_he_predictions: false  # Stream raw H&E vectors beside spatial outputs.
     enabled: true
     tiles_per_batch: 64
     spectral_peak_budget: 262144
@@ -260,11 +285,11 @@ analysis:
   exceedance_thresholds: []  # Optional density thresholds for P(y > t) summaries; empty disables them.
 
 results:
-  # All paths derive from root/<spectral>__agg-<type>__bio-<type>__disc-<type>/<run_name>/.
+  # Paths derive from root/<spectral>__agg-<type>__bio-<type>__disc-<type>[__he-<type>]/<run_name>/.
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: no-test-gatv2-aggregation  # Human-readable run name; separate experiments should use separate names.
+  run_name: he_mse_baseline  # Human-readable run name; separate experiments should use separate names.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.

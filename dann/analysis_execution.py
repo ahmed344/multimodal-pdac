@@ -180,7 +180,7 @@ def sampled_density_mean(pi: np.ndarray, mu: np.ndarray, sigma: np.ndarray, *,
 
 def extract_prepared(model: torch.nn.Module, loader: Any, device: torch.device,
                      cache: tuple[np.ndarray, torch.Tensor] | None,
-                     progress: InferenceProgress) -> dict[str, np.ndarray]:
+                     progress: InferenceProgress, *, he_writer=None) -> dict[str, np.ndarray]:
     """Pack model outputs once per physical batch; keep labels/identities on CPU."""
     from dann.execution import device_batches, pooled_validation_loader
     from dann.targets import observed_targets
@@ -203,6 +203,10 @@ def extract_prepared(model: torch.nn.Module, loader: Any, device: torch.device,
             widths = [predictions[name].shape[1] for name in names]
             packed = torch.cat([predictions[name] for name in names], dim=1).cpu().numpy()
             values = dict(zip(names, np.split(packed, np.cumsum(widths)[:-1], axis=1)))
+            from dann.he import analysis_he_statistics
+            values.update(analysis_he_statistics(predictions, batch))
+            if he_writer is not None:
+                he_writer.write(cpu['row_ids'].numpy(), predictions['he_prediction'].cpu().numpy())
             values.update({name: cpu[name].numpy() for name in
                 ('targets', 'raw_targets', 'target_valid_mask', 'batches', 'row_ids', 'support', 'latent_support')
                 if name in cpu})
@@ -612,10 +616,11 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
                 saved_rows={name: fingerprint(np.asarray(rows)) for name, rows in checkpoint.get('split_indices', {}).items()},
                 performance=performance if fast else config.get('performance', {}),
                 physical_batch=config['analysis']['batch_size'], fast=fast,
+                export_he_predictions=config['analysis'].get('export_he_predictions', False),
                 device=str(device), cuda=torch.version.cuda)
             # Training samplers may intentionally repeat rows. Leave their existing
             # extraction behavior alone; numerical caches are for held-out analysis.
-            hit = cache.get(f'extracted-{split}', keys[split]) if split != 'train' else None
+            hit = cache.get(f'extracted-{split}', keys[split]) if split != 'train' and not config['analysis'].get('export_he_predictions', False) else None
             if hit is not None:
                 extracted_by_split[split] = hit[0]
         missing = [split for split in splits if split not in extracted_by_split]
@@ -650,14 +655,17 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
                             feature_cache = build_validation_features(model, loaders[missing[0]], device,
                                 progress, context_datasets=[bundle.datasets[split] for split in missing])
                         for split in missing:
-                            extracted_by_split[split] = extract_prepared(model, loaders[split], device,
-                                                                         feature_cache, progress)
+                            from functools import partial
+                            from dann.he import extract_with_he
+                            extracted_by_split[split] = extract_with_he(model, loaders[split], device, config,
+                                output, split, partial(extract_prepared, cache=feature_cache, progress=progress))
                             progress.details.setdefault('preparation_wait_seconds', {})[split] = loaders[split].wait_seconds
                             progress.details.setdefault('max_prepared_batch_bytes', {})[split] = loaders[split].max_batch_bytes
                 else:
                     for split in missing:
                         progress.set_phase(f'legacy {split} extraction')
-                        extracted_by_split[split] = a.extract_latent_predictions(model, bundle.loaders[split], device)
+                        from dann.he import extract_with_he
+                        extracted_by_split[split] = extract_with_he(model, bundle.loaders[split], device, config, output, split)
                 for split in missing:
                     if split != 'train':
                         cache.put(f'extracted-{split}', keys[split], extracted_by_split[split])
@@ -673,6 +681,9 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
 
+        from dann.he import report_he
+        for split, values in extracted_by_split.items():
+            report_he(values, output, split, config['loss'].get('he_weight', 1.0))
         samples, seed = density_sampling_settings(config['analysis'])
         progress.details['density_sampling'] = dict(samples=samples, seed=seed, split_order=splits)
         progress.details['output_rows'] = {split: len(values['row_ids'])

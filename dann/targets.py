@@ -63,6 +63,8 @@ def checkpoint_analysis_config(config: Mapping[str, Any], checkpoint: Mapping[st
     for key in ("matrix_key", "batch_column", "intensity_transform", "intensity_clip_max", "nonzero_threshold", "x_column", "y_column"):
         if key in saved["data"]:
             resolved["data"][key] = saved["data"][key]
+    resolved["data"]["he_features_key"] = saved["data"].get("he_features_key", "hes_features")
+    resolved["loss"]["he_weight"] = saved["loss"].get("he_weight", 1.0)
     resolved["loss"]["logit_epsilon"] = saved["loss"]["logit_epsilon"]
     contract = checkpoint_contract(checkpoint)
     resolved["data"].update({key: contract[key] for key in ("target_columns", "cd8_normalization")})

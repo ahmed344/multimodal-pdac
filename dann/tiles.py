@@ -138,6 +138,10 @@ class SpatialTileDataset(Dataset):
             self.keys, features = geometry[0], geometry[1]
         self.indices = np.asarray(selected_rows, dtype=np.int64)
         self.metadata = metadata
+        from dann.he import HETargetReader, he_settings
+        he = he_settings(config)
+        self.he_reader = (HETargetReader(self.path, self.data.get('he_features_key', 'hes_features'),
+                                        len(self.keys), he['output_dim']) if metadata is not None and he else None)
         self.core_size = int(config['training'].get('core_size', 32))
         self.halo = execution_settings(config)['halo']
         self.latent_radius = execution_settings(config)['latent_radius']
@@ -242,6 +246,8 @@ class SpatialTileDataset(Dataset):
         else:
             result['samples'] = [self.spectra[row] for row in geometry['context_rows']]
         if self.metadata is not None:
+            if self.he_reader is not None:
+                result["_he_reader"] = self.he_reader
             m = self.metadata
             result.update(targets=m.targets[rows], raw_targets=m.raw_targets[rows],
                           target_valid_mask=m.target_valid_mask[rows], batches=m.batch_codes[rows])
@@ -279,6 +285,8 @@ class SpatialTileDataset(Dataset):
                       occupancy=mask, row_ids=np.asarray(rows), support=np.asarray(support, dtype=np.float32),
                       latent_support=np.asarray(latent_support, dtype=np.float32))
         if self.metadata is not None:
+            if self.he_reader is not None:
+                result["_he_reader"] = self.he_reader
             m = self.metadata
             result.update(targets=m.targets[rows], raw_targets=m.raw_targets[rows],
                           target_valid_mask=m.target_valid_mask[rows], batches=m.batch_codes[rows])
@@ -310,13 +318,15 @@ def tile_collate(tiles: Sequence[Mapping[str, Any]], include_spectra: bool = Tru
     for key in ('row_ids', 'support', 'latent_support', 'targets', 'raw_targets', 'target_valid_mask', 'batches', 'reduction_groups'):
         if key in tiles[0]:
             batch[key] = torch.from_numpy(np.concatenate([t[key] for t in tiles]))
+    if '_he_reader' in tiles[0]:
+        batch['he_targets'] = torch.from_numpy(tiles[0]['_he_reader'].read(batch['row_ids'].numpy()))
     return batch
 
 
 def ordered_spatial_predictions(
     model: AdversarialLatentFusion, loader, selected_rows: int, device: torch.device,
     directory: Path, output_batch_size: int = 4096, *, execution=None,
-    density_samples: int = 1000, density_seed: int = 20260719, progress=None,
+    density_samples: int = 1000, density_seed: int = 20260719, progress=None, predict_he: bool = False,
 ) -> Iterator[dict[str, torch.Tensor]]:
     """Stage tile results, release preparation, then stream ordered density blocks."""
     import tempfile
@@ -325,10 +335,11 @@ def ordered_spatial_predictions(
     from dann.spatial_execution import density_blocks, release_preparation
     settings = getattr(loader, 'settings', {}) if execution else {}
     width, targets = model.latent_dim, model.num_targets
+    he_width = getattr(model, "he_output_dim", 0) if predict_he else 0
     with tempfile.TemporaryDirectory(prefix='.dann-stage-', dir=directory) as temporary:
         path = Path(temporary) / 'predictions.bin'
         matrix = np.memmap(path, mode='w+', dtype=np.float32,
-                           shape=(selected_rows, width + 3*targets + 2))
+                           shape=(selected_rows, width + 3*targets + he_width + 2))
         seen = np.memmap(Path(temporary) / 'seen.bin', mode='w+', dtype=np.uint8, shape=(selected_rows,))
         seen[:] = 0
         cache = None
@@ -352,9 +363,10 @@ def ordered_spatial_predictions(
                         if np.any(ids < 0):
                             raise ValueError('Context row missing from this inference pass.')
                         batch['pooled_features'] = features[torch.as_tensor(ids, device=device)]
-                    outputs = model(batch, grl_strength=0.)
+                    outputs = model(batch, grl_strength=0.,
+                                    **({'predict_he': predict_he} if getattr(model, 'he_output_dim', 0) else {}))
                     # A single synchronized device-to-host copy for all model outputs.
-                    packed = torch.cat([outputs[k] for k in ('latent', 'pi', 'mu', 'sigma')], dim=1).cpu().numpy()
+                    packed = torch.cat([outputs[k] for k in ('latent', 'pi', 'mu', 'sigma', *(['he_prediction'] if he_width else []))], dim=1).cpu().numpy()
                     matrix[rows, :-2] = packed
                     matrix[rows, -2] = cpu['support'].numpy()
                     matrix[rows, -1] = cpu['latent_support'].numpy()
@@ -393,6 +405,8 @@ def ordered_spatial_predictions(
                 boundaries = [0, width, width+targets, width+2*targets, width+3*targets]
                 result = {key: torch.from_numpy(values[:, a:b]) for key, a, b in
                           zip(('latent', 'pi', 'mu', 'sigma'), boundaries[:-1], boundaries[1:])}
+                if he_width:
+                    result["he_prediction"] = torch.from_numpy(values[:, width+3*targets:-2])
                 result.update(row_ids=torch.arange(start, stop), support=torch.from_numpy(values[:, -2]),
                               latent_support=torch.from_numpy(values[:, -1]))
                 if density is not None:

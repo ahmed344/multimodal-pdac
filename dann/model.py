@@ -112,12 +112,13 @@ class GradientReversal(nn.Module):
 
 
 class AdversarialLatentFusion(nn.Module):
-    """Deep Sets, selectable aggregation, and two independently selected heads."""
-    def __init__(self, encoder, biology_predictor, batch_discriminator):
+    """Deep Sets, selectable aggregation, and independently selected prediction heads."""
+    def __init__(self, encoder, biology_predictor, batch_discriminator, he_predictor=None):
         super().__init__()
         self.encoder = encoder
         self.biology_predictor = biology_predictor
         self.batch_discriminator = batch_discriminator
+        self.he_predictor = he_predictor
         self.gradient_reversal = GradientReversal()
         self.spatial = False
         self.peak_budget = 65536
@@ -158,18 +159,27 @@ class AdversarialLatentFusion(nn.Module):
         else:
             discriminator = {"cnn": CNNDiscriminator, "gatv2": DiscriminatorGATv2}[disc["type"]](
                 values["latent_dim"], num_batches, **disc[disc["type"]])
+        he = settings["heads"].get("he")
+        he_predictor = None
+        if he is not None:
+            if he["type"] == "mlp":
+                he_predictor = MLPBiology(values["latent_dim"], he["mlp"]["hidden_dims"], he["output_dim"], **common)
+            else:
+                he_predictor = {"cnn": CNNBiology, "gatv2": BiologyGATv2}[he["type"]](
+                    values["latent_dim"], he["output_dim"], **he[he["type"]])
         from dann.model_components.layers_gatv2 import GATv2Network
-        for component in (encoder.aggregation_mlp, biology, discriminator):
+        for component in (encoder.aggregation_mlp, biology, discriminator, he_predictor):
             if isinstance(component, GATv2Network):
                 component.tile_budget = values.get("gatv2_tile_budget", 8)
                 component.checkpointing = values.get("gatv2_checkpointing", True)
-        model = cls(encoder, biology, discriminator)
+        model = cls(encoder, biology, discriminator, he_predictor)
+        model.he_output_dim = he["output_dim"] if he is not None else 0
         model.num_targets, model.sigma_min = num_targets, values["sigma_min"]
         model.latent_dim = int(values["latent_dim"])
-        model.spatial = any(x["type"] in {"cnn", "gatv2"} for x in (settings["aggregation"], bio, disc))
+        model.spatial = any(x["type"] in {"cnn", "gatv2"} for x in (settings["aggregation"], *settings["heads"].values()))
         model.peak_budget = values.get("spectral_peak_budget", 65536)
         model.checkpointing = values.get("spectral_checkpointing", True)
-        model.halo = encoder.aggregation_mlp.radius + max(biology.radius, discriminator.radius)
+        model.halo = encoder.aggregation_mlp.radius + max(biology.radius, discriminator.radius, he_predictor.radius if he_predictor is not None else 0)
         return model
 
     @staticmethod
@@ -221,16 +231,19 @@ class AdversarialLatentFusion(nn.Module):
                             ("peak_indices", "intensities", "sample_indices", "peak_counts")])
 
     def forward(self, batch: Mapping[str, torch.Tensor],
-                grl_strength: float = 1.0) -> dict[str, torch.Tensor]:
-        """Predict aligned core outputs, retaining spatial context for both heads."""
+                grl_strength: float = 1.0, *, predict_he: bool = True) -> dict[str, torch.Tensor]:
+        """Predict aligned core outputs, retaining spatial context for all enabled heads."""
         if not self.spatial:
             latent = self.encode(batch)
-            return {"latent": latent, **self.biology_predictor(latent),
-                    "batch_logits": self.batch_discriminator(self.gradient_reversal(latent, grl_strength))}
+            outputs = {"latent": latent, **self.biology_predictor(latent),
+                       "batch_logits": self.batch_discriminator(self.gradient_reversal(latent, grl_strength))}
+            if predict_he and self.he_predictor is not None:
+                outputs["he_prediction"] = self.he_predictor(latent)
+            return outputs
         grid = self._latent_map(batch)
         mask = batch["occupancy"]
         latent = self._select(grid, batch)
-        # Keep the latent halo until both heads have consumed their neighborhoods.
+        # Keep the latent halo until all heads have consumed their neighborhoods.
         if self.biology_predictor.radius:
             biology = transform_biology(self._select(self._prepared_map(self.biology_predictor, grid, mask, batch), batch),
                                         self.num_targets, self.sigma_min)
@@ -238,4 +251,8 @@ class AdversarialLatentFusion(nn.Module):
             biology = self.biology_predictor(latent)
         reversed_grid = self.gradient_reversal(grid, grl_strength)
         logits = self._select(self._prepared_map(self.batch_discriminator, reversed_grid, mask, batch), batch)
-        return {"latent": latent, **biology, "batch_logits": logits}
+        outputs = {"latent": latent, **biology, "batch_logits": logits}
+        if predict_he and self.he_predictor is not None:
+            outputs["he_prediction"] = (self._select(self._prepared_map(self.he_predictor, grid, mask, batch), batch)
+                                        if self.he_predictor.radius else self.he_predictor(latent))
+        return outputs

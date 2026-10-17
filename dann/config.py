@@ -156,7 +156,10 @@ def apply_smoke_overrides(config: Mapping[str, Any]) -> dict[str, Any]:
             training[mode]["num_workers"] = training["smoke_num_workers"]
         if mode == "spatial":
             training["spatial"].update(core_size=training.get("smoke_core_size", 8),
-                                      tiles_per_batch=training.get("smoke_tiles_per_batch", 2))
+                                      tiles_per_batch=training.get("smoke_tiles_per_batch", 2),
+                                      supervised_rows_per_batch=min(training.get("smoke_supervised_rows_per_batch",
+                                          training["spatial"].get("supervised_rows_per_batch", 2048)),
+                                          training["spatial"].get("supervised_rows_per_batch", 2048)))
         resolve_execution(updated)
     else:
         output_dir = Path(training["output_dir"]) / "smoke"
@@ -221,8 +224,19 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
         settings = copy.deepcopy({key: model[key] for key in ("spectral_encoder", "aggregation", "heads")})
     if settings["spectral_encoder"]["type"] != "deep_sets":
         raise ValueError("model.spectral_encoder.type must be deep_sets.")
-    if set(settings["heads"]) != {"biology", "discriminator"}:
-        raise ValueError("model.heads must contain exactly biology and discriminator.")
+    if set(settings["heads"]) - {"biology", "discriminator", "he"} or not {"biology", "discriminator"} <= set(settings["heads"]):
+        raise ValueError("model.heads requires biology and discriminator, with optional he.")
+    he = settings["heads"].get("he", {"enabled": False})
+    if not isinstance(he, Mapping):
+        raise ValueError("model.heads.he must be a mapping.")
+    if not isinstance(he.get("enabled", False), bool):
+        raise ValueError("model.heads.he.enabled must be boolean.")
+    if he.get("enabled", False):
+        width = he.get("output_dim")
+        if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
+            raise ValueError("model.heads.he.output_dim must be a positive integer.")
+    else:
+        settings["heads"].pop("he", None)
     spectral = settings["spectral_encoder"]["deep_sets"]
     positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
                 spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
@@ -256,6 +270,8 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive execution mode and combined halo from the selected components."""
     settings = component_settings(config["model"])
     groups = [settings["aggregation"], settings["heads"]["biology"], settings["heads"]["discriminator"]]
+    if "he" in settings["heads"]:
+        groups.append(settings["heads"]["he"])
     radii = []
     for group in groups:
         if group["type"] == "mlp":
@@ -264,18 +280,33 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
             radii.append(group["cnn"]["depth"])
         elif group["type"] == "gatv2":
             radii.append(graph_reach(group["gatv2"]["depth"], group["gatv2"]["neighbor_radius"]))
-    return {"mode": "spatial" if any(radii) else "pixel", "halo": radii[0] + max(radii[1:]),
+    result = {"mode": "spatial" if any(radii) else "pixel", "halo": radii[0] + max(radii[1:]),
             "latent_radius": radii[0], "biology_radius": radii[0] + radii[1],
-            "combination": "deep_sets__agg-{}__bio-{}__disc-{}".format(*(g["type"] for g in groups))}
+            "combination": "deep_sets__agg-{}__bio-{}__disc-{}".format(*(g["type"] for g in groups[:3]))}
+    if len(groups) == 4:
+        result.update(he_radius=radii[0] + radii[3])
+        result["combination"] += "__he-" + groups[3]["type"]
+    return result
 
 
 def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve mode-specific settings and all run paths once, without overrides."""
+    weight = config.get("loss", {}).get("he_weight", 1.0)
+    if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not np.isfinite(weight) or weight < 0:
+        raise ValueError("loss.he_weight must be finite and nonnegative.")
+    for key in ("export_he_predictions",):
+        if not isinstance(config.get("analysis", {}).get(key, False), bool):
+            raise ValueError(f"analysis.{key} must be boolean.")
+    key = config["data"].get("he_features_key", "hes_features")
+    if not isinstance(key, str) or not key.strip() or "/" in key:
+        raise ValueError("data.he_features_key must name an obsm array.")
     config["performance"] = performance_settings(config)
     settings = component_settings(config["model"])
     if "spectral_encoder" in config["model"]:
         for name, group in [("aggregation", config["model"]["aggregation"]),
                             *config["model"]["heads"].items()]:
+            if name == "he" and name not in settings["heads"]:
+                continue
             resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
             group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
             group["gatv2"] = resolved["gatv2"]
@@ -397,7 +428,7 @@ def performance_settings(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 SPATIAL_EXECUTION_DEFAULTS = dict(
-    enabled=False, tiles_per_batch=64, spectral_peak_budget=262144, gat_tiles=32,
+    enabled=False, export_he_predictions=False, tiles_per_batch=64, spectral_peak_budget=262144, gat_tiles=32,
     feature_cache=True, feature_cache_rows=1024, output_rows=16384, density_workers=16,
 )
 
@@ -444,7 +475,7 @@ def spatial_execution_settings(supplied: Mapping[str, Any] | None = None) -> dic
     if set(settings) != set(SPATIAL_EXECUTION_DEFAULTS):
         raise ValueError('Unknown analysis.spatial_execution setting.')
     for key, value in settings.items():
-        if key in ('enabled', 'feature_cache'):
+        if key in ('enabled', 'feature_cache', 'export_he_predictions'):
             if not isinstance(value, bool):
                 raise ValueError(f'analysis.spatial_execution.{key} must be boolean.')
         elif isinstance(value, bool) or not isinstance(value, int) or value < (0 if key == 'density_workers' else 1):

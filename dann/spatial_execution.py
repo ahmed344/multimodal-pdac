@@ -103,7 +103,8 @@ def inference_performance(config: Mapping[str, Any], overrides: Mapping[str, Any
     return performance
 
 
-def preflight(path: Path, config: Mapping[str, Any], rows: int, performance: Mapping[str, Any]) -> dict:
+def preflight(path: Path, config: Mapping[str, Any], rows: int, performance: Mapping[str, Any],
+              *, predict_he: bool = True) -> dict:
     """Conservatively reserve CSR construction, geometry, queues, and staging space."""
     from dann.config import execution_settings
     from dann.spatial import matrix_group_path
@@ -119,7 +120,12 @@ def preflight(path: Path, config: Mapping[str, Any], rows: int, performance: Map
     # Full-grid keys/dictionaries, construction scratch and mmap resident pages.
     scratch = csr * (3 if config['data']['nonzero_threshold'] > 0 else 2) if performance['ram_cache'] else 0
     metadata = source_rows * 600
-    staging = rows * (config['model']['latent_dim'] + 3 * len(config['data']['target_columns']) + 2) * 4
+    from dann.he import he_settings
+    he = he_settings(config)
+    he_width = he['output_dim'] if he and predict_he else 0
+    staging = rows * (config['model']['latent_dim'] + 3 * len(config['data']['target_columns']) + he_width + 2) * 4
+    # Dense head maps and supervised target/prediction queues can coexist.
+    staging += performance['validation_tiles'] * size * size * he_width * 4 if performance.get('validation_tiles') else 0
     required = psutil.Process().memory_info().rss + scratch + metadata + staging
     budget = performance['host_budget_gib'] * 2**30
     if required > budget:
@@ -127,7 +133,7 @@ def preflight(path: Path, config: Mapping[str, Any], rows: int, performance: Map
                           f'(CSR scratch {scratch / 2**30:.2f}, metadata {metadata / 2**30:.2f}, '
                           f'staging {staging / 2**30:.2f}) > {budget / 2**30:.2f} GiB.')
     return dict(resident_estimated_bytes=csr, construction_estimated_bytes=required,
-                footprint_size=size, core_size=core)
+                footprint_size=size, core_size=core, he_staging_bytes=rows * he_width * 4)
 
 
 

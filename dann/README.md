@@ -2,7 +2,7 @@
 
 This package fits sparse MALDI-MSI to four IHC targets and exports a shared latent
 representation. MSI stays sparse, either backed or resident in RAM, until Deep Sets mean-pools the
-intensity-weighted learned peak embeddings. Aggregation and the two prediction
+intensity-weighted learned peak embeddings. Aggregation and the prediction
 heads can independently use MLPs, local spatial CNNs, or residual GATv2 attention.
 
 The four biology targets each use a structural-zero hurdle with three parameters:
@@ -10,24 +10,78 @@ zero probability `pi`, positive logit mean `mu`, and positive logit standard
 deviation `sigma`. A gradient reversal layer trains the shared latent space to
 confuse the batch discriminator while preserving IHC prediction.
 
+## Raw H&E auxiliary prediction
+
+`model.heads.he.enabled: true` adds a standard head from the shared MSI latent to
+1,536 stored UNI2-h features. Its `type` and independent `mlp`, `cnn`, and `gatv2`
+blocks follow the biology head interfaces; the initial settings copy biology.
+`output_dim: 1536` must match `obsm[data.he_features_key]` (default
+`hes_features`) in **data.path**, at exactly the MSI observation positions.
+Targets are read lazily with handles local to each read, safe across preparation
+threads and loader processes. Only selected core targets enter batches; large
+H&E arrays are never retained in cached tile geometry. The reader rejects
+incorrect shape, nonnumeric values, and nonfinite supervised values, reporting
+invalid source row positions. Stored column order is preserved.
+
+Outputs are unrestricted linear values. There is no feature normalization or
+standardization, no IHC-validity masking of H&E, and no gradient reversal on the
+H&E branch. The objective is:
+
+```text
+total = biology_weight * IHC_loss + batch_weight * batch_cross_entropy
+        + he_weight * mean((he_prediction - raw_he_targets)**2)
+```
+
+The mean covers selected core pixels and feature dimensions. `loss.he_weight:
+1.0` is the initial baseline, not a tuned optimum. Training and validation history
+record `he_mse`, `he_weighted_loss`, and the updated `total_loss`; squared-error
+sums and element counts produce batch-size-independent H&E metrics. Loss plots
+include both H&E series. The 90:10 study split and validation **CD8 likelihood**
+checkpoint/early-stopping criterion remain unchanged. Shared-representation
+objectives and full comparative training remain later experiments.
+
+Analysis always writes `analysis/he/{split}_metrics.json` for an enabled head.
+`analysis.export_he_predictions: true` additionally streams vectors into
+`analysis/he/{split}_predictions.parquet`. Independently,
+`analysis.spatial_execution.export_he_predictions: true` writes
+`he_predictions.parquet` beside spatial outputs. Both switches default to false.
+Each file contains `row_position`, `obs_name`, and a fixed-size float32 list
+`he_prediction` in stored feature order. Row coverage is checked; observation
+names may be duplicated because source positions are the unique identities.
+Spatial exports use disk-backed staging to restore source order. Analysis caches
+retain H&E error sums/counts, not full vectors; requesting vector exports reruns
+extraction to stream them. Spatial inference needs no observed H&E features and
+skips the head when feature export is disabled.
+
+Enabled runs add `__he-{type}` to the experiment directory selector. To compare
+against the existing model, set `model.heads.he.enabled: false` and choose a
+separate `results.run_name`. Disabled or absent H&E settings preserve legacy
+initialization, output keys, checkpoint contracts, and loading requirements.
+Version-six enabled checkpoints record the head architecture, width, target key,
+and raw-target convention. Adding the head to an older architecture requires a
+fresh run (`training.resume_checkpoint: null`); compatible H&E checkpoints resume
+normally using their saved objective settings. Do not compare the baseline weight
+as though it had been optimized.
+
 ## Components and spatial execution
 
-There are three groups and four selectors, all in `dann/config.yaml`:
+There are three groups and five selectors, all in `dann/config.yaml`:
 
 | Group | Selector | Choices | Default |
 |---|---|---|---|
 | Spectral processing | `model.spectral_encoder.type` | `deep_sets` | `deep_sets` |
 | Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
 | Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
-| Prediction heads | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
+| Prediction heads | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
+| Optional H&E head | `model.heads.he.type` | `mlp`, `cnn`, `gatv2` | `gatv2` (enabled) |
 
-All 27 aggregation/head combinations are supported. Selectable neural modules
+All aggregation/head combinations are supported. Selectable neural modules
 live in `dann/model_components/`; `dann/model.py` composes them. The Deep Sets stage uses
 128-dimensional learned peak embeddings, multiplies each by its transformed
 intensity, applies the original per-peak MLP with `[256, 256]` hidden widths and
 256 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
 The selectable aggregation produces the **exported 256-dimensional latent**.
-The MLP aggregation uses `[256, 256]` hidden widths; both MLP heads use
+The MLP aggregation uses `[256, 256]` hidden widths; all MLP heads use
 `[256, 128, 64]`. The shared ZILN transformation, weighted four-target objective,
 class-weighted batch cross-entropy, and gradient reversal schedule are unchanged.
 Only the discriminator input receives gradient reversal.
@@ -141,9 +195,11 @@ Missing `sampling_strategy` retains legacy `shuffled_tiles`. Under that strategy
 `tiles_per_batch` controls training. Under the corrected strategy it controls only
 validation/test tile batches (default eight), never caps training tiles.
 `execution` metadata records training row and evaluation tile units separately.
-Smoke mode caps split membership and evaluation tiles but preserves the training
-row budget and architecture-derived halo. The activated run name is
-`residual-gatv2-aggregation`, separate from earlier experiments.
+Smoke mode caps split membership, evaluation tiles, and the training row budget
+(`training.smoke_supervised_rows_per_batch: 64`) while preserving the
+architecture-derived halo. Capped labels are scattered across many footprints,
+so the smaller smoke batch avoids excessive spatial activation memory.
+The activated run name is `he_mse_baseline`, separate from earlier experiments.
 
 Production retains its epoch-based GRL horizon:
 `(epoch * len(train_loader) + step) / (epochs * len(train_loader) - 1)` (with the
@@ -170,13 +226,13 @@ GATv2 aggregation/CNN biology/CNN discriminator architecture. Global pixel
 shuffling performed better in that study.
 
 The halo is derived as `aggregation radius + max(biology radius, discriminator
-radius)`. An MLP has reach zero; a CNN has reach equal to its depth. A GATv2
+radius, enabled H&E radius)`. An MLP has reach zero; a CNN has reach equal to its depth. A GATv2
 component has reach `depth * maximum_step`, where `maximum_step` is the largest
 absolute x/y offset among integer offsets within its Euclidean cutoff. The same
 offset definition builds edges and calculates reach. Aggregation reach is the
 latent radius; aggregation plus biology reach is the biology radius. Defaults
 use halo six and 20×20 input tiles for 8×8 cores. The enclosing biology window
-is 13×13 and latent window is 7×7. Both heads run before core rows are selected,
+is 13×13 and latent window is 7×7. Spatial heads run before core rows are selected,
 retaining their complete latent halo.
 
 All supervised spectra, neighborhoods, labels, and masks come from `data.path`

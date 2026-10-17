@@ -12,7 +12,7 @@ from torch.utils.data import Dataset, Sampler
 from dann.tiles import SpatialTileDataset, tile_collate
 
 ALGORITHM_VERSION = 1
-SUPERVISION_FIELDS = ('core_positions', 'row_ids', 'support', 'latent_support',
+SUPERVISION_FIELDS = ("he_targets", 'core_positions', 'row_ids', 'support', 'latent_support',
                       'targets', 'raw_targets', 'target_valid_mask', 'batches', 'reduction_groups')
 
 

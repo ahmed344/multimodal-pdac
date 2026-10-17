@@ -242,6 +242,7 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
         intensity_clip_max: float | None = None,
         nonzero_threshold: float = 0.0,
         resident=None,
+        he_reader=None,
     ) -> None:
         """Initialize a lazy backed sparse dataset.
 
@@ -262,6 +263,7 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
             raise ValueError(f"Unsupported intensity transform: {intensity_transform}")
         self.path = Path(path)
         self.resident = resident
+        self.he_reader = he_reader
         if resident is not None:
             settings = dict(matrix_key=matrix_key, intensity_transform=intensity_transform,
                             intensity_clip_max=intensity_clip_max, nonzero_threshold=nonzero_threshold)
@@ -362,6 +364,7 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
             ),
             "batch": int(self.metadata.batch_codes[row]),
             "row_id": row,
+            **({"he_targets": self.he_reader.read(np.array([row]))[0]} if self.he_reader is not None else {}),
         }
 
     def __getstate__(self) -> dict[str, Any]:
@@ -436,6 +439,7 @@ def sparse_collate(samples: Sequence[Mapping[str, Any]]) -> dict[str, torch.Tens
         "sample_indices": torch.from_numpy(sample_indices),
         "peak_counts": torch.from_numpy(lengths),
         "targets": torch.from_numpy(targets),
+        **({"he_targets": torch.from_numpy(np.stack([s["he_targets"] for s in samples]))} if "he_targets" in samples[0] else {}),
         "raw_targets": torch.from_numpy(np.stack([
             sample.get("raw_targets", sample["targets"]) for sample in samples
         ])),
@@ -540,7 +544,12 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
     if performance['ram_cache']:
         from dann.execution import ResidentSpectra
         resident = ResidentSpectra(path, data_config, int(performance['host_budget_gib'] * 2**30))
+    from dann.he import HETargetReader, he_settings
+    he = he_settings(config)
+    he_reader = (HETargetReader(path, data_config.get('he_features_key', 'hes_features'),
+                               metadata.num_observations, he['output_dim']) if he else None)
     dataset_kwargs = {
+        "he_reader": he_reader,
         "resident": resident,
         "path": path,
         "metadata": metadata,

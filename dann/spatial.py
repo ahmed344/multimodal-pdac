@@ -855,6 +855,13 @@ def _run_inference(
         raise ValueError('execution_overrides accepts spatial_execution and performance mappings.')
     spatial_settings = spatial_execution_settings({
         **(config['analysis'].get('spatial_execution') or {}), **overrides.get('spatial_execution', {})})
+    export_he = spatial_settings['export_he_predictions'] and bool(getattr(model, 'he_output_dim', 0))
+    he_path = output_path.parent / 'he_predictions.parquet'
+    if export_he:
+        if he_path.resolve() in {p.resolve() for p in destinations}:
+            raise ValueError('H&E export path collides with another inference artifact.')
+        if he_path.exists() and not overwrite:
+            raise FileExistsError(f'Output already exists: {he_path}')
     if tiles_per_batch is not None and (isinstance(tiles_per_batch, bool)
                                        or not isinstance(tiles_per_batch, int) or tiles_per_batch <= 0):
         raise ValueError('tiles_per_batch must be positive.')
@@ -933,7 +940,7 @@ def _run_inference(
         dataset.close()
         resident = None
         if optimized:
-            _report.details.update(preflight(input_path, config, selected_rows, performance))
+            _report.details.update(preflight(input_path, config, selected_rows, performance, predict_he=export_he))
             if performance['ram_cache']:
                 resident = ResidentSpectra(input_path, data_config,
                                           int(performance['host_budget_gib'] * 2**30))
@@ -962,8 +969,14 @@ def _run_inference(
     support_temporary = support_path.with_name(f'.{support_path.name}.{invocation}.tmp')
     provenance_temporary = provenance_path.with_name(f'.{provenance_path.name}.{invocation}.tmp')
     prediction_writer = latent_writer = support_writer = None
+    from contextlib import ExitStack
+    he_stack = ExitStack()
+    he_writer = None
     staged = None
     try:
+        if export_he:
+            from dann.he import HEWriter
+            he_writer = he_stack.enter_context(HEWriter(he_path, input_path, model.he_output_dim, np.arange(selected_rows)))
         prediction_writer = pq.ParquetWriter(
             temporary_path,
             output_schema(target_columns).with_metadata({
@@ -990,7 +1003,7 @@ def _run_inference(
                 model, loader, selected_rows, device, output_path.parent,
                 output_batch_size=spatial_settings['output_rows'] if optimized else 4096,
                 execution=spatial_settings if optimized else None,
-                density_samples=mc_samples, density_seed=mc_seed, progress=_report)
+                density_samples=mc_samples, density_seed=mc_seed, progress=_report, predict_he=export_he)
         processed = 0
         print(
             f"Inference checkpoint epoch {checkpoint_epoch} on {device}; "
@@ -1015,8 +1028,11 @@ def _run_inference(
                 else:
                     model_batch = {key: value.to(device, non_blocking=True)
                                    for key, value in cpu_batch.items()}
-                    predictions = model(model_batch, grl_strength=0.)
+                    predictions = model(model_batch, grl_strength=0.,
+                                        **({'predict_he': export_he} if getattr(model, 'he_output_dim', 0) else {}))
                     latent = predictions["latent"]
+                if he_writer is not None:
+                    he_writer.write(row_positions, predictions['he_prediction'].cpu().numpy())
                 parameters = {key: predictions[key].cpu().numpy() for key in ("pi", "mu", "sigma")}
                 # Row-keyed streams make capped/full exports independent of tile and output batches.
                 from dann.spatial_execution import sample_rows
@@ -1077,7 +1093,9 @@ def _run_inference(
             support_writer.close()
             validate_support_output(support_temporary, selected_rows)
         _report.update(selected_rows)
+        he_stack.close()
         provenance_temporary.write_text(json.dumps({
+            "he_prediction_identity": _file_identity(he_path) if export_he else None,
             "checkpoint": str(checkpoint_path), "input": str(input_path),
             "architecture": saved_checkpoint.get("architecture"),
             "support_semantics": "occupancy_fraction_in_enclosing_square_window_not_graph_reachability_or_attention_mass",
@@ -1098,6 +1116,8 @@ def _run_inference(
             os.replace(support_temporary, support_path)
         os.replace(provenance_temporary, provenance_path)
     except BaseException:
+        import sys
+        he_stack.__exit__(*sys.exc_info())
         from contextlib import suppress
         # A writer can also fail while closing (for example on a full disk).
         # Attempt every close and still remove all invocation-owned temporaries.

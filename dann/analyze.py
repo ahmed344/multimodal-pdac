@@ -135,6 +135,7 @@ def extract_latent_predictions(
     model: AdversarialLatentFusion,
     loader: torch.utils.data.DataLoader[dict[str, torch.Tensor]],
     device: torch.device,
+    *, he_writer=None,
 ) -> dict[str, np.ndarray]:
     """Stream latent vectors and ZILN parameters from sparse MSI rows.
 
@@ -162,6 +163,11 @@ def extract_latent_predictions(
         for cpu_batch in loader:
             batch = move_batch_to_device(cpu_batch, device)
             predictions = model(batch, grl_strength=0.0)
+            from dann.he import analysis_he_statistics
+            for key, value in analysis_he_statistics(predictions, batch).items():
+                outputs.setdefault(key, []).append(value)
+            if he_writer is not None:
+                he_writer.write(cpu_batch['row_ids'].numpy(), predictions['he_prediction'].cpu().numpy())
             for key in ("latent", "pi", "mu", "sigma"):
                 outputs[key].append(predictions[key].cpu().numpy())
             for key in ("support", "latent_support"):
@@ -1027,8 +1033,13 @@ def plot_loss_curves(
         ("batch_loss", "Batch discriminator"),
         ("batch_accuracy", "Batch accuracy"),
     ]
-    figure, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
-    for axis, (metric, title) in zip(axes.flat, panels, strict=True):
+    if 'train_he_mse' in history:
+        panels.extend([('he_mse', 'H&E MSE'), ('he_weighted_loss', 'Weighted H&E objective')])
+    rows = (len(panels) + 2) // 3
+    figure, axes = plt.subplots(rows, 3, figsize=(16, 4.5 * rows), constrained_layout=True)
+    for axis in axes.flat[len(panels):]:
+        axis.set_visible(False)
+    for axis, (metric, title) in zip(axes.flat, panels):
         axis.plot(history["epoch"], history[f"train_{metric}"], label="Train")
         axis.plot(
             history["epoch"], history[f"validation_{metric}"], label="Validation"
@@ -1201,7 +1212,9 @@ def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | 
     )
     mc_samples, mc_seed = density_sampling_settings(config["analysis"])
     density_rng = np.random.default_rng(mc_seed)
-    extracted = extract_latent_predictions(model, bundle.loaders[split], device)
+    from dann.he import extract_with_he
+    output_dir = Path(config["analysis"]["output_dir"])
+    extracted = extract_with_he(model, bundle.loaders[split], device, config, output_dir, split)
     extracted["target_transform"] = target_contract(config)
     extracted["density_mean"] = ziln.sampled_density_mean(
         extracted["pi"], extracted["mu"], extracted["sigma"],
@@ -1311,7 +1324,7 @@ def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | 
     scatter_data = (
         extracted
         if scatter_split == split
-        else extract_latent_predictions(model, bundle.loaders[scatter_split], device)
+        else extract_with_he(model, bundle.loaders[scatter_split], device, config, output_dir, scatter_split)
     )
     scatter_data["target_transform"] = target_contract(config)
     if scatter_split != split:

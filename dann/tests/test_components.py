@@ -40,6 +40,7 @@ def spatial_config(tmp_path):
     tissue[np.arange(0, len(keys), 2)].copy().write_h5ad(tmp_path/'labels.h5ad')
     config = load_config(Path('dann/config.yaml'))
     # Exercise the legacy path unless a test explicitly opts into execution caches.
+    config['model']['heads'].pop('he', None)
     config['performance'] = {}
     config['analysis'].pop('spatial_execution', None)
     config['analysis'].pop('peaks', None)  # Peak fixtures supply lesion/HES metadata separately.

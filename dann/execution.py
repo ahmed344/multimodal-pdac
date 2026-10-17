@@ -394,7 +394,7 @@ def evaluation_groups(model: torch.nn.Module, loader: Any,
                     pending_batch, pending_outputs = [], []
                 pending_id = group
                 pending_batch.append({k: batch[k][start:stop] for k in
-                    ('targets', 'target_valid_mask', 'batches', 'row_ids') if k in batch})
+                    ('targets', 'target_valid_mask', 'batches', 'row_ids', 'he_targets') if k in batch})
                 pending_outputs.append({k: v[start:stop] for k, v in outputs.items()})
         if pending_batch:
             b, o = finish()

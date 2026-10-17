@@ -82,6 +82,10 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
         checkpoint learning rate stays in place.
     """
 
+    has_he = any(c.get('model', {}).get('heads', {}).get('he', {}).get('enabled', False)
+                 for c in (saved_config, requested_config))
+    if has_he and architecture_contract(saved_config)['components'].get('he') != architecture_contract(requested_config)['components'].get('he'):
+        raise ValueError('Incompatible H&E settings on resume; adding or changing the head requires fresh training.')
     config = copy.deepcopy(dict(saved_config))
     training = config.setdefault("training", {})
     requested = requested_config["training"]
@@ -636,6 +640,8 @@ def _format_epoch_summary(
         ("mean_loss", "positive_loss", 6),
         ("cd8_loss", "cd8_loss", 6),
     )
+    if "he_mse" in train_metrics:
+        loss_parts += (("he_mse", "he_mse", 6), ("he_weighted_loss", "he_weighted_loss", 6))
     fit_parts = (
         ("batch_acc", "batch_accuracy", 4),
         ("hurdle_acc", "hurdle_acc", 4),
@@ -685,6 +691,7 @@ def run_epoch(
     cd8_index: int = 0,
     target_columns: Sequence[str] | None = None,
     sampling_audit_dir: Path | None = None,
+    he_weight: float = 1.0,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -695,6 +702,7 @@ def run_epoch(
         device (torch.device): Compute device.
         biology_weight (float): Biology objective multiplier.
         batch_weight (float): Discriminator objective multiplier.
+        he_weight (float): Raw H&E feature MSE multiplier when the head is enabled.
         class_weights (torch.Tensor | None): Optional batch class weights.
         optimizer (torch.optim.Optimizer | None): Optimizer, or ``None`` to validate.
         epoch_index (int): Zero-based epoch index.
@@ -730,6 +738,8 @@ def run_epoch(
         torch.cuda.reset_peak_memory_stats(device)
     metrics = {key: torch.as_tensor(value, dtype=torch.float64, device=device)
                for key, value in _empty_metrics(num_targets).items()}
+    metrics.update(he_sum=torch.zeros((), dtype=torch.float64, device=device),
+                   he_count=torch.zeros((), dtype=torch.float64, device=device))
     cd8_loss = ZILNLoss([1.0], ziln_loss.logit_epsilon, "sum",
                         ziln_loss.include_normal_constant).to(device)
     steps_per_epoch = max(len(loader), 1)
@@ -776,7 +786,14 @@ def run_epoch(
             discriminator = F.cross_entropy(
                 outputs["batch_logits"], batch["batches"], weight=class_weights
             )
-            total = biology_weight * biology.total + batch_weight * discriminator
+            he_loss = biology.total.new_zeros(())
+            if 'he_prediction' in outputs:
+                from dann.he import he_mse
+                he_loss = he_mse(outputs['he_prediction'], batch['he_targets'])
+                with torch.no_grad():
+                    metrics['he_sum'] += (outputs['he_prediction'].double() - batch['he_targets'].double()).square().sum()
+                    metrics['he_count'] += batch['he_targets'].numel()
+            total = biology_weight * biology.total + batch_weight * discriminator + he_weight * he_loss
             finite_outputs = torch.stack([torch.isfinite(value).all() for value in outputs.values()]).all()
             if not (torch.isfinite(total) & finite_outputs):
                 raise FloatingPointError(
@@ -812,8 +829,11 @@ def run_epoch(
         metrics[key] = packed[offset:offset+size].reshape(tuple(value.shape)) if value.ndim else float(packed[offset])
         offset += size
     finalized = _finalize_metrics(metrics, target_columns)
+    if getattr(model, 'he_predictor', None) is not None:
+        finalized['he_mse'] = metrics['he_sum'] / metrics['he_count'] if metrics['he_count'] else 0.0
+        finalized['he_weighted_loss'] = he_weight * finalized['he_mse']
     finalized["total_loss"] = (
-        biology_weight * finalized["biology_loss"] + batch_weight * finalized["batch_loss"]
+        biology_weight * finalized["biology_loss"] + batch_weight * finalized["batch_loss"] + finalized.get("he_weighted_loss", 0.0)
     )
     if audit is not None and audit.compositions:
         with (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").open("w") as handle:
@@ -867,6 +887,8 @@ def save_checkpoint(
         settings = component_settings(config["model"])
         for name, group in [("aggregation", saved_config["model"]["aggregation"]),
                             *saved_config["model"]["heads"].items()]:
+            if name == "he" and name not in settings["heads"]:
+                continue
             resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
             group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
             group["gatv2"] = resolved["gatv2"]
@@ -1093,6 +1115,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 device=device,
                 biology_weight=float(config["loss"]["biology_weight"]),
                 batch_weight=float(config["loss"]["batch_weight"]),
+                he_weight=float(config["loss"].get("he_weight", 1.0)),
                 class_weights=class_weights,
                 optimizer=optimizer,
                 epoch_index=epoch,
@@ -1112,6 +1135,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 device=device,
                 biology_weight=float(config["loss"]["biology_weight"]),
                 batch_weight=float(config["loss"]["batch_weight"]),
+                he_weight=float(config["loss"].get("he_weight", 1.0)),
                 class_weights=class_weights,
                 optimizer=None,
                 epoch_index=epoch,
