@@ -56,8 +56,11 @@ class ResidentSpectra:
                 np.sqrt(values, out=values)
             if data.get('intensity_clip_max') is not None:
                 np.minimum(values, data['intensity_clip_max'], out=values)
-            if not np.isfinite(values).all() or np.any(values < 0):
-                raise ValueError('Invalid transformed MSI intensities in resident cache.')
+            invalid = ~np.isfinite(values) | (values < 0)
+            if invalid.any():
+                position = start + np.flatnonzero(invalid)[0]
+                row = np.searchsorted(self.indptr[1:], position, side='right')
+                raise ValueError(f'Invalid transformed MSI intensities in resident cache at row {row}.')
         for array in (self.indptr, self.indices, self.values):
             array.flags.writeable = False
         self.nbytes = sum(a.nbytes for a in (self.indptr, self.indices, self.values))
@@ -140,6 +143,7 @@ class PreparedLoader:
         self.tile_budget = (settings['validation_gat_tiles'] if validation else None) or model_config.get('gatv2_tile_budget', 8)
         self._iteration_created = False
         self._metrics_lock = Lock()
+        self._transfer_streams: dict[int, torch.cuda.Stream] = {}
         self.pooled_only = False
         self.inference = False
         self.wait_seconds = 0.
@@ -154,8 +158,12 @@ class PreparedLoader:
 
     def prepare(self, request: Any) -> dict[str, Any]:
         """Gather one complete batch and prepare execution metadata on CPU."""
+        from dann.data_loader import SparseAnnDataDataset, sparse_collate
         if self.source.batch_sampler is None:
             batch = self.dataset[request]
+        elif (isinstance(self.dataset, SparseAnnDataDataset)
+              and self.source.collate_fn is sparse_collate and not self.pooled_only):
+            batch = self.dataset.get_batch(request)
         else:
             items = (self.dataset.__getitems__(request) if hasattr(self.dataset, '__getitems__')
                      else [self.dataset[i] for i in request])
@@ -223,15 +231,28 @@ class PreparedLoader:
                 yield batch
 
 
+def _transfer_stream(loader: Any, device: torch.device) -> torch.cuda.Stream:
+    """Reuse loader-owned streams so allocator caches stay reusable across passes."""
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    streams = getattr(loader, '_transfer_streams', None)
+    if streams is None:
+        streams = loader._transfer_streams = {}
+    if index not in streams:
+        streams[index] = torch.cuda.Stream(device=torch.device('cuda', index))
+    return streams[index]
+
+
 def device_batches(loader: Any, device: torch.device) -> Iterator[tuple[dict, dict]]:
-    """Overlap one pinned batch transfer with compute; retain sources until DMA completes."""
+    """Overlap transfers on a persistent loader stream; retain sources through DMA."""
     settings = getattr(loader, 'settings', {})
     enabled = device.type == 'cuda' and settings.get('transfer_prefetch', False)
     if not enabled:
         for cpu in loader:
             yield cpu, tree_map(cpu, lambda t: t.to(device, non_blocking=True))
         return
-    stream = torch.cuda.Stream(device=device)
+    stream = _transfer_stream(loader, device)
+    # Freeze an unindexed CUDA device for this pass, including later resumptions.
+    device = stream.device
     iterator = iter(loader)
 
     def stage(cpu):

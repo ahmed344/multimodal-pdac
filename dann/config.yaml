@@ -153,7 +153,7 @@ training:
   pixel:  # Used only when aggregation and both prediction heads are MLPs.
     batch_size: 2048  # Supervised sparse pixels per optimizer step.
     validation_batch_size: 4096  # Supervised sparse pixels per validation step.
-    learning_rate: 0.01  # AdamW learning rate for pixel mode.
+    learning_rate: 0.001  # AdamW learning rate for pixel mode.
     num_workers: 20  # Read-only, process-local HDF5 data-loader workers.
     prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
 
@@ -162,7 +162,7 @@ training:
     sampling_strategy: proportional_slide_tiles  # Independently shuffled slide queues, proportional row interleaving.
     supervised_rows_per_batch: 2048  # Exact training row budget; final epoch batch may be smaller.
     tiles_per_batch: 8  # Validation/test tile count; also training count with legacy shuffled_tiles.
-    learning_rate: 0.001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
+    learning_rate: 0.0001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
     num_workers: 20  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
     prefetch_factor: 4  # Tile batches prefetched per worker; larger batches also increase host-memory use.
     # Halo is derived: aggregation radius + max(biology radius, discriminator radius, H&E radius).
@@ -178,8 +178,9 @@ training:
   grl_max_lambda: 0.25  # Maximum encoder-bound gradient reversal strength.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
   grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
-  early_stopping_patience: 10  # Epochs without improvement in mean validation CD8 ZILN loss over valid CD8 rows.
-  early_stopping_min_delta: 0.001  # Minimum improvement in that selection metric; training still uses all four targets.
+  early_stopping_metric: supervised_objective  # Weighted IHC + H&E; cd8_loss is available for comparison. Omitted settings retain legacy CD8 selection.
+  early_stopping_patience: 10  # Epochs without improvement in the validation selection metric.
+  early_stopping_min_delta: 0.001  # Minimum improvement in supervised-objective units (or CD8-loss units when selected).
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
   resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, and early stopping may override.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.

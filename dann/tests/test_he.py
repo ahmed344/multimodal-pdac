@@ -128,6 +128,9 @@ def test_prepared_split_core_alignment_regrouping_and_epoch_mse(he_config):
     metrics = epoch(model, bundle.loaders['validation'], ZILNLoss.from_config(c))
     assert metrics['he_mse'] == pytest.approx(sse/count)
     assert metrics['he_weighted_loss'] == metrics['he_mse']
+    validation_targets = expected[bundle.split_indices['validation']].astype(np.float64)
+    centered_sum = np.square(validation_targets-validation_targets.mean(axis=0)).sum()
+    assert metrics['he_r2'] == pytest.approx(1-sse/centered_sum)
     assert metrics['total_loss'] == pytest.approx(5*metrics['biology_loss']+metrics['batch_loss']+metrics['he_mse'])
 
 
@@ -266,8 +269,9 @@ def test_pixel_worker_alignment_and_mse_batch_size_independence(he_config):
         loader = DataLoader(dataset, batch_size=size, num_workers=2, collate_fn=sparse_collate)
         for batch in loader:
             np.testing.assert_array_equal(batch['he_targets'], targets[batch['row_ids'].numpy()])
-        metrics.append(epoch(model, loader, ZILNLoss.from_config(c))['he_mse'])
-    assert metrics[0] == pytest.approx(metrics[1], rel=1e-7)
+        metrics.append(epoch(model, loader, ZILNLoss.from_config(c)))
+    for key in ('he_mse', 'he_r2'):
+        assert metrics[0][key] == pytest.approx(metrics[1][key], rel=1e-7)
 
 
 def test_optimized_analysis_cache_retains_mse_and_exports_on_request(he_config, tmp_path, monkeypatch):

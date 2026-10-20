@@ -230,6 +230,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser.add_argument('--production', choices=['none', 'aggregation', 'biology'], default='none')
     args = parser.parse_args(argv)
     config = load_config(args.config)
+    # This fixed-epoch diagnostic still compares CD8 scores, independently of
+    # the production early-stopping policy.
+    config['training']['early_stopping_metric'] = 'cd8_loss'
     for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
         group['cnn']['residual'] = False  # Historical plain-CNN controls.
     t = config['training']; seed = int(t['seed'])

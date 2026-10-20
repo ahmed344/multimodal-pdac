@@ -449,12 +449,18 @@ def test_epoch_summary_aligns_each_target():
         "hurdle_acc_stroma": 0.64,
         "mean_r2_stroma": 0.13,
     }
-    summary = _format_epoch_summary(12, 300, train, validation, columns)
+    for metrics in (train, validation):
+        for branch in ('biology', 'batch', 'hurdle', 'positive'):
+            metrics[f'{branch}_weighted_loss'] = metrics[f'{branch}_loss']
+        metrics['supervised_objective'] = metrics['biology_weighted_loss']
+        metrics['total_loss'] = metrics['supervised_objective'] + metrics['batch_weighted_loss']
+    summary = _format_epoch_summary(12, 300, train, validation, columns, 'supervised_objective')
     expected = "\n".join([
-        "epoch=12/300 | biology_loss = 1.234567, 1.345678 | batch_loss = 0.501234, 0.512345 | "
-        "hurdle_loss = 0.401234, 0.412345 | mean_loss = 0.833333, 0.933333 | "
-        "cd8_loss = 1.111111, 1.222222",
-        "  batch_acc = 0.8123, 0.7901 | hurdle_acc = 0.7100, 0.6800 | mean_r2 = 0.2100, 0.1800",
+        "epoch=12/300 | total objective = 1.735801, 1.858023 | "
+        "stopping objective (supervised_objective) = 1.234567, 1.345678 | "
+        "IHC objective = 1.234567, 1.345678 | batch objective = 0.501234, 0.512345 | "
+        "hurdle objective = 0.401234, 0.412345 | positive objective (location + scale) = 0.833333, 0.933333",
+        "  batch_acc = 0.8123, 0.7901 | macro hurdle_acc = 0.7100, 0.6800 | macro mean_r2 = 0.2100, 0.1800",
         "  [CD8]      hurdle_acc = 0.7200, 0.7000 | mean_r2 = 0.2200, 0.2000",
         "  [Tumor]    hurdle_acc = 0.7000, 0.6800 | mean_r2 = 0.1700, 0.1500",
         "  [Collagen] hurdle_acc = 0.6900, 0.6600 | mean_r2 = 0.1600, 0.1400",

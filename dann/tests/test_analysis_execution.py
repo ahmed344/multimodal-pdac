@@ -195,6 +195,7 @@ def test_end_to_end_cache_reuse_and_failure_preserves_outputs(spatial_config, tm
     monkeypatch.setattr(analyze, 'fit_latent_umap', lambda latent, config: latent[:, :2].copy())
     calls = []
     def compact(config, path, epoch, metadata, extracted, scatter, coords, peptides, activity, output, render, **kwargs):
+        assert kwargs['checkpoint']['config']['loss'] == torch.load(path, weights_only=False)['config']['loss']
         calls.append((extracted['density_mean'].copy(), scatter['density_mean'].copy()))
         analyze.build_latent_umap_frame(extracted, coords, config['data']['target_columns'],
             metadata.batch_names, config['analysis']['split']).to_csv(output / 'latent.csv', index=False)

@@ -32,6 +32,7 @@ from dann.config import (
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.model import AdversarialLatentFusion
 from dann.train import move_batch_to_device
+from dann.objective_curves import plot_loss_curves
 from dann.targets import (
     checkpoint_analysis_config, observed_targets, target_contract, target_label,
 )
@@ -995,70 +996,6 @@ def plot_latent_umap_ziln_diagnostics_per_target(
     plt.close(figure)
 
 
-def plot_loss_curves(
-    history_path: Path,
-    output_path: Path,
-    figure_dpi: int,
-    best_epoch: int | float | None = None,
-) -> None:
-    """Plot train/validation objective components and batch accuracy.
-
-    A dashed red vertical line marks the best-model epoch selected by minimum
-    validation biology loss when ``best_epoch`` is omitted.
-
-    Args:
-        history_path (Path): Training history CSV.
-        output_path (Path): Destination PNG path.
-        figure_dpi (int): Saved figure resolution.
-        best_epoch (int | float | None): One-based epoch of the chosen best
-            checkpoint. When ``None``, uses the epoch with the lowest
-            ``validation_biology_loss`` in ``history_path``.
-
-    Returns:
-        None: Figure is saved to disk.
-    """
-
-    history = pd.read_csv(history_path)
-    if best_epoch is None:
-        best_epoch = float(
-            history.loc[history["validation_biology_loss"].idxmin(), "epoch"]
-        )
-    else:
-        best_epoch = float(best_epoch)
-    panels = [
-        ("total_loss", "Total objective"),
-        ("biology_loss", "ZILN biology"),
-        ("hurdle_loss", "Zero hurdle"),
-        ("positive_loss", "Positive logit-normal"),
-        ("batch_loss", "Batch discriminator"),
-        ("batch_accuracy", "Batch accuracy"),
-    ]
-    if 'train_he_mse' in history:
-        panels.extend([('he_mse', 'H&E MSE'), ('he_weighted_loss', 'Weighted H&E objective')])
-    rows = (len(panels) + 2) // 3
-    figure, axes = plt.subplots(rows, 3, figsize=(16, 4.5 * rows), constrained_layout=True)
-    for axis in axes.flat[len(panels):]:
-        axis.set_visible(False)
-    for axis, (metric, title) in zip(axes.flat, panels):
-        axis.plot(history["epoch"], history[f"train_{metric}"], label="Train")
-        axis.plot(
-            history["epoch"], history[f"validation_{metric}"], label="Validation"
-        )
-        axis.axvline(
-            best_epoch,
-            color="red",
-            linestyle="--",
-            linewidth=1.5,
-            label=f"Best model (epoch {int(best_epoch)})",
-        )
-        axis.set_title(title)
-        axis.set_xlabel("Epoch")
-        axis.grid(alpha=0.25)
-        axis.legend()
-    figure.savefig(output_path, dpi=figure_dpi)
-    plt.close(figure)
-
-
 def plot_ziln_density_scatter(
     predicted_mu: np.ndarray,
     true_targets: np.ndarray,
@@ -1390,6 +1327,8 @@ def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | 
     )
     family_table.to_csv(output_dir / "peptide_families.csv", index=False)
     history_path = model_dir / "history.csv"
+    from dann.selection import checkpoint_selection
+    curve_checkpoint = checkpoint
     best_checkpoint_path = model_dir / "best.pt"
     if checkpoint_path.resolve() == best_checkpoint_path.resolve():
         best_epoch = checkpoint_epoch
@@ -1397,14 +1336,17 @@ def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | 
         best_payload = torch.load(
             best_checkpoint_path, map_location="cpu", weights_only=False
         )
+        curve_checkpoint = best_payload
         best_epoch = int(best_payload["epoch"]) + 1
     else:
-        best_epoch = None
+        best_epoch = checkpoint_selection(checkpoint)["best_epoch"]
     plot_loss_curves(
         history_path,
         (output_dir if output_override is not None else model_dir) / "loss_curves.png",
         int(config["analysis"]["figure_dpi"]),
         best_epoch=best_epoch,
+        config=curve_checkpoint["config"],
+        selection=checkpoint_selection(curve_checkpoint),
     )
     from dann.diagnostics import write_density_diagnostics
     write_density_diagnostics(extracted, config, output_dir, split)

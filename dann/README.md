@@ -34,11 +34,11 @@ total = biology_weight * IHC_loss + batch_weight * batch_cross_entropy
 
 The mean covers selected core pixels and feature dimensions. `loss.he_weight:
 1.0` is the initial baseline, not a tuned optimum. Training and validation history
-record `he_mse`, `he_weighted_loss`, and the updated `total_loss`; squared-error
+record `he_mse`, `he_weighted_loss`, `he_r2`, and the updated `total_loss`; squared-error
 sums and element counts produce batch-size-independent H&E metrics. Loss plots
-include both H&E series. The 90:10 study split and validation **CD8 likelihood**
-checkpoint/early-stopping criterion remain unchanged. Shared-representation
-objectives and full comparative training remain later experiments.
+show `he_weighted_loss` as **H&E objective**, without a separate MSE panel.
+The checked-in early-stopping criterion is the validation supervised objective
+(weighted IHC plus H&E). The study split remains 90:10.
 
 Analysis always writes `analysis/he/{split}_metrics.json` for an enabled head.
 `analysis.export_he_predictions: true` additionally streams vectors into
@@ -282,8 +282,24 @@ counts, then assign the remainder to test. Loading or resuming historical
 checkpoints preserves their saved split membership even if configured fractions
 have changed. H&E-mediated transfer is assessed separately.
 
-Checkpoint selection uses **mean validation CD8 ZILN loss over valid CD8 rows**.
-Training still optimizes all four weighted targets plus the adversarial objective.
+Checkpoint selection and early stopping both use **validation supervised objective**
+with `training.early_stopping_metric: supervised_objective` in the checked-in YAML.
+The optimized loss is unchanged:
+
+```text
+IHC_weighted = biology_weight * IHC_loss
+HE_weighted = he_weight * he_mse                 # omitted when disabled
+Batch_weighted = batch_weight * batch_cross_entropy
+Supervised = IHC_weighted + HE_weighted          # stopping / best.pt score
+Total = Supervised + Batch_weighted             # backpropagation objective
+```
+
+`cd8_loss` remains available for comparison and is the default when the setting
+is absent. It selects mean validation CD8 ZILN loss over valid CD8 rows.
+`early_stopping_min_delta` measures units of the selected score: supervised-objective
+units in the checked-in configuration. Weights, learning rates, GRL, patience,
+and the numeric minimum improvement are unchanged by this selection policy.
+
 Checkpoints save the exact split positions plus an ordered row/feature identity
 fingerprint; analysis reuses those splits and may cap them further. There is no
 refit using validation or test labels. Version-five architecture metadata records
@@ -292,13 +308,69 @@ and optimizer parameter names. Legacy flat configurations mean Deep Sets with
 MLP aggregation and heads. Legacy parameter-key conversion is identity because
 keys and registration order were retained; optimizer ordering and state shapes
 are checked before resume. Incompatible components or targets are rejected.
-A legacy selection score is reset when resuming under the CD8 selection metric.
+Checkpoints explicitly record `selection_metric`, `best_selection_score`,
+`best_epoch` (one-based), `selection_start_epoch` (one-based), and
+`early_stopping_state` (stale epochs, patience, minimum improvement, stopped flag).
+Supervised scores are never written under CD8-labelled fields. Compatible resumes
+restore the score, selected epoch, and stale-epoch count even without `history.csv`;
+recognized old CD8 checkpoints can replay their saved CD8 history for patience.
+Changing the metric resets the score and patience at the next epoch, records that
+selection boundary, and selects only newly evaluated epochs. Set `training.epochs`
+beyond the resumed checkpoint epoch; a metric switch with no additional epoch is
+rejected. Unknown legacy selection rules also start a new selection period.
+
 Training resume copies the checkpoint configuration, then applies only the current
 YAML values for `epochs`, `num_workers`, `prefetch_factor`,
-`early_stopping_patience`, and `early_stopping_min_delta`. The checkpoint learning
+`early_stopping_metric`, `early_stopping_patience`, and `early_stopping_min_delta`,
+plus the documented performance and post-training overrides. The checkpoint learning
 rate and other training settings stay in place; differing YAML values are reported
 and ignored. `--smoke-test` cannot be combined with a resume checkpoint. Completed
 `history.csv` rows are kept and `loss_curves.png` is refreshed from that full history.
+
+History retains raw loss and fit columns and adds `biology_weighted_loss`,
+`hurdle_weighted_loss`, `positive_weighted_loss`, `batch_weighted_loss`, and
+`supervised_objective`, each prefixed by `train_` or `validation_`. Per-signal
+`hurdle_weighted_loss_<signal>` and `positive_weighted_loss_<signal>` include both
+the signal's target weight and `biology_weight`. Their sums equal the aggregate
+IHC objective. For mean reduction, every signal and both branches share the total
+valid target-weight mass denominator, accumulated across the epoch. Positive
+contributions are not divided by positive counts. Sum reduction retains the
+existing sample-weighted average of batch sums for aggregate and per-signal reports.
+`selected_epoch` and `selection_start_epoch` preserve selection metadata in history.
+
+The four-column plot is 20 inches wide and 33.4 inches tall for the four configured
+signals. In the first two rows, total objective sits directly above supervised
+objective in column one, discriminator accuracy above batch discriminator
+objective in column two, and H&E R² above H&E objective in column three. Every
+subsequent pair of rows places balanced hurdle accuracy and positive-logit R²
+directly above their weighted hurdle and positive likelihood objectives. These
+blocks show aggregate IHC macro fit metrics beside CD8, then Tumor beside
+Collagen, then Stroma. The combined IHC objective remains in history and the
+additive formulas, while its two branches occupy separate metric/objective pairs
+in the figure. Unused cells and disabled H&E panels are hidden. One shared legend
+identifies Train, Validation, and the selected checkpoint epoch across all panels.
+Epoch axes are aligned, with numeric ticks and no repeated "Epoch" axis labels;
+no minimum is inferred from incomplete history.
+
+`train_he_r2` and `validation_he_r2` are variance-weighted feature R² values:
+`1 - sum((target - prediction)**2) / sum((target - feature_mean)**2)`, where each
+feature mean is computed over the entire respective epoch. Float64 per-feature
+means and centered sums of squares are merged across batches, including the
+variation between batch means. No target or prediction matrix is retained.
+Fewer than two observations or zero total feature variance yields an unavailable
+value. R² is higher-is-better and may be negative; it does not change the MSE
+objective, gradients, or checkpoint selection. Historical MSE alone cannot
+reconstruct H&E R², so those entries remain unavailable.
+
+IHC positive-logit R² measures the positive mean, while its likelihood objective
+depends on both location and scale and may also be negative. Additive formulas
+clarify how the detailed panels decompose IHC. Both analysis paths use the
+checkpoint's saved weights, target order, and selection metadata. Historical
+aggregate losses can be weighted from saved settings; unavailable per-signal
+losses remain gaps or unavailable panels.
+This applies to future training and requested analysis; completed-run figures are
+not regenerated automatically.
+
 The architecture contract includes the residual setting for every selected CNN.
 Version-three checkpoints retain their recorded biology setting and default missing
 aggregation/discriminator flags to false. Version-two and unversioned checkpoints
@@ -1259,11 +1331,159 @@ between splits and precomputes core positions and neighborhood support. Complete
 halos and every eligible graph edge remain present. `torch_threads` optionally
 bounds PyTorch's intra-operation CPU threads to avoid oversubscription.
 
-`transfer_prefetch` uses a dedicated CUDA stream and at most two pinned staging
-batches. The compute stream waits on a transfer event, device allocations are
-recorded on the consuming stream, and source buffers stay alive through DMA.
+Pixel datasets prepare complete batches through `SparseAnnDataDataset.get_batch`
+when the prepared loader uses `sparse_collate`. Resident spectra use one ordered
+CSR gather and H&E targets use one `HETargetReader.read` per nonempty batch.
+Backed spectra sort/deduplicate source rows, read only contiguous requested runs
+using one invocation-local read-only HDF5 handle, and restore request order and
+duplicates. Ordinary DataLoaders use `__getitems__` with the same batch gathering,
+returning NumPy/scalar sample dictionaries for existing and custom collators.
+Scalar `__getitem__` remains available as a reference. Empty splits produce no
+batches; explicit empty `get_batch` requests raise the collator's empty-sequence
+error. No dense spectra or full-dataset H&E cache is constructed.
+
+This is automatic for pixel training, validation, and testing, with unchanged
+samplers, batch boundaries, preprocessing, targets, losses, and checkpoint schema.
+Spatial tile/graph preparation is unchanged. Resident preprocessing errors also
+identify the original source row.
+
+Reproduce the pixel comparison in a fresh diagnostic directory on an idle GPU:
+
+```bash
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+python -m dann.verification.pixel_loader_benchmark \
+  --output data/PDAC/Results/dann/diagnostics/pixel-loader-comparison --full-epoch
+```
+
+The harness freezes **row-index requests**, including the full sampler order,
+largest stored-entry footprint and actual final partial batch. Each pair uses
+identical initial weights, requests, seeds, losses, and execution settings. Five
+warm-up batches per phase precede 64 measured training and 24 validation batches;
+three trials alternate implementation order. `--full-epoch` additionally checks
+one complete resident training/validation epoch per implementation. Tensor
+gathering, H&E reads, collation, transfers and model/optimizer execution all remain
+inside the measurement. Scalar fetching is retained in a benchmark-only wrapper.
+Resident runs use the configured two preparation threads and two queued batches;
+backed runs use zero preparation threads, as required by the existing performance
+validator, with the same 2,048/4,096 row batches. Neither comparison tunes settings.
+
+Artifacts include source/config snapshots, row requests, initial/final model
+states, per-phase preparation time, loader wait, throughput, sampled utilization,
+and the existing host/CUDA memory measurements. Preparation time sums overlapping
+thread durations; loader wait is time blocked awaiting prepared batches. GPU
+utilization samples every 0.5 seconds are coarse for short validation passes.
+Peak host RSS and reserved CUDA memory can retain earlier phases' high-water marks;
+no allocator changes or cache flushing are performed. The `--deterministic` flag
+supports a separate numerical audit with
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`; its timings should be kept separate from the
+default training profile.
+
+The 2026-10-19 comparison used the labeled file's 1,698,428 rows and 686,730,743
+stored MSI entries, the configured H&E head, and an RTX 5090 with PyTorch
+2.11.0+cu128. Median default-profile results over three pairs were:
+
+| Storage / phase | Scalar seconds | Batched seconds | Speedup | Batched loader wait |
+| --- | ---: | ---: | ---: | ---: |
+| Resident, 64 training batches | 26.40 | 2.86 | 9.22× | 0.98% |
+| Resident, 24 validation batches | 19.57 | 0.87 | 22.58× | 7.65% |
+| Backed, 64 training batches | 41.12 | 5.50 | 7.47× | 73.88% |
+| Backed, 24 validation batches | 30.57 | 3.56 | 8.59× | 79.71% |
+| Resident, complete training epoch (one pair) | 305.46 | 32.57 | 9.38× | 0.12% |
+| Resident, complete validation epoch (one pair) | 33.36 | 1.44 | 23.10× | 4.94% |
+
+The complete training/validation pass fell from **338.8 to 34.0 seconds**. Median
+training throughput rose from 4,966 to 45,780 rows/s resident and from 3,188 to
+23,823 rows/s backed. Resident preparation summed 52.31 versus 1.04 CPU wall
+seconds across threads for 64 batches; backed preparation fell from 39.68 to
+4.06 seconds. Sampled training GPU utilization rose from 9.3% to 85.3% resident
+and from 6.4% to 47.6% backed. Allocated CUDA peaks were essentially unchanged:
+7.49 GiB for training, 1.12 GiB for validation, and 7.57 GiB for the full training
+epoch. Memory optimization remains deferred.
+
+All three resident training speedups were 9.0–9.3×; no reproducible throughput
+regression above 5% occurred. The resident throughput and wait targets were met.
+The backed path still spends most time preparing inputs with its unchanged
+zero-thread setting. Frozen shuffled requests have medians of 2,046 distinct
+contiguous CSR runs per training batch and 4,086 per validation batch, so bounded
+HDF5 reads remain significant. Worker-count/batch-size tuning was not part of
+this comparison. These are prepared-loader measurements with normal OS caching;
+cold-disk and multi-process throughput were not measured. The timings include
+model execution and are separate
+from the earlier isolated 38× H&E-reading probe.
+
+Correctness checks compare every field's value, dtype, shape and order to scalar
+collation, including repeated rows, empty spectra, duplicate peaks, explicit
+zeros, all transforms, filtering/clipping, masks and optional H&E. Tests cover
+source-row errors, invocation-local handle cleanup, ordinary/persistent process
+workers, custom collators, ordered preparation threads, unchanged RNG state,
+budget checks, and seeded outputs, losses, gradients and an optimizer update.
+Existing CUDA transfer/stream regressions are included in the DANN suite.
+Final verification passed **962 tests** with
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 python -m pytest -q dann/tests`.
+
+Default CUDA training is not bitwise reproducible: the short paired runs had
+parameter differences up to 3.46e-5, and repeated scalar runs also differed. The
+full default-profile pair accumulated a maximum parameter difference of 0.395
+and a validation-loss difference of 0.146. A separate deterministic CUDA replay
+matched **all final model parameters and training/validation losses exactly**
+over the complete resident epoch (747 updates, 1,528,567 training rows and
+169,861 validation rows), as well as the 64-update resident and backed checks.
+This isolates the default-profile drift from input preparation. Determinism was
+enabled only for this verification; production behavior and the timing table above retain
+the existing CUDA settings.
+
+Raw measurements, requests, snapshots and model states are under
+`data/PDAC/Results/dann/diagnostics/2026-10-19-pixel-batches/`. The separate
+deterministic numerical audit is under the same parent with the directory name
+`2026-10-19-pixel-batches-deterministic/`.
+
+`transfer_prefetch` lazily creates one dedicated CUDA stream per loader and device,
+then reuses it across training, validation, or inference passes. Unindexed `cuda`
+resolves to the current device, sharing its entry with the explicit device index.
+The stream cache lives with the loader as runtime state; it is absent from model
+weights, checkpoints, and configuration. PyTorch's native allocator reuses cached
+blocks on their allocation stream, so keeping the stream avoids populating new
+stream-specific caches each epoch. Reserved memory can still exceed live tensor
+memory and vary with batch sizes; routine cache flushing is unnecessary.
+
+There are at most two pinned staging batches. The compute stream waits on a
+transfer event, device allocations are recorded on the consuming stream, and
+source buffers stay alive through DMA.
+Completion, failure, and explicit iterator closure synchronize outstanding
+transfers and close the source iterator while retaining the stream for reuse.
 CPU execution uses the same prepared interface without CUDA pinning. The transfer
-path follows [PyTorch’s pinned-memory and stream guidance](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html).
+path follows [PyTorch’s pinned-memory and stream guidance](https://docs.pytorch.org/tutorials/intermediate/pinmem_nonblock.html)
+and [native allocator stream ownership](https://github.com/pytorch/pytorch/blob/v2.11.0/c10/cuda/CUDACachingAllocator.cpp).
+
+The 2026-10-19 CUDA regression repeats identical batches for 40 passes, both on
+one loader and alternating two loaders. Live allocations return to baseline and
+reserved memory stays stable after warm-up; reinstating stream creation per pass
+fails this check (40 to 1,280 MiB reserved for the synthetic workload). Tests also
+cover device aliases, empty loaders, early closure, source/transfer/consumer
+exceptions, subsequent reuse, and CNN/GATv2 output and gradient equivalence.
+
+A capped real-data replay on an RTX 5090 with PyTorch 2.11.0+cu128 and the native
+allocator used three fixed training batches of 2,048 rows and three validation
+batches of 4,096 rows per cycle, including the largest stored-entry footprint
+from each capped candidate set (up to 1.68 million peaks in a validation batch).
+Across 40 alternating passes, persistent streams stabilized at 8.71 GiB reserved
+after four passes. Median throughput over three independent runs, excluding the
+first two cycles, was:
+
+| Transfer stream lifetime | Peak reserved GiB | Peak allocated GiB (train / validation) | Training rows/s | Validation rows/s |
+| --- | ---: | ---: | ---: | ---: |
+| New stream each pass | 12.79 | 7.60 / 1.12 | 44,447 | 134,574 |
+| Reused per loader/device | 8.71 | 7.60 / 1.12 | 44,828 | 137,848 |
+
+This replay reduced reserved memory by 31.9%, with no throughput regression;
+live allocations after each pass were 0.041 GiB for both prefetch variants.
+A separate deterministic real-data check matched transferred values, model
+outputs, and training gradients exactly against disabled prefetch. Default
+nondeterministic training produced small final-weight differences after 60
+updates, also observed between unchanged repeats. These bounded replays exclude
+CPU preparation timing and do not establish full-epoch memory or convergence.
+Inputs, scripts, per-pass metrics, and numerical comparisons are saved under
+`data/PDAC/Results/dann/transfer-stream-reuse-2026-10-19/`.
 
 `model.spectral_peak_budget` and `model.gatv2_tile_budget` tune execution without
 changing spatial dimensions or optimizer rows. `spectral_checkpointing` and

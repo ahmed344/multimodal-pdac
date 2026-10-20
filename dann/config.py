@@ -312,6 +312,8 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
             group["gatv2"] = resolved["gatv2"]
     execution = execution_settings(config)
     training = config["training"]
+    from dann.selection import selection_metric
+    training["early_stopping_metric"] = selection_metric(config)
     mode = execution["mode"]
     spatial_batching = {key: training.get("spatial", training).get(key, default)
                        for key, default in (("core_size", 32), ("tiles_per_batch", 8),

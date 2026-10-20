@@ -334,7 +334,7 @@ def test_training_only_and_resume_early_stopping(tmp_path, monkeypatch):
     from dann.tests.test_components import spatial_config
     # Reuse the small CSR fixture without running real-data training.
     config = spatial_config.__wrapped__(tmp_path)
-    config['training'].update(epochs=3, early_stopping_patience=1)
+    config['training'].update(epochs=3, early_stopping_patience=1, early_stopping_metric='cd8_loss')
     original_bundle = train.create_data_bundle
     datasets = []
 

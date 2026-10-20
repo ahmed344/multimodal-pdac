@@ -28,6 +28,7 @@ from dann.checkpoints import (architecture_contract, checkpoint_config, validate
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
 from dann.targets import CD8, checkpoint_contract, target_contract
+from dann.selection import checkpoint_selection, selection_metric
 
 
 @dataclass
@@ -43,7 +44,7 @@ class EarlyStopping:
         """Update state with one validation metric.
 
         Args:
-            value (float): Current validation biology loss.
+            value (float): Current validation selection score.
 
         Returns:
             tuple[bool, bool]: Whether improved and whether training should stop.
@@ -77,7 +78,7 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
 
     Returns:
         dict[str, Any]: Checkpoint configuration with epochs, workers, prefetch,
-        early-stopping patience, minimum improvement, and the resume path replaced
+        early-stopping metric, patience, minimum improvement, and the resume path replaced
         by the requested values, plus current post-training switches. The
         checkpoint learning rate stays in place.
     """
@@ -91,6 +92,7 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     requested = requested_config["training"]
     for key in _RESUME_OVERRIDES:
         training[key] = requested[key]
+    training["early_stopping_metric"] = selection_metric(requested_config)
     from dann.config import performance_settings, post_training_settings
     config['performance'] = performance_settings(requested_config)
     config['post_training'] = post_training_settings(requested_config.get('post_training'))
@@ -273,6 +275,31 @@ def restore_resume_stopping(
     return best_epoch
 
 
+def restore_selection_state(
+    stopper: EarlyStopping,
+    checkpoint: Mapping[str, Any],
+    metric: str,
+    history: Sequence[Mapping[str, float]],
+) -> tuple[float | None, int]:
+    """Restore compatible stopping progress or start selection after the resume boundary."""
+    saved = checkpoint_selection(checkpoint)
+    if saved["selection_metric"] != metric:
+        stopper.best, stopper.stale_epochs = math.inf, 0
+        return None, int(checkpoint["epoch"]) + 2
+    stopper.best = saved["best_selection_score"]
+    state = saved["early_stopping_state"]
+    if state is not None:
+        stopper.stale_epochs = int(state["stale_epochs"])
+        return saved["best_epoch"], saved["selection_start_epoch"]
+    # Recognized old checkpoints have no explicit patience state. Replay only
+    # their CD8 history; new checkpoints never depend on an external CSV.
+    previous_delta = checkpoint.get("config", {}).get("training", {}).get("early_stopping_min_delta", stopper.min_delta)
+    replay = EarlyStopping(stopper.patience, float(previous_delta), best=stopper.best)
+    best_epoch = restore_resume_stopping(replay, history, metric == "cd8_loss")
+    stopper.stale_epochs = replay.stale_epochs
+    return best_epoch, saved["selection_start_epoch"]
+
+
 def write_training_history(
     path: Path,
     rows: Sequence[Mapping[str, float]],
@@ -317,6 +344,8 @@ def refresh_loss_curves(
     output_path: Path,
     figure_dpi: int,
     best_epoch: float | None,
+    config: Mapping[str, Any] | None = None,
+    selection: Mapping[str, Any] | None = None,
 ) -> None:
     """Redraw train and validation curves from the complete history.
 
@@ -325,13 +354,16 @@ def refresh_loss_curves(
         output_path (Path): Destination ``loss_curves.png`` path.
         figure_dpi (int): Saved figure resolution.
         best_epoch (float | None): One-based epoch of the selected checkpoint.
+        config (Mapping[str, Any] | None): Saved weights and target ordering.
+        selection (Mapping[str, Any] | None): Selection metric, epoch, and boundary.
 
     Returns:
         None: Figure is saved to disk.
     """
 
     from dann.analyze import plot_loss_curves
-    plot_loss_curves(history_path, output_path, figure_dpi, best_epoch=best_epoch)
+    plot_loss_curves(history_path, output_path, figure_dpi, best_epoch=best_epoch,
+                     config=config, selection=selection)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -458,6 +490,8 @@ def _empty_metrics(num_targets: int) -> dict[str, Any]:
         "biology": 0.0,
         "hurdle": 0.0,
         "positive": 0.0,
+        "hurdle_per_target": np.zeros(num_targets, dtype=np.float64),
+        "positive_per_target": np.zeros(num_targets, dtype=np.float64),
         "batch": 0.0,
         "batch_correct": 0.0,
         "zero_correct": np.zeros(num_targets, dtype=np.float64),
@@ -586,6 +620,8 @@ def _finalize_metrics(
         )
         result[f"hurdle_acc_{suffix}"] = balanced_accuracy
         result[f"mean_r2_{suffix}"] = float(mean_r2)
+        for branch in ("hurdle", "positive"):
+            result[f"{branch}_loss_{suffix}"] = float(metrics[f"{branch}_per_target"][index]) / biology_mass
         balanced_accuracies.append(balanced_accuracy)
         mean_r2_values.append(float(mean_r2))
     finite_balanced = [value for value in balanced_accuracies if math.isfinite(value)]
@@ -619,6 +655,7 @@ def _format_epoch_summary(
     train_metrics: Mapping[str, float],
     validation_metrics: Mapping[str, float],
     target_columns: Sequence[str],
+    metric: str = "cd8_loss",
 ) -> str:
     """Build the epoch log with one aligned line per IHC target.
 
@@ -628,25 +665,29 @@ def _format_epoch_summary(
         train_metrics (Mapping[str, float]): Finalized training metrics.
         validation_metrics (Mapping[str, float]): Finalized validation metrics.
         target_columns (Sequence[str]): Ordered target column names.
+        metric (str): Validation score used for early stopping and checkpoint selection.
 
     Returns:
         str: Loss line, macro fit line, and one ``[Name]`` line per target.
     """
 
     loss_parts = (
-        ("biology_loss", "biology_loss", 6),
-        ("batch_loss", "batch_loss", 6),
-        ("hurdle_loss", "hurdle_loss", 6),
-        ("mean_loss", "positive_loss", 6),
-        ("cd8_loss", "cd8_loss", 6),
+        ("total objective", "total_loss", 6),
+        (f"stopping objective ({metric})", metric, 6),
+        ("IHC objective", "biology_weighted_loss", 6),
+        ("batch objective", "batch_weighted_loss", 6),
+        ("hurdle objective", "hurdle_weighted_loss", 6),
+        ("positive objective (location + scale)", "positive_weighted_loss", 6),
     )
     if "he_mse" in train_metrics:
-        loss_parts += (("he_mse", "he_mse", 6), ("he_weighted_loss", "he_weighted_loss", 6))
+        loss_parts += (("H&E objective", "he_weighted_loss", 6),)
     fit_parts = (
         ("batch_acc", "batch_accuracy", 4),
-        ("hurdle_acc", "hurdle_acc", 4),
-        ("mean_r2", "mean_r2", 4),
+        ("macro hurdle_acc", "hurdle_acc", 4),
+        ("macro mean_r2", "mean_r2", 4),
     )
+    if "he_r2" in train_metrics:
+        fit_parts += (("H&E R²", "he_r2", 4),)
     loss_text = " | ".join(
         f"{label} = {_format_pair(train_metrics[key], validation_metrics[key], decimals)}"
         for label, key, decimals in loss_parts
@@ -671,6 +712,35 @@ def _format_epoch_summary(
             f"{_format_pair(train_metrics[f'mean_r2_{suffix}'], validation_metrics[f'mean_r2_{suffix}'], 4)}"
         )
     return "\n".join(lines)
+
+
+@torch.no_grad()
+def _update_he_statistics(
+    metrics: dict[str, torch.Tensor],
+    prediction: torch.Tensor,
+    targets: torch.Tensor,
+) -> None:
+    """Accumulate H&E SSE and merge float64 per-feature centered moments.
+
+    Center features separately so R² compares with each feature's epoch mean,
+    not a pooled scalar mean. Parallel variance merging preserves differences
+    between batch means without retaining predictions or all target vectors.
+    """
+    values = targets.double()
+    rows = values.shape[0]
+    mean = values.mean(dim=0)
+    centered_sum = (values - mean).square().sum(dim=0)
+    if "he_target_mean" not in metrics:
+        metrics["he_target_mean"] = torch.zeros_like(mean)
+        metrics["he_target_m2"] = torch.zeros_like(mean)
+    previous_rows = metrics["he_rows"]
+    combined_rows = previous_rows + rows
+    difference = mean - metrics["he_target_mean"]
+    metrics["he_target_m2"] += centered_sum + difference.square() * (previous_rows * rows / combined_rows)
+    metrics["he_target_mean"] += difference * (rows / combined_rows)
+    metrics["he_rows"] += rows
+    metrics["he_sum"] += (prediction.double() - values).square().sum()
+    metrics["he_count"] += values.numel()
 
 
 def run_epoch(
@@ -739,7 +809,8 @@ def run_epoch(
     metrics = {key: torch.as_tensor(value, dtype=torch.float64, device=device)
                for key, value in _empty_metrics(num_targets).items()}
     metrics.update(he_sum=torch.zeros((), dtype=torch.float64, device=device),
-                   he_count=torch.zeros((), dtype=torch.float64, device=device))
+                   he_count=torch.zeros((), dtype=torch.float64, device=device),
+                   he_rows=torch.zeros((), dtype=torch.float64, device=device))
     cd8_loss = ZILNLoss([1.0], ziln_loss.logit_epsilon, "sum",
                         ziln_loss.include_normal_constant).to(device)
     steps_per_epoch = max(len(loader), 1)
@@ -790,9 +861,7 @@ def run_epoch(
             if 'he_prediction' in outputs:
                 from dann.he import he_mse
                 he_loss = he_mse(outputs['he_prediction'], batch['he_targets'])
-                with torch.no_grad():
-                    metrics['he_sum'] += (outputs['he_prediction'].double() - batch['he_targets'].double()).square().sum()
-                    metrics['he_count'] += batch['he_targets'].numel()
+                _update_he_statistics(metrics, outputs['he_prediction'], batch['he_targets'])
             total = biology_weight * biology.total + batch_weight * discriminator + he_weight * he_loss
             finite_outputs = torch.stack([torch.isfinite(value).all() for value in outputs.values()]).all()
             if not (torch.isfinite(total) & finite_outputs):
@@ -818,6 +887,8 @@ def run_epoch(
             metrics["biology"] += biology.total.detach() * mass
             metrics["hurdle"] += biology.hurdle.detach() * mass
             metrics["positive"] += biology.positive.detach() * mass
+            metrics["hurdle_per_target"] += biology.hurdle_per_target * mass
+            metrics["positive_per_target"] += biology.positive_per_target * mass
             metrics["batch"] += discriminator.detach() * batch_size
             predictions = outputs["batch_logits"].argmax(dim=1)
             metrics["batch_correct"] += (predictions == batch["batches"]).sum().detach()
@@ -832,9 +903,18 @@ def run_epoch(
     if getattr(model, 'he_predictor', None) is not None:
         finalized['he_mse'] = metrics['he_sum'] / metrics['he_count'] if metrics['he_count'] else 0.0
         finalized['he_weighted_loss'] = he_weight * finalized['he_mse']
-    finalized["total_loss"] = (
-        biology_weight * finalized["biology_loss"] + batch_weight * finalized["batch_loss"] + finalized.get("he_weighted_loss", 0.0)
-    )
+        total_variance = float(np.sum(metrics.get('he_target_m2', 0.0)))
+        finalized['he_r2'] = (1.0 - metrics['he_sum'] / total_variance
+                              if metrics['he_rows'] >= 2 and total_variance > 0 else math.nan)
+    for branch in ("biology", "hurdle", "positive"):
+        finalized[f"{branch}_weighted_loss"] = biology_weight * finalized[f"{branch}_loss"]
+    for column in target_columns:
+        suffix = _metric_suffix(column)
+        for branch in ("hurdle", "positive"):
+            finalized[f"{branch}_weighted_loss_{suffix}"] = biology_weight * finalized[f"{branch}_loss_{suffix}"]
+    finalized["batch_weighted_loss"] = batch_weight * finalized["batch_loss"]
+    finalized["supervised_objective"] = finalized["biology_weighted_loss"] + finalized.get("he_weighted_loss", 0.0)
+    finalized["total_loss"] = finalized["supervised_objective"] + finalized["batch_weighted_loss"]
     if audit is not None and audit.compositions:
         with (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").open("w") as handle:
             handle.writelines(json.dumps(row) + "\n" for row in audit.compositions)
@@ -861,7 +941,11 @@ def save_checkpoint(
     epoch: int,
     config: Mapping[str, Any],
     bundle: DataBundle,
-    best_validation_biology: float,
+    best_selection_score: float,
+    *,
+    best_epoch: float | None = None,
+    selection_start_epoch: int = 1,
+    stopper: EarlyStopping | None = None,
 ) -> None:
     """Persist model, optimizer, schema, split, and configuration state.
 
@@ -872,7 +956,10 @@ def save_checkpoint(
         epoch (int): Last completed zero-based epoch.
         config (Mapping[str, Any]): Effective configuration.
         bundle (DataBundle): Data metadata and selected split indices.
-        best_validation_biology (float): Best validation biology loss.
+        best_selection_score (float): Best validation score in selection-metric units.
+        best_epoch (float | None): Selected one-based epoch, if known.
+        selection_start_epoch (int): First one-based epoch eligible for selection.
+        stopper (EarlyStopping | None): Explicit patience progress for training resumes.
 
     Returns:
         None: Checkpoint is written atomically through a temporary file.
@@ -908,7 +995,13 @@ def save_checkpoint(
         "optimizer_parameter_names": list(dict(model.named_parameters())),
         "data_identity": identity,
         "training_data_contract": training_data_contract(config, identity),
-        "selection_metric": "mean_valid_cd8_ziln",
+        "selection_metric": selection_metric(config),
+        "best_selection_score": float(best_selection_score),
+        "best_epoch": best_epoch,
+        "selection_start_epoch": int(selection_start_epoch),
+        "early_stopping_state": (dict(stale_epochs=stopper.stale_epochs,
+            patience=stopper.patience, min_delta=stopper.min_delta,
+            stopped=stopper.stale_epochs >= stopper.patience) if stopper is not None else None),
         "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
         "epoch": int(epoch),
@@ -917,8 +1010,6 @@ def save_checkpoint(
         "target_columns": tuple(config["data"]["target_columns"]),
         "target_transform": target_contract(config),
         "split_indices": bundle.split_indices,
-        "best_validation_biology": float(best_validation_biology),
-        "best_validation_cd8": float(best_validation_biology),
     }
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, temporary)
@@ -945,7 +1036,7 @@ def load_training_checkpoint(
             that do not rebuild the training bundle.
 
     Returns:
-        tuple[int, float]: Next epoch index and prior best validation biology loss.
+        tuple[int, float]: Next epoch index and compatible prior best selection score.
     """
 
     checkpoint = torch.load(path, map_location=device, weights_only=False)
@@ -956,8 +1047,9 @@ def load_training_checkpoint(
     validate_sampling_contract(checkpoint, config, selected_rows)
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
-    return int(checkpoint["epoch"]) + 1, float(
-        checkpoint.get("best_validation_biology", math.inf) if checkpoint.get("selection_metric") == "mean_valid_cd8_ziln" else math.inf
+    saved = checkpoint_selection(checkpoint)
+    return int(checkpoint["epoch"]) + 1, (
+        saved["best_selection_score"] if saved["selection_metric"] == selection_metric(config) else math.inf
     )
 
 
@@ -1009,6 +1101,10 @@ def train_model(config: Mapping[str, Any]) -> Path:
         if ignored:
             print("Resume kept checkpoint values for: " + ", ".join(ignored), flush=True)
         training = config["training"]
+        if (checkpoint_selection(resume_payload)["selection_metric"] != selection_metric(config)
+                and int(training["epochs"]) <= int(resume_payload["epoch"]) + 1):
+            raise ValueError("Changing the selection metric requires at least one additional epoch; increase training.epochs.")
+    metric = selection_metric(config)
     seed_everything(
         int(training["seed"]), bool(training["deterministic_algorithms"])
     )
@@ -1087,19 +1183,22 @@ def train_model(config: Mapping[str, Any]) -> Path:
     history_columns: list[str] = []
     preserved_lines: dict[float, str] = {}
     best_epoch: float | None = None
+    selection_start_epoch = 1
     history_path = output_dir / "history.csv"
     try:
         if resume:
             history, history_columns, preserved_lines = load_resume_history(history_path, start_epoch)
-            best_epoch = restore_resume_stopping(
-                stopper, history, resume_payload.get("selection_metric") == "mean_valid_cd8_ziln")
+            best_epoch, selection_start_epoch = restore_selection_state(stopper, resume_payload, metric, history)
+            if checkpoint_selection(resume_payload)["selection_metric"] != metric:
+                print(f"Selection changed to {metric}; score and patience reset at epoch {selection_start_epoch}.", flush=True)
             if history and len(preserved_lines) != _history_row_count(history_path):
                 history_columns = write_training_history(
                     history_path, history, history_columns, preserved_lines)
             if history:
                 refresh_loss_curves(
                     history_path, output_dir / "loss_curves.png",
-                    int(config["analysis"]["figure_dpi"]), best_epoch)
+                    int(config["analysis"]["figure_dpi"]), best_epoch, config,
+                    dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch))
         if resume and stopper.stale_epochs >= stopper.patience:
             print(f"Early stopping remains in effect after epoch {start_epoch}.", flush=True)
             return output_dir / "best.pt"
@@ -1152,17 +1251,19 @@ def train_model(config: Mapping[str, Any]) -> Path:
             row.update(
                 {f"validation_{key}": value for key, value in validation_metrics.items()}
             )
+            if not math.isfinite(validation_metrics[metric]):
+                raise ValueError(f"Validation requires a finite {metric} for checkpoint selection.")
+            improved, should_stop = stopper.update(validation_metrics[metric])
+            if improved:
+                best_epoch = float(epoch + 1)
+            row.update(selected_epoch=best_epoch, selection_start_epoch=float(selection_start_epoch))
             history.append(row)
             history_columns = write_training_history(
                 history_path, history, history_columns, preserved_lines)
-            if not math.isfinite(validation_metrics["cd8_loss"]):
-                raise ValueError("Validation requires valid CD8 observations for checkpoint selection.")
-            improved, should_stop = stopper.update(validation_metrics["cd8_loss"])
-            if improved:
-                best_epoch = float(epoch + 1)
             refresh_loss_curves(
                 history_path, output_dir / "loss_curves.png",
-                int(config["analysis"]["figure_dpi"]), best_epoch)
+                int(config["analysis"]["figure_dpi"]), best_epoch, config,
+                dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch))
             if improved:
                 save_checkpoint(
                     output_dir / "best.pt",
@@ -1172,8 +1273,9 @@ def train_model(config: Mapping[str, Any]) -> Path:
                     config,
                     bundle,
                     stopper.best,
+                    best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper,
                 )
-            if (epoch + 1) % int(training["checkpoint_every"]) == 0:
+            if (epoch + 1) % int(training["checkpoint_every"]) == 0 or should_stop or epoch + 1 == epochs:
                 save_checkpoint(
                     output_dir / "latest.pt",
                     model,
@@ -1182,6 +1284,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                     config,
                     bundle,
                     stopper.best,
+                    best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper,
                 )
             print(
                 _format_epoch_summary(
@@ -1190,6 +1293,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                     train_metrics,
                     validation_metrics,
                     target_columns,
+                    metric,
                 ),
                 flush=True,
             )

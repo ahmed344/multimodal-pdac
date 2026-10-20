@@ -230,7 +230,7 @@ def stratified_cap_indices(
 
 
 class SparseAnnDataDataset(Dataset[dict[str, Any]]):
-    """Map-style dataset that reads individual CSR rows from HDF5 on demand."""
+    """Map-style sparse pixels with scalar and whole-batch read interfaces."""
 
     def __init__(
         self,
@@ -366,6 +366,91 @@ class SparseAnnDataDataset(Dataset[dict[str, Any]]):
             "row_id": row,
             **({"he_targets": self.he_reader.read(np.array([row]))[0]} if self.he_reader is not None else {}),
         }
+
+    def _backed_spectra(self, rows: np.ndarray) -> dict[str, np.ndarray]:
+        """Read contiguous requested CSR runs, then restore order and duplicates.
+
+        Each invocation owns its handle, including when preparation threads share
+        this dataset. Gaps between requested rows are never read. Stored peak
+        order, duplicate columns and explicit zeros survive the gather.
+        """
+        unique, inverse = np.unique(rows, return_inverse=True)
+        boundaries = np.concatenate(([0], np.flatnonzero(np.diff(unique) != 1) + 1,
+                                     [len(unique)]))
+        lengths = np.empty(len(unique), dtype=np.int64)
+        peak_parts, value_parts = [], []
+        with h5py.File(self.path, "r") as handle:
+            group = handle[self.group_path]
+            pointers, peaks, values = group["indptr"], group["indices"], group["data"]
+            for first, last in zip(boundaries[:-1], boundaries[1:]):
+                ptr = np.asarray(pointers[unique[first]:unique[last - 1] + 2], dtype=np.int64)
+                lengths[first:last] = np.diff(ptr)
+                peak_parts.append(np.asarray(peaks[ptr[0]:ptr[-1]], dtype=np.int64))
+                value_parts.append(np.asarray(values[ptr[0]:ptr[-1]], dtype=np.float32))
+        indptr = np.concatenate(([0], np.cumsum(lengths)))
+        peak_indices, intensities = np.concatenate(peak_parts), np.concatenate(value_parts)
+        if self.nonzero_threshold > 0.0:
+            keep = intensities > self.nonzero_threshold
+            cumulative = np.concatenate(([0], np.cumsum(keep, dtype=np.int64)))
+            indptr = cumulative[indptr]
+            peak_indices, intensities = peak_indices[keep], intensities[keep]
+        intensities = self._transform_values(intensities)
+        invalid = ~np.isfinite(intensities) | (intensities < 0.0)
+        if invalid.any():
+            position = np.flatnonzero(invalid)[0]
+            row = unique[np.searchsorted(indptr[1:], position, side="right")]
+            raise ValueError(f"Invalid MSI intensities encountered in row {row}.")
+        lengths = np.diff(indptr)[inverse]
+        offsets = np.concatenate(([0], np.cumsum(lengths)))
+        entries = (np.arange(offsets[-1])
+                   + np.repeat(indptr[inverse] - offsets[:-1], lengths))
+        return dict(peak_indices=peak_indices[entries], intensities=intensities[entries],
+                    sample_indices=np.repeat(np.arange(len(rows), dtype=np.int64), lengths),
+                    peak_counts=lengths, row_ids=rows)
+
+    def _batch_arrays(self, items: Sequence[int]) -> dict[str, np.ndarray]:
+        """Gather spectra and labels once, retaining scalar-access NumPy dtypes."""
+        if not len(items):
+            raise ValueError("Cannot collate an empty sample sequence.")
+        rows = self.indices[np.asarray(items, dtype=np.int64)]
+        batch = ({key: value.numpy() for key, value in self.resident.gather(rows).items()}
+                 if self.resident is not None else self._backed_spectra(rows))
+        targets = self.metadata.targets
+        raw = self.metadata.raw_targets
+        valid = self.metadata.target_valid_mask
+        batch.update(targets=targets[rows],
+                     raw_targets=(targets if raw is None else raw)[rows],
+                     target_valid_mask=(np.ones((len(rows), targets.shape[1]), dtype=bool)
+                                        if valid is None else valid[rows]),
+                     batches=self.metadata.batch_codes[rows].astype(np.int64, copy=False))
+        if self.he_reader is not None:
+            batch["he_targets"] = self.he_reader.read(rows)
+        return batch
+
+    def get_batch(self, items: Sequence[int]) -> dict[str, torch.Tensor]:
+        """Return the sparse-collated tensor dictionary for dataset-local indices.
+
+        Empty requests fail just like ``sparse_collate([])``; empty splits never
+        issue a request. Labels and H&E targets follow the requested row order.
+        """
+        batch = self._batch_arrays(items)
+        batch["targets"] = batch["targets"].astype(np.float32, copy=False)
+        return {key: torch.from_numpy(value) for key, value in batch.items()}
+
+    def __getitems__(self, items: Sequence[int]) -> list[dict[str, Any]]:
+        """Support PyTorch batch fetching while preserving custom collator inputs."""
+        if not len(items):
+            return []
+        batch = self._batch_arrays(items)
+        offsets = np.concatenate(([0], np.cumsum(batch["peak_counts"])))
+        labels = ["targets", "raw_targets", "target_valid_mask"]
+        if "he_targets" in batch:
+            labels.append("he_targets")
+        return [dict(peak_indices=batch["peak_indices"][first:last],
+                     intensities=batch["intensities"][first:last],
+                     batch=int(batch["batches"][i]), row_id=int(batch["row_ids"][i]),
+                     **{key: batch[key][i] for key in labels})
+                for i, (first, last) in enumerate(zip(offsets[:-1], offsets[1:]))]
 
     def __getstate__(self) -> dict[str, Any]:
         """Prepare pickle state without sharing an HDF5 handle across workers.

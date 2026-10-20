@@ -91,6 +91,10 @@ def test_center_initialized_mixing_preserves_mlp_at_boundaries(spatial_config, m
 
 def test_three_epochs_preserve_schedule_and_production_checkpoint(spatial_config,tmp_path,monkeypatch):
     c=pointwise_config(spatial_config)
+    # This historical diagnostic requires its original rate, independent of
+    # the editable production configuration.
+    c['training']['pixel']['learning_rate'] = .01
+    resolve_execution(c)
     c['training']['epochs']=300
     bundle=create_data_bundle(c)
     model=AdversarialLatentFusion.from_config(c,2,4)
@@ -118,6 +122,8 @@ def test_three_epochs_preserve_schedule_and_production_checkpoint(spatial_config
     restored=AdversarialLatentFusion.from_config(c,2,4)
     restored.load_state_dict(saved['model_state'])
     assert saved['config']['training']['epochs']==300
+    assert saved['selection_metric'] == 'cd8_loss'
+    assert saved['best_selection_score'] == min(h['validation']['cd8_loss'] for h in history[1:])
     for epoch in range(4):
         prediction=torch.load(output/f'validation_epoch_{epoch}.pt',weights_only=False)
         np.testing.assert_array_equal(prediction['row_ids'],bundle.split_indices['validation'])

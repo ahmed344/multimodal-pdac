@@ -20,6 +20,8 @@ class ZILNLossOutput:
     positive: torch.Tensor
     positive_count: torch.Tensor
     valid_weight_mass: torch.Tensor
+    hurdle_per_target: torch.Tensor
+    positive_per_target: torch.Tensor
 
 
 class ZILNLoss(nn.Module):
@@ -157,10 +159,19 @@ class ZILNLoss(nn.Module):
         weight_mass = (weights * target_valid_mask).sum()
         reduced_hurdle = self._reduce(hurdle * weights, weight_mass)
         reduced_positive = self._reduce(positive_nll * weights, weight_mass)
+        # Reporting only: preserve the original scalar objective and its graph.
+        with torch.no_grad():
+            hurdle_per_target = (hurdle * weights).sum(dim=0)
+            positive_per_target = (positive_nll * weights).sum(dim=0)
+            if self.reduction == "mean":
+                hurdle_per_target = hurdle_per_target / weight_mass.clamp_min(torch.finfo(hurdle_per_target.dtype).eps)
+                positive_per_target = positive_per_target / weight_mass.clamp_min(torch.finfo(positive_per_target.dtype).eps)
         return ZILNLossOutput(
             total=reduced_hurdle + reduced_positive,
             hurdle=reduced_hurdle,
             positive=reduced_positive,
             positive_count=positive_mask.sum(),
             valid_weight_mass=weight_mass,
+            hurdle_per_target=hurdle_per_target,
+            positive_per_target=positive_per_target,
         )

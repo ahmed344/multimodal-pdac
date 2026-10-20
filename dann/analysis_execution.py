@@ -462,7 +462,7 @@ def validate_outputs(directory: Path, *, expected_rows: Mapping[Path, int] | Non
 
 
 def write_artifacts(config, checkpoint_path, epoch, metadata, extracted, scatter_data,
-                    coordinates, peptides, activity, output, render, *, table_writer=None):
+                    coordinates, peptides, activity, output, render, *, checkpoint, table_writer=None):
     """Keep table schemas and plotting helpers shared with the legacy analysis."""
     from dann import analyze as a
     from dann.calibration import run_calibration
@@ -534,11 +534,18 @@ def write_artifacts(config, checkpoint_path, epoch, metadata, extracted, scatter
 
     model_dir = Path(config['training']['output_dir'])
     best_path = model_dir / 'best.pt'
-    best_epoch = epoch if checkpoint_path.resolve() == best_path.resolve() else None
-    if best_epoch is None and best_path.is_file():
-        best_epoch = int(torch.load(best_path, map_location='cpu', weights_only=False)['epoch']) + 1
+    from dann.selection import checkpoint_selection
+    curve_checkpoint = checkpoint
+    if checkpoint_path.resolve() == best_path.resolve():
+        best_epoch = epoch
+    elif best_path.is_file():
+        curve_checkpoint, _ = load_checkpoint_snapshot(best_path)
+        best_epoch = int(curve_checkpoint['epoch']) + 1
+    else:
+        best_epoch = checkpoint_selection(checkpoint)['best_epoch']
     render(a.plot_loss_curves, model_dir / 'history.csv', output / 'loss_curves.png',
-           int(analysis['figure_dpi']), best_epoch=best_epoch)
+           int(analysis['figure_dpi']), best_epoch=best_epoch,
+           config=curve_checkpoint['config'], selection=checkpoint_selection(curve_checkpoint))
     grid_keys = read_grid(Path(config['data']['path']), config['data'])[0] if 'support' in extracted else None
     write_density_diagnostics(extracted, config, output, split, grid_keys=grid_keys)
     if scatter_split != split:
@@ -749,7 +756,7 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
             progress.set_phase('tables and figure preparation')
             write_artifacts(config, checkpoint_path, int(checkpoint['epoch'])+1, metadata,
                 extracted, extracted_by_split[config['analysis']['ziln_scatter_split']], coordinates,
-                peptides, activity, staged, queue.submit, table_writer=queue.table)
+                peptides, activity, staged, queue.submit, checkpoint=checkpoint, table_writer=queue.table)
             queue.run(settings['render_workers'], performance, progress)
             progress.set_phase('output validation')
             final_stat = source.stat()
