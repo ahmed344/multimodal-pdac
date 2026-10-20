@@ -7,6 +7,7 @@ import copy
 import json
 import math
 import resource
+import sys
 from time import perf_counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,8 @@ from dann.checkpoints import (architecture_contract, checkpoint_config, validate
 from dann.tiles import row_identity
 from dann.targets import CD8, checkpoint_contract, target_contract
 from dann.selection import checkpoint_selection, selection_metric
+from dann.training_artifacts import (TrainingArtifacts, atomic_output, atomic_json,
+                                     cpu_snapshot, write_history, write_audit)
 
 
 @dataclass
@@ -319,24 +322,7 @@ def write_training_history(
         list[str]: Column order written to disk.
     """
 
-    ordered = list(columns)
-    for row in rows:
-        for key in row:
-            if key not in ordered:
-                ordered.append(str(key))
-    preserved = {} if preserved_lines is None else preserved_lines
-    lines = [",".join(ordered)]
-    for row in rows:
-        epoch = float(row["epoch"])
-        saved = preserved.get(epoch)
-        if saved is not None and saved.count(",") == len(ordered) - 1:
-            lines.append(saved)
-            continue
-        formatted = pd.DataFrame([{key: row.get(key, math.nan) for key in ordered}], columns=ordered)
-        lines.append(formatted.to_csv(index=False, header=False).rstrip("\n"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return ordered
+    return write_history(path, rows, columns, preserved_lines)
 
 
 def refresh_loss_curves(
@@ -361,9 +347,10 @@ def refresh_loss_curves(
         None: Figure is saved to disk.
     """
 
-    from dann.analyze import plot_loss_curves
-    plot_loss_curves(history_path, output_path, figure_dpi, best_epoch=best_epoch,
-                     config=config, selection=selection)
+    from dann.objective_curves import plot_loss_curves
+    with atomic_output(output_path) as temporary:
+        plot_loss_curves(history_path, temporary, figure_dpi, best_epoch=best_epoch,
+                         config=config, selection=selection)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -762,6 +749,7 @@ def run_epoch(
     target_columns: Sequence[str] | None = None,
     sampling_audit_dir: Path | None = None,
     he_weight: float = 1.0,
+    artifacts: TrainingArtifacts | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -785,6 +773,7 @@ def run_epoch(
         target_columns (Sequence[str] | None): Ordered target names. Defaults to
             ``target_{index}`` suffixes when omitted.
         sampling_audit_dir (Path | None): Optional spatial batch logs and epoch hashes.
+        artifacts (TrainingArtifacts | None): Background audit writer and worker-error monitor.
 
     Returns:
         dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
@@ -819,13 +808,12 @@ def run_epoch(
         loader.sampler.set_epoch(epoch_index)
     audit = (SamplingEpochAudit(epoch_index, len(loader.dataset.indices))
              if training and sampling_audit_dir is not None else None)
-    if audit is not None:
-        sampling_audit_dir.mkdir(parents=True, exist_ok=True)
-        (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").write_text("")
     from dann.execution import device_batches, evaluation_groups
     batches = ((cpu, batch, None) for cpu, batch in device_batches(loader, device)) if training else evaluation_groups(model, loader, device)
     with (torch.enable_grad() if training else torch.inference_mode()):
         for step, (cpu_batch, batch, outputs) in enumerate(batches):
+            if artifacts is not None:
+                artifacts.check()
             progress = (epoch_index * steps_per_epoch + step) / max(
                 total_epochs * steps_per_epoch - 1, 1
             )
@@ -915,11 +903,12 @@ def run_epoch(
     finalized["batch_weighted_loss"] = batch_weight * finalized["batch_loss"]
     finalized["supervised_objective"] = finalized["biology_weighted_loss"] + finalized.get("he_weighted_loss", 0.0)
     finalized["total_loss"] = finalized["supervised_objective"] + finalized["batch_weighted_loss"]
-    if audit is not None and audit.compositions:
-        with (sampling_audit_dir / f"epoch_{epoch_index:04d}_batches.jsonl").open("w") as handle:
-            handle.writelines(json.dumps(row) + "\n" for row in audit.compositions)
-        with (sampling_audit_dir / f"epoch_{epoch_index:04d}_summary.json").open("w") as handle:
-            json.dump(audit.summary(), handle, indent=2)
+    if audit is not None:
+        summary = audit.summary() if audit.compositions else None
+        if artifacts is None:
+            write_audit(sampling_audit_dir, epoch_index, audit.compositions, summary)
+        else:
+            artifacts.submit_audit(sampling_audit_dir, epoch_index, audit.compositions, summary)
     if hasattr(loader, 'settings'):
         elapsed = perf_counter() - started
         peak = torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0
@@ -934,38 +923,12 @@ def run_epoch(
     return finalized
 
 
-def save_checkpoint(
-    path: Path,
+def checkpoint_metadata(
     model: AdversarialLatentFusion,
-    optimizer: torch.optim.Optimizer,
-    epoch: int,
     config: Mapping[str, Any],
     bundle: DataBundle,
-    best_selection_score: float,
-    *,
-    best_epoch: float | None = None,
-    selection_start_epoch: int = 1,
-    stopper: EarlyStopping | None = None,
-) -> None:
-    """Persist model, optimizer, schema, split, and configuration state.
-
-    Args:
-        path (Path): Destination checkpoint path.
-        model (AdversarialLatentFusion): Trained model.
-        optimizer (torch.optim.Optimizer): Optimizer state.
-        epoch (int): Last completed zero-based epoch.
-        config (Mapping[str, Any]): Effective configuration.
-        bundle (DataBundle): Data metadata and selected split indices.
-        best_selection_score (float): Best validation score in selection-metric units.
-        best_epoch (float | None): Selected one-based epoch, if known.
-        selection_start_epoch (int): First one-based epoch eligible for selection.
-        stopper (EarlyStopping | None): Explicit patience progress for training resumes.
-
-    Returns:
-        None: Checkpoint is written atomically through a temporary file.
-    """
-
-    path.parent.mkdir(parents=True, exist_ok=True)
+) -> dict[str, Any]:
+    """Validate and freeze immutable checkpoint metadata once per training run."""
     identity = row_identity(Path(config["data"]["path"]), config["data"])
     saved_config = copy.deepcopy(dict(config))
     architecture = architecture_contract(config)
@@ -986,34 +949,55 @@ def save_checkpoint(
     except PackageNotFoundError:
         pyg_version = None
     validate_checkpoint({"config": saved_config, "architecture": architecture}, config, model)
-    payload = {
+    return {
         "software_versions": {"torch": str(torch.__version__), "torch_geometric": pyg_version},
         "sampling_contract": sampling_contract(config, bundle.split_indices["train"]),
-        "sampler_state": {"completed_epoch": int(epoch), "sampler_epoch": int(epoch),
-                          "next_epoch": int(epoch) + 1},
         "architecture": architecture,
         "optimizer_parameter_names": list(dict(model.named_parameters())),
         "data_identity": identity,
         "training_data_contract": training_data_contract(config, identity),
         "selection_metric": selection_metric(config),
-        "best_selection_score": float(best_selection_score),
-        "best_epoch": best_epoch,
-        "selection_start_epoch": int(selection_start_epoch),
-        "early_stopping_state": (dict(stale_epochs=stopper.stale_epochs,
-            patience=stopper.patience, min_delta=stopper.min_delta,
-            stopped=stopper.stale_epochs >= stopper.patience) if stopper is not None else None),
-        "model_state": model.state_dict(),
-        "optimizer_state": optimizer.state_dict(),
-        "epoch": int(epoch),
         "config": saved_config,
         "batch_names": bundle.metadata.batch_names,
         "target_columns": tuple(config["data"]["target_columns"]),
         "target_transform": target_contract(config),
-        "split_indices": bundle.split_indices,
+        "split_indices": copy.deepcopy(bundle.split_indices),
     }
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(payload, temporary)
-    temporary.replace(path)
+
+
+def checkpoint_payload(metadata: Mapping[str, Any], state: Mapping[str, Any], epoch: int,
+                       best_selection_score: float, *, best_epoch: float | None = None,
+                       selection_start_epoch: int = 1, stopper: EarlyStopping | None = None) -> dict[str, Any]:
+    """Combine frozen state with the completed epoch's exact stopping metadata."""
+    return {**metadata, **state, 'epoch': int(epoch),
+            'sampler_state': dict(completed_epoch=int(epoch), sampler_epoch=int(epoch), next_epoch=int(epoch) + 1),
+            'best_selection_score': float(best_selection_score), 'best_epoch': best_epoch,
+            'selection_start_epoch': int(selection_start_epoch),
+            'early_stopping_state': (dict(stale_epochs=stopper.stale_epochs, patience=stopper.patience,
+                min_delta=stopper.min_delta, stopped=stopper.stale_epochs >= stopper.patience)
+                if stopper is not None else None)}
+
+
+def save_checkpoint(
+    path: Path,
+    model: AdversarialLatentFusion,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    config: Mapping[str, Any],
+    bundle: DataBundle,
+    best_selection_score: float,
+    *,
+    best_epoch: float | None = None,
+    selection_start_epoch: int = 1,
+    stopper: EarlyStopping | None = None,
+) -> None:
+    """Synchronously save an atomic, portable checkpoint for existing callers."""
+    metadata = checkpoint_metadata(model, config, bundle)
+    state = cpu_snapshot(dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict()))
+    payload = checkpoint_payload(metadata, state, epoch, best_selection_score,
+                                 best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper)
+    with atomic_output(path) as temporary:
+        torch.save(payload, temporary)
 
 
 def load_training_checkpoint(
@@ -1185,20 +1169,27 @@ def train_model(config: Mapping[str, Any]) -> Path:
     best_epoch: float | None = None
     selection_start_epoch = 1
     history_path = output_dir / "history.csv"
+    artifacts = None
+    output_timings = dict(mode='sync', epochs=[], jobs=[], final_drain_seconds=0.)
+    output_started = perf_counter()
     try:
+        if config.get('performance', {}).get('async_artifacts', False):
+            artifacts = TrainingArtifacts(output_dir, config)
         if resume:
             history, history_columns, preserved_lines = load_resume_history(history_path, start_epoch)
             best_epoch, selection_start_epoch = restore_selection_state(stopper, resume_payload, metric, history)
             if checkpoint_selection(resume_payload)["selection_metric"] != metric:
                 print(f"Selection changed to {metric}; score and patience reset at epoch {selection_start_epoch}.", flush=True)
-            if history and len(preserved_lines) != _history_row_count(history_path):
+            if artifacts is None and history and len(preserved_lines) != _history_row_count(history_path):
                 history_columns = write_training_history(
                     history_path, history, history_columns, preserved_lines)
             if history:
-                refresh_loss_curves(
-                    history_path, output_dir / "loss_curves.png",
-                    int(config["analysis"]["figure_dpi"]), best_epoch, config,
-                    dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch))
+                selection = dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch)
+                if artifacts is not None:
+                    artifacts.submit_epoch(history, history_columns, preserved_lines, selection)
+                else:
+                    refresh_loss_curves(history_path, output_dir / 'loss_curves.png',
+                                        int(config['analysis']['figure_dpi']), best_epoch, config, selection)
         if resume and stopper.stale_epochs >= stopper.patience:
             print(f"Early stopping remains in effect after epoch {start_epoch}.", flush=True)
             return output_dir / "best.pt"
@@ -1206,7 +1197,10 @@ def train_model(config: Mapping[str, Any]) -> Path:
         clip = training.get("gradient_clip_norm")
         gradient_clip_norm = None if clip is None else float(clip)
         target_columns = list(config["data"]["target_columns"])
+        metadata = checkpoint_metadata(model, config, bundle)
         for epoch in range(start_epoch, epochs):
+            if artifacts is not None:
+                artifacts.check()
             train_metrics = run_epoch(
                 model=model,
                 loader=bundle.loaders["train"],
@@ -1226,6 +1220,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
                 sampling_audit_dir=output_dir / "sampling",
+                artifacts=artifacts,
             )
             validation_metrics = run_epoch(
                 model=model,
@@ -1245,7 +1240,9 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 gradient_clip_norm=None,
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
+                artifacts=artifacts,
             )
+            boundary_started = perf_counter()
             row: dict[str, float] = {"epoch": float(epoch + 1)}
             row.update({f"train_{key}": value for key, value in train_metrics.items()})
             row.update(
@@ -1258,51 +1255,59 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 best_epoch = float(epoch + 1)
             row.update(selected_epoch=best_epoch, selection_start_epoch=float(selection_start_epoch))
             history.append(row)
-            history_columns = write_training_history(
-                history_path, history, history_columns, preserved_lines)
-            refresh_loss_curves(
-                history_path, output_dir / "loss_curves.png",
-                int(config["analysis"]["figure_dpi"]), best_epoch, config,
-                dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch))
-            if improved:
-                save_checkpoint(
-                    output_dir / "best.pt",
-                    model,
-                    optimizer,
-                    epoch,
-                    config,
-                    bundle,
-                    stopper.best,
-                    best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper,
-                )
+            for key in row:
+                if key not in history_columns:
+                    history_columns.append(key)
+            destinations = ['best.pt'] if improved else []
             if (epoch + 1) % int(training["checkpoint_every"]) == 0 or should_stop or epoch + 1 == epochs:
-                save_checkpoint(
-                    output_dir / "latest.pt",
-                    model,
-                    optimizer,
-                    epoch,
-                    config,
-                    bundle,
-                    stopper.best,
-                    best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper,
-                )
-            print(
-                _format_epoch_summary(
-                    epoch + 1,
-                    epochs,
-                    train_metrics,
-                    validation_metrics,
-                    target_columns,
-                    metric,
-                ),
-                flush=True,
-            )
+                destinations.append('latest.pt')
+            payload, snapshot_seconds = None, 0.
+            if destinations:
+                snapshot_started = perf_counter()
+                state = (artifacts.snapshot(model, optimizer) if artifacts is not None else
+                         cpu_snapshot(dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict())))
+                snapshot_seconds = perf_counter() - snapshot_started
+                payload = checkpoint_payload(metadata, state, epoch, stopper.best, best_epoch=best_epoch,
+                                             selection_start_epoch=selection_start_epoch, stopper=stopper)
+                del state
+            selection = dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch)
+            summary = _format_epoch_summary(epoch + 1, epochs, train_metrics, validation_metrics, target_columns, metric)
+            if artifacts is not None:
+                artifacts.submit_epoch(history, history_columns, preserved_lines, selection, payload, destinations, summary)
+            else:
+                saving_started = perf_counter()
+                write_training_history(history_path, history, history_columns, preserved_lines)
+                for name in destinations:
+                    with atomic_output(output_dir / name) as temporary:
+                        torch.save(payload, temporary)
+                output_timings['jobs'].append(dict(kind='write', epoch=epoch + 1, seconds=perf_counter() - saving_started))
+                plotting_started = perf_counter()
+                refresh_loss_curves(history_path, output_dir / 'loss_curves.png',
+                                    int(config['analysis']['figure_dpi']), best_epoch, config, selection)
+                output_timings['jobs'].append(dict(kind='plot', epoch=epoch + 1, seconds=perf_counter() - plotting_started))
+                print(summary, flush=True)
+            del payload
+            output_timings['epochs'].append(dict(epoch=epoch + 1, snapshot_seconds=snapshot_seconds,
+                                                 boundary_seconds=perf_counter() - boundary_started))
             if should_stop:
                 print(f"Early stopping after epoch {epoch + 1}.", flush=True)
                 break
     finally:
-        for dataset in bundle.datasets.values():
-            dataset.close()
+        original_error = sys.exception()
+        try:
+            try:
+                if artifacts is not None:
+                    artifacts.close()
+                    output_timings.update(artifacts.report)
+                output_timings['total_seconds'] = perf_counter() - output_started
+                atomic_json(output_dir / 'artifact_timings.json', output_timings)
+            except BaseException as error:
+                if original_error is None:
+                    raise
+                original_error.add_note(f'Training artifact shutdown also failed: {error!r}')
+        finally:
+            for dataset in bundle.datasets.values():
+                dataset.close()
     return output_dir / "best.pt"
 
 

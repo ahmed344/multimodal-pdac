@@ -394,7 +394,7 @@ def inference_input(config: Mapping[str, Any], explicit: Path | None = None) -> 
 
 PERFORMANCE_DEFAULTS = dict(
     ram_cache=False, cache_geometry=False, preparation_workers=0, prepared_batches=2, torch_threads=None,
-    transfer_prefetch=False, validation_tiles=None, validation_peak_budget=None,
+    transfer_prefetch=False, async_artifacts=False, validation_tiles=None, validation_peak_budget=None,
     validation_gat_tiles=None, validation_feature_cache=False, feature_cache_rows=1024,
     host_budget_gib=128., vram_budget_gib=24.,
 )
@@ -408,7 +408,7 @@ def performance_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     settings = {**PERFORMANCE_DEFAULTS, **supplied}
     if set(settings) != set(PERFORMANCE_DEFAULTS):
         raise ValueError('Unknown performance setting.')
-    for key in ('ram_cache', 'cache_geometry', 'transfer_prefetch', 'validation_feature_cache'):
+    for key in ('ram_cache', 'cache_geometry', 'transfer_prefetch', 'validation_feature_cache', 'async_artifacts'):
         if not isinstance(settings[key], bool):
             raise ValueError(f'performance.{key} must be boolean.')
     for key in ('preparation_workers', 'prepared_batches', 'validation_tiles',

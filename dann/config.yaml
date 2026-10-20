@@ -295,6 +295,7 @@ results:
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.
 performance:
+  async_artifacts: true  # CPU workers save checkpoints/audits/history and render curves while the next epoch trains.
   ram_cache: true
   cache_geometry: true
   torch_threads: 4  # Intra-operation CPU threads; null keeps the process default.

@@ -57,7 +57,21 @@ def plot_loss_curves(
     the actual selected epoch, metric, and first eligible epoch. No minimum-loss
     epoch is inferred: older runs without selection metadata have no marker.
     """
-    history = weighted_history(pd.read_csv(history_path), config)
+    plot_objective_history(pd.read_csv(history_path), output_path, figure_dpi,
+                           best_epoch=best_epoch, config=config, selection=selection)
+
+
+def plot_objective_history(
+    history: pd.DataFrame,
+    output_path: Path,
+    figure_dpi: int,
+    best_epoch: int | float | None = None,
+    *,
+    config: Mapping[str, Any] | None = None,
+    selection: Mapping[str, Any] | None = None,
+) -> None:
+    """Render an immutable history snapshot without reading a changing CSV."""
+    history = weighted_history(history, config)
     if selection is not None:
         if best_epoch is None:
             best_epoch = selection.get("best_epoch")

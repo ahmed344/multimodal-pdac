@@ -327,6 +327,45 @@ rate and other training settings stay in place; differing YAML values are report
 and ignored. `--smoke-test` cannot be combined with a resume checkpoint. Completed
 `history.csv` rows are kept and `loss_curves.png` is refreshed from that full history.
 
+`performance.async_artifacts: true` moves checkpoint serialization, history and
+sampling-audit writes, and curve rendering into two persistent CPU workers. One
+worker writes files in order; the other renders immutable history snapshots. The
+next epoch can start while either worker is busy. Validation and stopping decisions
+remain synchronous, as does copying a consistent model/optimizer snapshot to CPU
+before training mutates it. CPU tensors are also copied, and CUDA transfers finish
+before a snapshot is handed to a worker. This covers MLP, CNN, GATv2, their mixed
+combinations, and optional H&E heads. Dataset identity and checkpoint contracts are
+computed once per run. One snapshot serves both best/latest saves when applicable.
+
+If outputs fall behind, pending plots and superseded saves for each of `best.pt`
+and `latest.pt` are replaced by the newest request for that destination. A latest
+save never discards a pending best save. Every history row and sampling audit is
+retained. Queues account for snapshots, worker memory, and rendering buffers against
+`performance.host_budget_gib`; training waits only when required records or a new
+snapshot cannot otherwise fit. Files are published with atomic replacements, so
+readers see complete files. Outputs can lag the running epoch until the workers
+catch up.
+
+Workers are drained on completion, early stopping, and graceful interruption before
+post-training analysis can consume the final checkpoint. Worker errors surface in
+training; a partially completed epoch is never saved as completed. An abrupt process
+or machine failure can lose pending outputs, leaving the last published files.
+Configurations without `async_artifacts` retain synchronous output, and setting it
+to `false` provides the comparison path. This execution-only setting can change on
+resume without changing model or optimizer semantics. `model/artifact_timings.json`
+records snapshot and epoch-boundary times, worker jobs, replaced requests, worker
+startup, and final drain time. A matched three-epoch capped GPU comparison is:
+
+```bash
+python -m dann.verification.artifact_benchmark --root data/PDAC/Results/dann/artifact-check --deterministic
+```
+
+The result root must be new. The command checks all-MLP, all-CNN, and all-GATv2
+runs with synchronous and asynchronous output, comparing numerical states,
+histories, sampling audits, and objective identities. `--deterministic` enables
+deterministic GPU kernels only in these comparison runs and requires exact state
+and metric equality; production training settings are unchanged.
+
 History retains raw loss and fit columns and adds `biology_weighted_loss`,
 `hurdle_weighted_loss`, `positive_weighted_loss`, `batch_weighted_loss`, and
 `supervised_objective`, each prefixed by `train_` or `validation_`. Per-signal
