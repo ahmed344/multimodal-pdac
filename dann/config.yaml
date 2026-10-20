@@ -45,7 +45,7 @@ model:
 
   # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
-    type: mlp  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
+    type: gatv2  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
       hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
@@ -60,12 +60,12 @@ model:
       neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
       residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
       dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-      attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
+      attention_dropout: 0.10  # Drop attention coefficients during training.
 
   # 3. Prediction heads: choices are independent; all consume aggregation latents.
   heads:
     biology:
-      type: mlp  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
+      type: gatv2  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
       mlp:
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
@@ -80,12 +80,12 @@ model:
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
+        attention_dropout: 0.10  # Drop attention coefficients during training.
 
     he:
       enabled: true  # Auxiliary raw UNI2-h feature prediction.
       output_dim: 1536
-      type: mlp  # Choices: mlp, cnn, gatv2. Emits unrestricted linear feature predictions.
+      type: gatv2  # Choices: mlp, cnn, gatv2. Emits unrestricted linear feature predictions.
       mlp:
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
@@ -100,10 +100,10 @@ model:
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
+        attention_dropout: 0.10  # Drop attention coefficients during training.
 
     discriminator:
-      type: mlp  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
+      type: gatv2  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
       mlp:
         hidden_dims: [256, 128, 64]  # Original batch-discriminator hidden widths.
       cnn:
@@ -118,7 +118,7 @@ model:
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.0  # Attention coefficient dropout; zero for the initial comparison.
+        attention_dropout: 0.10  # Drop attention coefficients during training.
 
   # Shared MLP numerics and ZILN output transformation; CNN settings are above.
   activation: gelu  # MLP activation: relu, gelu, silu, or leaky_relu.
@@ -158,15 +158,16 @@ training:
     prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
 
   spatial:  # Used when any selected aggregation/head component is a CNN or GATv2.
-    core_size: 8  # Core side length in grid pixels; no edge pixels are discarded.
+    core_size: 32  # Core side length in grid pixels; no edge pixels are discarded.
     sampling_strategy: proportional_slide_tiles  # Independently shuffled slide queues, proportional row interleaving.
-    supervised_rows_per_batch: 2048  # Exact training row budget; final epoch batch may be smaller.
+    supervised_rows_per_batch: 32768  # Effective optimizer batch; final epoch batch may be smaller.
+    microbatch_rows: null  # One physical batch, benchmarked at radius 1.5; use 16384 for two accumulation steps.
     tiles_per_batch: 8  # Validation/test tile count; also training count with legacy shuffled_tiles.
     learning_rate: 0.0001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
     num_workers: 20  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
     prefetch_factor: 4  # Tile batches prefetched per worker; larger batches also increase host-memory use.
     # Halo is derived: aggregation radius + max(biology radius, discriminator radius, H&E radius).
-    # Default radii give halo 6, a 20x20 input, 13x13 biology support, and 7x7 latent support.
+    # Selected depths/radii determine the halo and supports recorded in execution metadata.
     # Only occupied, selected core rows supply labels; all occupied halo MSI remains context.
 
   # Shared optimization and adversarial schedule.
@@ -178,6 +179,8 @@ training:
   grl_max_lambda: 0.25  # Maximum encoder-bound gradient reversal strength.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
   grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
+  grl_horizon_updates: null  # Full-fit epoch-based schedule (300 x 47 updates); the pilot's 500-update horizon is not used.
+  early_stopping_enabled: true  # Disable only for bounded diagnostic comparisons.
   early_stopping_metric: supervised_objective  # Weighted IHC + H&E; cd8_loss is available for comparison. Omitted settings retain legacy CD8 selection.
   early_stopping_patience: 10  # Epochs without improvement in the validation selection metric.
   early_stopping_min_delta: 0.001  # Minimum improvement in supervised-objective units (or CD8-loss units when selected).
@@ -290,7 +293,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: he_mse_baseline  # Human-readable run name; separate experiments should use separate names.
+  run_name: core32_attention010_radius15  # Fresh full fit, separate from the baseline and pilot.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.
@@ -302,7 +305,7 @@ performance:
   preparation_workers: 2  # Threads; requires ram_cache. Start comparisons at 2 or 4.
   prepared_batches: 2  # Bounded CPU queue; completed results retain sampler order.
   transfer_prefetch: true  # One pinned staging batch on a dedicated CUDA stream.
-  validation_tiles: 64  # Physical GPU batch; historical tiles_per_batch still defines losses.
+  validation_tiles: 8  # Tested physical validation batch for 32x32 cores; tiles_per_batch still defines losses.
   validation_peak_budget: 262144  # Explicit values also set the inner inference chunk cap; null keeps model limits.
   validation_gat_tiles: 32  # Null inherits model.gatv2_tile_budget.
   validation_feature_cache: true  # Pass-local pooled spectra; requires both caches above.

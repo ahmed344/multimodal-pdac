@@ -21,6 +21,10 @@ class SpatialBatchRequest:
     """Ordered supervision and first-appearance tile IDs, sent from the main process."""
     row_ids: tuple[int, ...]
     tile_ids: tuple[int, ...]
+    logical_row_ids: tuple[int, ...] = ()
+    logical_tile_ids: tuple[int, ...] = ()
+    microbatch_index: int = 0
+    microbatch_count: int = 1
 
 
 class ProportionalSlideTileSampler(Sampler[SpatialBatchRequest]):
@@ -30,12 +34,19 @@ class ProportionalSlideTileSampler(Sampler[SpatialBatchRequest]):
     retains its original identity and complete context on both sides of a boundary.
     Only tile ordering and the current request are materialized for an epoch.
     """
-    def __init__(self, tiles: SpatialTileDataset, seed: int, row_budget: int) -> None:
+    def __init__(self, tiles: SpatialTileDataset, seed: int, row_budget: int,
+                 microbatch_rows: int | None = None) -> None:
         if isinstance(row_budget, bool) or not isinstance(row_budget, int) or row_budget <= 0:
             raise ValueError('row_budget must be a positive integer.')
         self.tiles = tiles
         self.seed = seed
         self.row_budget = row_budget
+        if microbatch_rows is not None and (isinstance(microbatch_rows, bool)
+                or not isinstance(microbatch_rows, int) or microbatch_rows <= 0):
+            raise ValueError('microbatch_rows must be a positive integer or None.')
+        self.microbatch_rows = microbatch_rows
+        self.start_update = 0
+        self.stop_update: int | None = None
         self.epoch = 0
         self.queues: dict[str, list[int]] = {}
         self.lengths = np.array([len(rows) for _, rows in tiles.tiles], dtype=np.int64)
@@ -44,6 +55,15 @@ class ProportionalSlideTileSampler(Sampler[SpatialBatchRequest]):
         self.num_rows = int(self.lengths.sum())
 
     def __len__(self) -> int:
+        sizes = [min(self.row_budget, self.num_rows - i * self.row_budget)
+                 for i in range(self.start_update, self.logical_updates
+                                if self.stop_update is None else min(self.stop_update, self.logical_updates))]
+        return sum((n + self.microbatch_rows - 1) // self.microbatch_rows
+                   if self.microbatch_rows else 1 for n in sizes)
+
+    @property
+    def logical_updates(self) -> int:
+        """Number of optimizer updates in a complete epoch, independent of subdivision."""
         return (self.num_rows + self.row_budget - 1) // self.row_budget
 
     def set_epoch(self, epoch: int) -> None:
@@ -53,6 +73,25 @@ class ProportionalSlideTileSampler(Sampler[SpatialBatchRequest]):
         self.epoch = epoch
 
     def __iter__(self) -> Iterator[SpatialBatchRequest]:
+        for index, request in enumerate(self.logical_requests()):
+            if index < self.start_update:
+                continue
+            if self.stop_update is not None and index >= self.stop_update:
+                break
+            if self.microbatch_rows is None:
+                yield request
+                continue
+            # Only row IDs are materialized here; spectra are gathered by the loader.
+            row_tiles = {row: tile for tile in request.tile_ids
+                         for row, _ in self.tiles.tiles[tile][1]}
+            count = (len(request.row_ids) + self.microbatch_rows - 1) // self.microbatch_rows
+            for micro, start in enumerate(range(0, len(request.row_ids), self.microbatch_rows)):
+                rows = request.row_ids[start:start + self.microbatch_rows]
+                tiles = tuple(dict.fromkeys(row_tiles[row] for row in rows))
+                yield SpatialBatchRequest(rows, tiles, request.row_ids, request.tile_ids, micro, count)
+
+    def logical_requests(self) -> Iterator[SpatialBatchRequest]:
+        """Replay the unchanged proportional sampler before physical subdivision."""
         rng = np.random.default_rng(self.seed + 50000 + self.epoch)
         ordered = []
         for slide in sorted(self.queues):
@@ -94,6 +133,14 @@ class SpatialBatchDataset(Dataset):
         for key in SUPERVISION_FIELDS:
             if key in batch:
                 batch[key] = batch[key][selection]
+        if request.logical_row_ids:
+            rows = np.asarray(request.logical_row_ids, dtype=np.int64)
+            batch['accumulation'] = dict(
+                index=request.microbatch_index, count=request.microbatch_count,
+                rows=len(rows), tiles=len(request.logical_tile_ids),
+                valid_counts=torch.from_numpy(self.metadata.target_valid_mask[rows].sum(axis=0)),
+                class_counts=torch.from_numpy(np.bincount(
+                    self.metadata.batch_codes[rows], minlength=len(self.metadata.batch_names))))
         return batch
 
     def close(self) -> None:
@@ -119,7 +166,9 @@ class SamplingEpochAudit:
         _, counts = np.unique(batch['batches'].numpy(), return_counts=True)
         fractions = counts / counts.sum()
         result = dict(epoch=self.epoch, step=len(self.compositions), supervised_rows=len(rows),
-                      unique_tiles=int(batch['occupancy'].shape[0]), distinct_slides=len(counts),
+                      row_ids_sha256=hashlib.sha256(rows.tobytes()).hexdigest(),
+                      unique_tiles=int(batch.get('unique_tiles', len(batch.get('occupancy', ())))),
+                      distinct_slides=len(counts),
                       slide_entropy=float(-(fractions * np.log(fractions)).sum()),
                       largest_slide_fraction=float(fractions.max()), processed_rows=self.processed_rows,
                       epoch_position=self.processed_rows / max(self.total_rows, 1))

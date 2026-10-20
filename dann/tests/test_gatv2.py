@@ -123,8 +123,9 @@ def test_v5_contracts(spatial_config, name):
     resolve_execution(c)
     payload = {'config': c, 'architecture': architecture_contract(c)}
     assert checkpoint_config(payload) == c
+    changed_attention_dropout = 0. if group['gatv2']['attention_dropout'] else .1
     for key, value in dict(channels=16, heads=4, neighbor_radius=2., depth=3,
-                           residual=False, dropout=.2, attention_dropout=.1).items():
+                           residual=False, dropout=.2, attention_dropout=changed_attention_dropout).items():
         bad = copy.deepcopy(payload)
         bad['architecture']['components'][name]['gatv2'][key] = value
         with pytest.raises(ValueError, match='disagrees'):

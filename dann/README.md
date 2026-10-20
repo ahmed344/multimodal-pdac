@@ -122,7 +122,7 @@ gatv2:
   neighbor_radius: 1.5
   residual: true
   dropout: 0.10
-  attention_dropout: 0.0
+  attention_dropout: 0.10
 ```
 
 `channels` is the total concatenated hidden width and must divide evenly by
@@ -147,7 +147,7 @@ GELU and feature `dropout`; `residual: true` returns `(hidden + update)/sqrt(2)`
 A final pointwise projection emits latent channels, raw biology parameters, or
 batch logits. Missing positions remain zero. Residual toggles change neither
 parameters nor reach. `attention_dropout` affects attention coefficients only;
-zero avoids extra attention regularization in the initial comparison. During
+the full-fit configuration uses 0.10 during training. During
 training, each attention update uses activation checkpointing with preserved RNG:
 backward recomputes edge activations while retaining all eligible neighbors and the
 original optimizer batch. Evaluation does not checkpoint attention updates.
@@ -177,8 +177,8 @@ explicitly disable residuals to retain their original comparisons.
 
 All-MLP configurations retain the sparse pixel loader and `training.pixel` settings.
 Any CNN or GATv2 selects `training.spatial`. The checked-in configuration now uses
-`sampling_strategy: proportional_slide_tiles`, 8×8 cores, and
-`supervised_rows_per_batch: 2048`. Every selected training row appears once per
+`sampling_strategy: proportional_slide_tiles`, 32×32 cores, and
+`supervised_rows_per_batch: 32768`. Every selected training row appears once per
 epoch, including rows with invalid targets (validity masks still control loss).
 Only the final batch may contain fewer rows. No labels influence sampling.
 
@@ -199,11 +199,34 @@ Smoke mode caps split membership, evaluation tiles, and the training row budget
 (`training.smoke_supervised_rows_per_batch: 64`) while preserving the
 architecture-derived halo. Capped labels are scattered across many footprints,
 so the smaller smoke batch avoids excessive spatial activation memory.
-The activated run name is `he_mse_baseline`, separate from earlier experiments.
+The activated run name is `core32_attention010_radius15`, separate from the
+baseline and pilot. Aggregation, biology, H&E and discriminator all use GATv2
+with radius 1.5 and attention dropout 0.10. The full fit uses learning rate
+0.0001, one physical 32,768-row batch (`microbatch_rows: null`), and eight physical
+validation tiles. It starts fresh with the seeded 90/10 split, at most 300 epochs
+and supervised-objective early stopping. `grl_horizon_updates: null` retains the
+full epoch-based DANN schedule (14,100 updates at 47 updates/epoch); the accelerated
+500-update pilot ramp is not used. Configured post-training analysis and tissue
+inference run after fitting when invoking `python -m dann.train --config dann/config.yaml`.
 
-Production retains its epoch-based GRL horizon:
-`(epoch * len(train_loader) + step) / (epochs * len(train_loader) - 1)` (with the
-existing denominator guard). The diagnostic used a fixed update horizon.
+`training.spatial.microbatch_rows` optionally subdivides a proportional sampler
+request **before** spectra gathering. `null` (the default) retains a single
+forward/backward pass; `supervised_rows_per_batch` always remains the effective
+optimizer batch. Every microbatch keeps its requested tiles' complete context.
+Biology means use the effective batch's valid target-weight mass, weighted
+discriminator cross-entropy uses its class-weight mass, and H&E MSE uses its
+feature-element count. ZILN sum reduction remains additive. Parameters and GRL
+strength stay fixed until the group finishes; clipping and AdamW occur once,
+including for a partial final batch. Training logs describe logical updates.
+With dropout enabled the stochastic draws differ from a monolithic batch.
+
+Production defaults to its epoch-based GRL horizon:
+`completed_updates / (epochs * logical_updates_per_epoch - 1)` (with the
+existing denominator guard). An explicit `training.grl_horizon_updates` uses
+`completed_updates / (grl_horizon_updates - 1)` instead. Checkpoints record the
+horizon, physical microbatch setting, logical updates per epoch, and cumulative
+optimizer-update/row counters in `optimization` and `training_progress`.
+`training.early_stopping_enabled: false` disables diagnostic early stopping.
 Dropout, AdamW, clipping, loss weights, peak budget and checkpointing are unchanged.
 New checkpoints have a separate versioned `sampling_contract` and epoch-boundary
 `sampler_state`. Training resume keeps the checkpoint sampling contract, so a YAML change to
@@ -211,14 +234,71 @@ strategy, algorithm, seed, core size, training batch budget, or selected-row
 identity is ignored. The contract check still rejects a checkpoint whose saved
 sampler state is inconsistent. Old checkpoints imply legacy sampling using their
 saved configuration. Inference and
-architecture checks do not depend on sampler compatibility; no mid-epoch resume
-is supported.
+architecture checks do not depend on sampler compatibility. The production
+`train_model` entry point resumes completed epochs only; partial pilot checkpoints
+also carry the update position and RNG needed by update-oriented callers.
 
 Training writes `model/sampling/epoch_NNNN_batches.jsonl` with supervised rows,
 unique tiles, distinct slides, slide entropy (natural logarithm), largest slide
 fraction, cumulative rows and epoch position. The corresponding summary records
 composition ranges/means and SHA-256 hashes of actual row order and cumulative
 boundaries (little-endian int64, including the initial zero boundary).
+
+The bounded core/batch pilot uses fresh identical all-GATv2 weights, the saved
+90/10 split, radius 1.5 throughout, learning rate 0.0001, and a shared 500-update
+GRL horizon. Its reference uses core 8 / 2,048 rows / attention dropout 0; its
+candidate uses core 32 / 32,768 rows / attention dropout 0.10, initially in 4,096-row
+microbatches (falling back to 2,048 then 1,024 on memory failures). Both validate
+with eight physical tiles and retain the other configured architecture/loss
+settings. It compares the combined changes, not an isolated dropout effect.
+
+```bash
+python -m dann.verification.core_batch_pilot \
+  --split-checkpoint data/PDAC/Results/dann/deep_sets__agg-gatv2__bio-gatv2__disc-gatv2__he-gatv2/he_mse_baseline/model/latest.pt \
+  --output data/PDAC/Results/dann/core32-pilot \
+  --minutes 60 --updates 500
+```
+
+Use a fresh output directory. The runner alternates 50-update blocks, validates
+initially and after every completed pair, and reserves measured validation time
+before starting another pair. `results.json` identifies the largest completed
+paired checkpoint; unmatched work is excluded from comparisons. Separate arm
+directories contain resolved configs, update composition/row hashes, checkpoints,
+and held-out diagnostics. `comparison.csv` reports learning by updates, rows and
+elapsed time. Automatic full-tissue inference and plotting are disabled.
+
+To compare physical accumulation while holding the candidate's effective batch
+at 32,768 rows, use its untrained `candidate/model/update_0000.pt` checkpoint:
+
+```bash
+python -m dann.verification.accumulation_benchmark \
+  --checkpoint /path/to/candidate/model/update_0000.pt \
+  --output data/PDAC/Results/dann/accumulation-benchmark \
+  --minutes 30 --repeats 3 --warmup 5
+```
+
+The benchmark tests 1/2/4/8 accumulation steps (32,768/16,384/8,192/4,096 physical
+rows). Core 32, radius 1.5, attention dropout 0.10, spectral/GAT execution budgets,
+optimizer settings, saved split, initial weights, and update-based GRL schedule
+stay fixed. Every repetition uses a fresh process and five warmup updates, then
+restores weights, AdamW, gradients, random streams and counters before one timed
+full epoch. Repetitions use sampler epochs 0/1/2, paired across settings. Timing
+includes CPU preparation, transfers, training and the final partial update;
+startup, report writing, validation and checkpointing are excluded.
+
+`results.json`, `comparison.csv` and `report.txt` retain isolated process timings,
+warmup and training memory peaks, actual supervision hashes, optimizer counters,
+and failures. CUDA allocation failures are distinct from exceeding the configured
+24 GiB GPU budget. A failing setting never silently changes its microbatch size.
+All repetitions must complete within budget to qualify; within 3% of the fastest
+median epoch, the recommendation prefers lower allocated GPU memory. These are
+observed memory and throughput results, not convergence or biological-quality
+comparisons. Existing production configurations and checkpoints are not modified.
+Latent effective rank uses a fixed row-ID subsample (row ID modulo 23); variance
+and within/between-slide decomposition use all validation rows. CD8 diagnostics
+include presence/exceedance Brier scores, presence calibration bins and
+positive-branch PIT/interval coverage. These are pilot diagnostics, not evidence
+of improved biological interpretation or H&E-mediated transfer.
 
 The preceding diagnostic supports this sampling correction for spatial MLP and
 discriminator-only CNN controls. It does not confirm convergence of the active

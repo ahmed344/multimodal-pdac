@@ -9,9 +9,9 @@ import math
 import resource
 import sys
 from time import perf_counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -62,7 +62,46 @@ class EarlyStopping:
         return improved, self.stale_epochs >= self.patience
 
 
+@dataclass
+class TrainingProgress:
+    """Counters at completed optimizer boundaries, including partial epochs."""
+
+    optimizer_updates: int = 0
+    supervised_rows: int = 0
+    epoch: int = 0
+    update_in_epoch: int = 0
+
+    @classmethod
+    def from_checkpoint(cls, checkpoint: Mapping[str, Any], updates_per_epoch: int,
+                        rows_per_epoch: int) -> "TrainingProgress":
+        """Read explicit counters or infer completed epochs for legacy checkpoints."""
+        if "training_progress" in checkpoint:
+            return cls(**checkpoint["training_progress"])
+        epochs = int(checkpoint.get("epoch", -1)) + 1
+        return cls(epochs * updates_per_epoch, epochs * rows_per_epoch, epochs, 0)
+
+
+def accumulation_scales(batch: Mapping[str, Any], biology, ziln_loss: ZILNLoss,
+                        class_weights: torch.Tensor | None) -> tuple[Any, Any, float]:
+    """Scale local loss means by their exact logical-batch denominator masses."""
+    group = batch.get("accumulation")
+    if group is None:
+        return 1., 1., 1.
+    weights = ziln_loss.target_weights
+    bio_mass = (group["valid_counts"].to(weights) * weights).sum()
+    bio_scale = (biology.valid_weight_mass / bio_mass.clamp_min(torch.finfo(weights.dtype).eps)
+                 if ziln_loss.reduction == "mean" else 1.)
+    counts = group["class_counts"]
+    if class_weights is None:
+        class_scale = len(batch["batches"]) / group["rows"]
+    else:
+        class_scale = class_weights[batch["batches"]].sum() / (counts.to(class_weights) * class_weights).sum()
+    # Every row has the same frozen H&E width; this is exactly the element-count ratio.
+    return bio_scale, class_scale, len(batch["targets"]) / group["rows"]
+
+
 _RESUME_OVERRIDES = (
+    "early_stopping_enabled",
     "early_stopping_patience",
     "early_stopping_min_delta",
     "epochs",
@@ -94,7 +133,8 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     training = config.setdefault("training", {})
     requested = requested_config["training"]
     for key in _RESUME_OVERRIDES:
-        training[key] = requested[key]
+        if key in requested:
+            training[key] = requested[key]
     training["early_stopping_metric"] = selection_metric(requested_config)
     from dann.config import performance_settings, post_training_settings
     config['performance'] = performance_settings(requested_config)
@@ -750,6 +790,12 @@ def run_epoch(
     sampling_audit_dir: Path | None = None,
     he_weight: float = 1.0,
     artifacts: TrainingArtifacts | None = None,
+    progress_state: TrainingProgress | None = None,
+    grl_horizon_updates: int | None = None,
+    max_updates: int | None = None,
+    deadline: float | None = None,
+    update_callback: Callable[[dict], None] | None = None,
+    evaluation_callback: Callable[[Mapping, Mapping], None] | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -774,6 +820,12 @@ def run_epoch(
             ``target_{index}`` suffixes when omitted.
         sampling_audit_dir (Path | None): Optional spatial batch logs and epoch hashes.
         artifacts (TrainingArtifacts | None): Background audit writer and worker-error monitor.
+        progress_state (TrainingProgress | None): Mutable counters at completed optimizer boundaries.
+        grl_horizon_updates (int | None): Fixed update horizon; None preserves the epoch horizon.
+        max_updates (int | None): Bound logical requests for proportional sampling.
+        deadline (float | None): Monotonic deadline checked before starting a logical update.
+        update_callback (Callable | None): Observe each completed logical update.
+        evaluation_callback (Callable | None): Observe held-out predictions without changing evaluation.
 
     Returns:
         dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
@@ -802,25 +854,36 @@ def run_epoch(
                    he_rows=torch.zeros((), dtype=torch.float64, device=device))
     cd8_loss = ZILNLoss([1.0], ziln_loss.logit_epsilon, "sum",
                         ziln_loss.include_normal_constant).to(device)
-    steps_per_epoch = max(len(loader), 1)
-    # Production retains the epoch-based GRL horizon, unlike diagnostic fixed-update runs.
+    steps_per_epoch = max(getattr(getattr(loader, 'sampler', None), 'logical_updates', len(loader)), 1)
+    state = progress_state or TrainingProgress(epoch_index * steps_per_epoch, 0, epoch_index, 0)
+    initial_updates = state.optimizer_updates
     if training and hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch_index)
+        if hasattr(loader.sampler, "start_update"):
+            loader.sampler.start_update = state.update_in_epoch
+            loader.sampler.stop_update = (state.update_in_epoch + max_updates
+                                         if max_updates is not None else None)
     audit = (SamplingEpochAudit(epoch_index, len(loader.dataset.indices))
-             if training and sampling_audit_dir is not None else None)
+             if training and (sampling_audit_dir is not None or update_callback is not None) else None)
     from dann.execution import device_batches, evaluation_groups
     batches = ((cpu, batch, None) for cpu, batch in device_batches(loader, device)) if training else evaluation_groups(model, loader, device)
+    group_rows, group_batches = [], []
+    update_started = perf_counter()
     with (torch.enable_grad() if training else torch.inference_mode()):
         for step, (cpu_batch, batch, outputs) in enumerate(batches):
             if artifacts is not None:
                 artifacts.check()
-            progress = (epoch_index * steps_per_epoch + step) / max(
-                total_epochs * steps_per_epoch - 1, 1
-            )
+            group = cpu_batch.get("accumulation", {})
+            first = group.get("index", 0) == 0
+            last = group.get("index", 0) + 1 == group.get("count", 1)
+            if training and first and deadline is not None and perf_counter() >= deadline:
+                break
+            progress = state.optimizer_updates / max(
+                (grl_horizon_updates or total_epochs * steps_per_epoch) - 1, 1)
             strength = grl_strength(
                 progress, grl_schedule, grl_max_lambda, grl_gamma
             )
-            if training:
+            if training and first:
                 optimizer.zero_grad(set_to_none=True)
             if outputs is None:
                 outputs = model(batch, grl_strength=strength)
@@ -850,7 +913,9 @@ def run_epoch(
                 from dann.he import he_mse
                 he_loss = he_mse(outputs['he_prediction'], batch['he_targets'])
                 _update_he_statistics(metrics, outputs['he_prediction'], batch['he_targets'])
-            total = biology_weight * biology.total + batch_weight * discriminator + he_weight * he_loss
+            bio_scale, class_scale, he_scale = accumulation_scales(batch, biology, ziln_loss, class_weights)
+            total = (biology_weight * biology.total * bio_scale
+                     + batch_weight * discriminator * class_scale + he_weight * he_loss * he_scale)
             finite_outputs = torch.stack([torch.isfinite(value).all() for value in outputs.values()]).all()
             if not (torch.isfinite(total) & finite_outputs):
                 raise FloatingPointError(
@@ -858,11 +923,36 @@ def run_epoch(
                 )
             if training:
                 total.backward()
-                if gradient_clip_norm is not None:
-                    nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
-                optimizer.step()
-                if audit is not None and "occupancy" in cpu_batch:
-                    audit.update(cpu_batch)
+                if audit is not None:
+                    group_rows.append(cpu_batch["row_ids"])
+                    group_batches.append(cpu_batch["batches"])
+                if last:
+                    if gradient_clip_norm is not None:
+                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+                    optimizer.step()
+                    state.optimizer_updates += 1
+                    state.update_in_epoch += 1
+                    state.supervised_rows += group.get("rows", len(batch["targets"]))
+                    record = {}
+                    if audit is not None:
+                        record = audit.update(dict(row_ids=torch.cat(group_rows), batches=torch.cat(group_batches),
+                            unique_tiles=group.get("tiles", len(cpu_batch.get("occupancy", ())))))
+                        group_rows, group_batches = [], []
+                    if update_callback is not None:
+                        if device.type == 'cuda':
+                            torch.cuda.synchronize(device)
+                        if hasattr(loader.sampler, 'row_budget'):
+                            position = min(state.update_in_epoch * loader.sampler.row_budget,
+                                           len(loader.dataset.indices))
+                            record.update(step=state.update_in_epoch-1, processed_rows=position,
+                                          epoch_position=position / len(loader.dataset.indices))
+                        update_callback(dict(record, optimizer_updates=state.optimizer_updates,
+                                             cumulative_supervised_rows=state.supervised_rows,
+                                             update_in_epoch=state.update_in_epoch, grl_strength=strength,
+                                             seconds=perf_counter() - update_started))
+                    update_started = perf_counter()
+            elif evaluation_callback is not None:
+                evaluation_callback(batch, outputs)
 
             batch_size = int(batch["targets"].shape[0])
             metrics["samples"] += batch_size
@@ -872,14 +962,19 @@ def run_epoch(
                 if ziln_loss.reduction == "mean" else batch_size
             )
             metrics["biology_mass"] += mass
-            metrics["biology"] += biology.total.detach() * mass
-            metrics["hurdle"] += biology.hurdle.detach() * mass
-            metrics["positive"] += biology.positive.detach() * mass
-            metrics["hurdle_per_target"] += biology.hurdle_per_target * mass
-            metrics["positive_per_target"] += biology.positive_per_target * mass
-            metrics["batch"] += discriminator.detach() * batch_size
+            report_mass = mass if ziln_loss.reduction == "mean" else group.get("rows", batch_size)
+            metrics["biology"] += biology.total.detach() * report_mass
+            metrics["hurdle"] += biology.hurdle.detach() * report_mass
+            metrics["positive"] += biology.positive.detach() * report_mass
+            metrics["hurdle_per_target"] += biology.hurdle_per_target * report_mass
+            metrics["positive_per_target"] += biology.positive_per_target * report_mass
+            metrics["batch"] += discriminator.detach() * class_scale * group.get("rows", batch_size)
             predictions = outputs["batch_logits"].argmax(dim=1)
             metrics["batch_correct"] += (predictions == batch["batches"]).sum().detach()
+    batches.close()
+    if training and state.update_in_epoch == steps_per_epoch:
+        state.epoch = epoch_index + 1
+        state.update_in_epoch = 0
     # One reporting transfer for all scalar and per-target sufficient statistics.
     packed = torch.cat([v.reshape(-1) for v in metrics.values()]).cpu().numpy()
     offset = 0
@@ -903,12 +998,16 @@ def run_epoch(
     finalized["batch_weighted_loss"] = batch_weight * finalized["batch_loss"]
     finalized["supervised_objective"] = finalized["biology_weighted_loss"] + finalized.get("he_weighted_loss", 0.0)
     finalized["total_loss"] = finalized["supervised_objective"] + finalized["batch_weighted_loss"]
-    if audit is not None:
+    if audit is not None and sampling_audit_dir is not None:
         summary = audit.summary() if audit.compositions else None
         if artifacts is None:
             write_audit(sampling_audit_dir, epoch_index, audit.compositions, summary)
         else:
             artifacts.submit_audit(sampling_audit_dir, epoch_index, audit.compositions, summary)
+    if training:
+        finalized.update(optimizer_updates=state.optimizer_updates - initial_updates,
+                         cumulative_optimizer_updates=state.optimizer_updates,
+                         cumulative_supervised_rows=state.supervised_rows)
     if hasattr(loader, 'settings'):
         elapsed = perf_counter() - started
         peak = torch.cuda.max_memory_allocated(device) if device.type == 'cuda' else 0
@@ -950,6 +1049,12 @@ def checkpoint_metadata(
         pyg_version = None
     validate_checkpoint({"config": saved_config, "architecture": architecture}, config, model)
     return {
+        "optimization": dict(
+            logical_updates_per_epoch=getattr(bundle.loaders["train"].sampler, "logical_updates",
+                                              len(bundle.loaders["train"])),
+            supervised_rows_per_batch=config["training"].get("supervised_rows_per_batch"),
+            microbatch_rows=config["training"].get("microbatch_rows"),
+            grl_horizon_updates=config["training"].get("grl_horizon_updates")),
         "software_versions": {"torch": str(torch.__version__), "torch_geometric": pyg_version},
         "sampling_contract": sampling_contract(config, bundle.split_indices["train"]),
         "architecture": architecture,
@@ -967,9 +1072,11 @@ def checkpoint_metadata(
 
 def checkpoint_payload(metadata: Mapping[str, Any], state: Mapping[str, Any], epoch: int,
                        best_selection_score: float, *, best_epoch: float | None = None,
-                       selection_start_epoch: int = 1, stopper: EarlyStopping | None = None) -> dict[str, Any]:
+                       selection_start_epoch: int = 1, stopper: EarlyStopping | None = None,
+                       progress_state: TrainingProgress | None = None) -> dict[str, Any]:
     """Combine frozen state with the completed epoch's exact stopping metadata."""
     return {**metadata, **state, 'epoch': int(epoch),
+            **({'training_progress': asdict(progress_state)} if progress_state is not None else {}),
             'sampler_state': dict(completed_epoch=int(epoch), sampler_epoch=int(epoch), next_epoch=int(epoch) + 1),
             'best_selection_score': float(best_selection_score), 'best_epoch': best_epoch,
             'selection_start_epoch': int(selection_start_epoch),
@@ -990,12 +1097,14 @@ def save_checkpoint(
     best_epoch: float | None = None,
     selection_start_epoch: int = 1,
     stopper: EarlyStopping | None = None,
+    progress_state: TrainingProgress | None = None,
 ) -> None:
     """Synchronously save an atomic, portable checkpoint for existing callers."""
     metadata = checkpoint_metadata(model, config, bundle)
     state = cpu_snapshot(dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict()))
     payload = checkpoint_payload(metadata, state, epoch, best_selection_score,
-                                 best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper)
+                                 best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper,
+                                 progress_state=progress_state)
     with atomic_output(path) as temporary:
         torch.save(payload, temporary)
 
@@ -1029,6 +1138,9 @@ def load_training_checkpoint(
     validate_training_data_contract(checkpoint, config)
     validate_checkpoint(checkpoint, config, model, optimizer=True)
     validate_sampling_contract(checkpoint, config, selected_rows)
+    if checkpoint.get("training_progress", {}).get("update_in_epoch", 0):
+        raise ValueError("Partial-epoch checkpoints require restoring training_progress and RNG; "
+                         "the epoch-only train_model entry point cannot resume them.")
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     saved = checkpoint_selection(checkpoint)
@@ -1137,9 +1249,15 @@ def train_model(config: Mapping[str, Any]) -> Path:
     )
     output_dir = Path(training["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    logical_updates = getattr(bundle.loaders["train"].sampler, "logical_updates", len(bundle.loaders["train"]))
+    progress_state = TrainingProgress.from_checkpoint(
+        resume_payload, logical_updates, len(bundle.split_indices["train"]))
     with (output_dir / "execution_startup.json").open('w') as handle:
         json.dump(dict(preparation_seconds=preparation_seconds,
                        resident_spectra_bytes=resident.nbytes if resident is not None else 0,
+                       logical_updates_per_epoch=logical_updates,
+                       microbatch_rows=training.get("microbatch_rows"),
+                       grl_horizon_updates=training.get("grl_horizon_updates"),
                        performance=config.get('performance', {})), handle, indent=2)
     with (output_dir / "resolved_config.yaml").open("w", encoding="utf-8") as handle:
         yaml.safe_dump(dict(config), handle, sort_keys=False)
@@ -1190,7 +1308,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 else:
                     refresh_loss_curves(history_path, output_dir / 'loss_curves.png',
                                         int(config['analysis']['figure_dpi']), best_epoch, config, selection)
-        if resume and stopper.stale_epochs >= stopper.patience:
+        if resume and training.get("early_stopping_enabled", True) and stopper.stale_epochs >= stopper.patience:
             print(f"Early stopping remains in effect after epoch {start_epoch}.", flush=True)
             return output_dir / "best.pt"
         epochs = int(training["epochs"])
@@ -1221,6 +1339,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 target_columns=target_columns,
                 sampling_audit_dir=output_dir / "sampling",
                 artifacts=artifacts,
+                progress_state=progress_state,
+                grl_horizon_updates=training.get("grl_horizon_updates"),
             )
             validation_metrics = run_epoch(
                 model=model,
@@ -1251,6 +1371,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
             if not math.isfinite(validation_metrics[metric]):
                 raise ValueError(f"Validation requires a finite {metric} for checkpoint selection.")
             improved, should_stop = stopper.update(validation_metrics[metric])
+            should_stop = should_stop and training.get("early_stopping_enabled", True)
             if improved:
                 best_epoch = float(epoch + 1)
             row.update(selected_epoch=best_epoch, selection_start_epoch=float(selection_start_epoch))
@@ -1268,7 +1389,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
                          cpu_snapshot(dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict())))
                 snapshot_seconds = perf_counter() - snapshot_started
                 payload = checkpoint_payload(metadata, state, epoch, stopper.best, best_epoch=best_epoch,
-                                             selection_start_epoch=selection_start_epoch, stopper=stopper)
+                                             selection_start_epoch=selection_start_epoch, stopper=stopper,
+                                             progress_state=progress_state)
                 del state
             selection = dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch)
             summary = _format_epoch_summary(epoch + 1, epochs, train_metrics, validation_metrics, target_columns, metric)

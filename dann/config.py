@@ -318,7 +318,8 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     spatial_batching = {key: training.get("spatial", training).get(key, default)
                        for key, default in (("core_size", 32), ("tiles_per_batch", 8),
                                             ("sampling_strategy", "shuffled_tiles"),
-                                            ("supervised_rows_per_batch", 2048))}
+                                            ("supervised_rows_per_batch", 2048),
+                                            ("microbatch_rows", None))}
     if "pixel" in training:
         training.update(training["pixel"])
     if mode in training:
@@ -342,6 +343,18 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     for key in ("core_size", "tiles_per_batch", "supervised_rows_per_batch") if mode == "spatial" else ():
         if not isinstance(training[key], int) or isinstance(training[key], bool) or training[key] <= 0:
             raise ValueError(f"training.{key} must be a positive integer.")
+    if mode == "spatial" and training["microbatch_rows"] is not None:
+        value = training["microbatch_rows"]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError("training.spatial.microbatch_rows must be a positive integer or null.")
+        if training["sampling_strategy"] != "proportional_slide_tiles":
+            raise ValueError("microbatch_rows requires proportional_slide_tiles sampling.")
+    horizon = training.setdefault("grl_horizon_updates", None)
+    if horizon is not None and (isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0):
+        raise ValueError("training.grl_horizon_updates must be a positive integer or null.")
+    training.setdefault("early_stopping_enabled", True)
+    if not isinstance(training["early_stopping_enabled"], bool):
+        raise ValueError("training.early_stopping_enabled must be boolean.")
     if (isinstance(training["num_workers"], bool) or not isinstance(training["num_workers"], int)
             or training["num_workers"] < 0 or not np.isfinite(training["learning_rate"])
             or training["learning_rate"] <= 0):
@@ -358,6 +371,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     if mode == "spatial":
         config["execution"].update(
             core_size=training["core_size"], tiles_per_batch=training["tiles_per_batch"],
+            microbatch_rows=training["microbatch_rows"],
             sampling_strategy=training["sampling_strategy"],
             training_supervised_rows_per_batch=(training["supervised_rows_per_batch"]
                 if training["sampling_strategy"] == "proportional_slide_tiles" else None),

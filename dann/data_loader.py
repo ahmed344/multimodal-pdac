@@ -684,7 +684,8 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         from dann.sampling import ProportionalSlideTileSampler, SpatialBatchDataset
         tiles = datasets["train"]
         sampler = ProportionalSlideTileSampler(
-            tiles, seed, training_config["supervised_rows_per_batch"])
+            tiles, seed, training_config["supervised_rows_per_batch"],
+            training_config.get("microbatch_rows"))
         batch_dataset = SpatialBatchDataset(tiles)
         batch_kwargs = {k: v for k, v in common_loader_kwargs.items() if k != "collate_fn"}
         loaders["train"] = DataLoader(batch_dataset, batch_size=None, sampler=sampler,
