@@ -20,10 +20,11 @@ import yaml
 from torch import nn
 from torch.nn import functional as F
 
-from dann.config import apply_smoke_overrides, load_config, resolve_device, seed_everything
+from dann.config import apply_smoke_overrides, load_config, lr_scheduler_settings, resolve_device, seed_everything
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.sampling import SamplingEpochAudit
 from dann.losses import ZILNLoss
+from dann.lr_scheduler import create_lr_scheduler, step_lr_scheduler, validate_lr_scheduler_checkpoint
 from dann.model import AdversarialLatentFusion
 from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
@@ -31,7 +32,7 @@ from dann.tiles import row_identity
 from dann.targets import CD8, checkpoint_contract, target_contract
 from dann.selection import checkpoint_selection, selection_metric
 from dann.training_artifacts import (TrainingArtifacts, atomic_output, atomic_json,
-                                     cpu_snapshot, write_history, write_audit)
+                                     cpu_snapshot, training_state, write_history, write_audit)
 
 
 @dataclass
@@ -131,6 +132,7 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
         raise ValueError('Incompatible H&E settings on resume; adding or changing the head requires fresh training.')
     config = copy.deepcopy(dict(saved_config))
     training = config.setdefault("training", {})
+    training["lr_scheduler"] = lr_scheduler_settings(training)
     requested = requested_config["training"]
     for key in _RESUME_OVERRIDES:
         if key in requested:
@@ -683,6 +685,8 @@ def _format_epoch_summary(
     validation_metrics: Mapping[str, float],
     target_columns: Sequence[str],
     metric: str = "cd8_loss",
+    learning_rate: float | None = None,
+    next_learning_rate: float | None = None,
 ) -> str:
     """Build the epoch log with one aligned line per IHC target.
 
@@ -693,6 +697,8 @@ def _format_epoch_summary(
         validation_metrics (Mapping[str, float]): Finalized validation metrics.
         target_columns (Sequence[str]): Ordered target column names.
         metric (str): Validation score used for early stopping and checkpoint selection.
+        learning_rate (float | None): LR used throughout the completed epoch.
+        next_learning_rate (float | None): LR after validation-driven scheduling.
 
     Returns:
         str: Loss line, macro fit line, and one ``[Name]`` line per target.
@@ -719,6 +725,10 @@ def _format_epoch_summary(
         f"{label} = {_format_pair(train_metrics[key], validation_metrics[key], decimals)}"
         for label, key, decimals in loss_parts
     )
+    if learning_rate is not None:
+        if next_learning_rate is None:
+            next_learning_rate = learning_rate
+        loss_text += f" | learning_rate = {learning_rate:.8g} | next_learning_rate = {next_learning_rate:.8g}"
     fit_text = " | ".join(
         f"{label} = {_format_pair(train_metrics[key], validation_metrics[key], decimals)}"
         for label, key, decimals in fit_parts
@@ -1098,10 +1108,11 @@ def save_checkpoint(
     selection_start_epoch: int = 1,
     stopper: EarlyStopping | None = None,
     progress_state: TrainingProgress | None = None,
+    lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
 ) -> None:
     """Synchronously save an atomic, portable checkpoint for existing callers."""
     metadata = checkpoint_metadata(model, config, bundle)
-    state = cpu_snapshot(dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict()))
+    state = cpu_snapshot(training_state(model, optimizer, lr_scheduler))
     payload = checkpoint_payload(metadata, state, epoch, best_selection_score,
                                  best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper,
                                  progress_state=progress_state)
@@ -1116,6 +1127,8 @@ def load_training_checkpoint(
     device: torch.device,
     config: Mapping[str, Any],
     selected_rows=None,
+    *,
+    lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
 ) -> tuple[int, float]:
     """Restore model and optimizer state for resumed training.
 
@@ -1127,6 +1140,9 @@ def load_training_checkpoint(
         config (Mapping[str, Any]): Requested training configuration to validate.
         selected_rows: Actual selected training rows; defaults to saved rows for callers
             that do not rebuild the training bundle.
+        lr_scheduler: Optional scheduler receiving saved state without an extra step.
+            Existing model/optimizer-only callers may omit it; train_model also
+            validates the scheduler contract before preparing production data.
 
     Returns:
         tuple[int, float]: Next epoch index and compatible prior best selection score.
@@ -1141,6 +1157,11 @@ def load_training_checkpoint(
     if checkpoint.get("training_progress", {}).get("update_in_epoch", 0):
         raise ValueError("Partial-epoch checkpoints require restoring training_progress and RNG; "
                          "the epoch-only train_model entry point cannot resume them.")
+    if lr_scheduler is not None:
+        validate_lr_scheduler_checkpoint(checkpoint)
+        if not lr_scheduler_settings(checkpoint["config"]["training"])["enabled"]:
+            raise ValueError("Cannot enable LR scheduling when resuming a fixed-LR checkpoint.")
+        lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state"])
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
     saved = checkpoint_selection(checkpoint)
@@ -1193,6 +1214,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
             raise ValueError("Cannot resume a checkpoint during a smoke test.")
         resume_payload = torch.load(resume, map_location="cpu", weights_only=False)
         config = resume_training_config(checkpoint_config(resume_payload), requested)
+        validate_lr_scheduler_checkpoint(resume_payload)
         ignored = ignored_resume_settings(requested, config)
         if ignored:
             print("Resume kept checkpoint values for: " + ", ".join(ignored), flush=True)
@@ -1235,12 +1257,14 @@ def train_model(config: Mapping[str, Any]) -> Path:
         weight_decay=float(training["weight_decay"]),
         betas=(float(training["beta1"]), float(training["beta2"])),
     )
+    lr_scheduler = create_lr_scheduler(optimizer, config)
     start_epoch = 0
     prior_best = math.inf
     resume = training.get("resume_checkpoint")
     if resume:
         start_epoch, prior_best = load_training_checkpoint(
-            Path(resume), model, optimizer, device, config, bundle.split_indices["train"]
+            Path(resume), model, optimizer, device, config, bundle.split_indices["train"],
+            lr_scheduler=lr_scheduler,
         )
     stopper = EarlyStopping(
         patience=int(training["early_stopping_patience"]),
@@ -1319,6 +1343,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
         for epoch in range(start_epoch, epochs):
             if artifacts is not None:
                 artifacts.check()
+            learning_rate = float(optimizer.param_groups[0]["lr"])
             train_metrics = run_epoch(
                 model=model,
                 loader=bundle.loaders["train"],
@@ -1370,6 +1395,9 @@ def train_model(config: Mapping[str, Any]) -> Path:
             )
             if not math.isfinite(validation_metrics[metric]):
                 raise ValueError(f"Validation requires a finite {metric} for checkpoint selection.")
+            step_lr_scheduler(lr_scheduler, validation_metrics)
+            next_learning_rate = float(optimizer.param_groups[0]["lr"])
+            row.update(learning_rate=learning_rate, next_learning_rate=next_learning_rate)
             improved, should_stop = stopper.update(validation_metrics[metric])
             should_stop = should_stop and training.get("early_stopping_enabled", True)
             if improved:
@@ -1385,15 +1413,16 @@ def train_model(config: Mapping[str, Any]) -> Path:
             payload, snapshot_seconds = None, 0.
             if destinations:
                 snapshot_started = perf_counter()
-                state = (artifacts.snapshot(model, optimizer) if artifacts is not None else
-                         cpu_snapshot(dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict())))
+                state = (artifacts.snapshot(model, optimizer, lr_scheduler) if artifacts is not None else
+                         cpu_snapshot(training_state(model, optimizer, lr_scheduler)))
                 snapshot_seconds = perf_counter() - snapshot_started
                 payload = checkpoint_payload(metadata, state, epoch, stopper.best, best_epoch=best_epoch,
                                              selection_start_epoch=selection_start_epoch, stopper=stopper,
                                              progress_state=progress_state)
                 del state
             selection = dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch)
-            summary = _format_epoch_summary(epoch + 1, epochs, train_metrics, validation_metrics, target_columns, metric)
+            summary = _format_epoch_summary(epoch + 1, epochs, train_metrics, validation_metrics,
+                                            target_columns, metric, learning_rate, next_learning_rate)
             if artifacts is not None:
                 artifacts.submit_epoch(history, history_columns, preserved_lines, selection, payload, destinations, summary)
             else:

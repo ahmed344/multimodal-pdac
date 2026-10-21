@@ -1,6 +1,7 @@
 """Inference cache, metadata, deterministic spawned sampling and publication contracts."""
 import copy
 import hashlib
+import json
 from pathlib import Path
 
 import h5py
@@ -9,6 +10,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 import pytest
 import torch
+import yaml
 
 from dann.config import spatial_execution_settings, resolve_execution
 from dann.spatial import run_inference
@@ -161,16 +163,56 @@ def test_execution_validation(key, value):
     assert not spatial_execution_settings()['enabled']
 
 
-def test_cli_tile_precedence(spatial_config, tmp_path):
+@pytest.mark.parametrize('flags,expected', [([], 3), (['--batch-size', '7'], 7),
+    (['--tiles-per-batch', '1'], 1), (['--batch-size', '7', '--tiles-per-batch', '1'], 1)])
+def test_cli_tile_precedence(spatial_config, tmp_path, flags, expected):
+    from dann.spatial import main
     config = spatial_config
     config['analysis'].pop('spatial_execution', None)
     path = checkpoint(config, tmp_path)
     output = tmp_path/'precedence'/'prediction.parquet'
-    run_inference(Path(config['data']['context_path']), path, output, max_rows=3,
-                  batch_size_override=7, tiles_per_batch=1, execution_overrides=options())
-    import json
+    overrides = options()
+    config['analysis']['spatial_execution'] = overrides['spatial_execution']
+    config['performance'] = overrides['performance']
+    yaml_path = tmp_path/'current.yaml'
+    yaml_path.write_text(yaml.safe_dump(config))
+    assert main(['--config', str(yaml_path), '--checkpoint', str(path),
+                 '--output', str(output), '--latent-output', str(output.parent/'latents.parquet'),
+                 '--max-rows', '3', *flags]) == 0
     report = json.loads(output.with_suffix('.provenance.json').read_text())
-    assert report['execution']['physical_tiles_per_batch'] == 1
+    assert report['execution']['physical_tiles_per_batch'] == expected
+
+
+@pytest.mark.parametrize('profile', ['optimized', 'disabled', 'omitted'])
+def test_workflow_spatial_tile_count_and_legacy_fallback(spatial_config, tmp_path, profile):
+    from dann import workflow
+    config = spatial_config
+    model_dir = tmp_path/'model'
+    model_dir.mkdir()
+    path = checkpoint(config, model_dir)
+    saved = torch.load(path, map_location='cpu', weights_only=False)
+    overrides = options(density_workers=0)
+    config['performance'] = overrides['performance']
+    if profile != 'omitted':
+        config['analysis']['spatial_execution'] = overrides['spatial_execution']
+        config['analysis']['spatial_execution']['enabled'] = profile == 'optimized'
+    # Runtime selectors deliberately disagree with the spatial checkpoint.
+    for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
+        group['type'] = 'mlp'
+    resolve_execution(config)
+    config['analysis']['batch_size'] = 4096
+    config['post_training'].update(run_analysis=False, run_spatial_heatmaps=False,
+                                   run_latent_variance=False)
+
+    outputs = workflow.run_post_training_workflow(config, path)
+
+    report = json.loads(outputs['inference'].with_suffix('.provenance.json').read_text())
+    expected = 3 if profile == 'optimized' else saved['config']['training']['tiles_per_batch']
+    assert report['execution']['physical_tiles_per_batch'] == expected
+    assert report['selected_rows'] == report['context_rows'] == 156
+    effective = workflow._workflow_config(config, saved, path)
+    workflow._validate_exports(effective, saved, path, Path(config['data']['context_path']),
+                               predictions=True, latents=True)
 
 
 def test_categorical_axis_names_and_nullable_missing(spatial_config):

@@ -92,6 +92,18 @@ def state_bytes(value: Any, seen: set[int] | None = None) -> int:
     return size
 
 
+def training_state(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+) -> dict[str, Any]:
+    """Collect live training state; callers must freeze it before further updates."""
+    state = dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict())
+    if lr_scheduler is not None:
+        state["lr_scheduler_state"] = lr_scheduler.state_dict()
+    return state
+
+
 def cpu_snapshot(value: Any) -> Any:
     """Copy nested state, completing batched CUDA transfers before returning.
 
@@ -274,9 +286,12 @@ class TrainingArtifacts:
                     raise MemoryError('Training artifact snapshot cannot fit performance.host_budget_gib.')
                 self.condition.wait(.05)
 
-    def snapshot(self, model: torch.nn.Module, optimizer: torch.optim.Optimizer) -> dict[str, Any]:
-        """Reserve memory before copying a single immutable model/optimizer state."""
-        state = dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict())
+    def snapshot(
+        self, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
+        lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    ) -> dict[str, Any]:
+        """Reserve memory before freezing model, optimizer, and optional scheduler."""
+        state = training_state(model, optimizer, lr_scheduler)
         self.reserve(3 * state_bytes(state))
         return cpu_snapshot(state)
 

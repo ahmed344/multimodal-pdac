@@ -13,7 +13,7 @@ import torch
 from dann.analyze import run_analysis
 from dann.checkpoints import checkpoint_config
 from dann.config import (
-    density_sampling_settings, inference_input, latent_variance_settings,
+    density_sampling_settings, execution_settings, inference_input, latent_variance_settings,
     post_training_settings, spatial_heatmap_settings,
 )
 from dann.latent_variance import run_latent_variance
@@ -165,12 +165,16 @@ def run_post_training_workflow(config: Mapping[str, Any], checkpoint_path: Path)
             stage = 'inference'
             tissue = inference_input(effective)
             count, seed = density_sampling_settings(analysis)
+            # Analysis batches count pixel rows; spatial inference resolves its
+            # own tile count from the export profile or saved legacy defaults.
+            batch_size = (analysis['batch_size']
+                          if execution_settings(effective)['mode'] == 'pixel' else None)
             record(stage, run_inference(
                 input_path=tissue, checkpoint_path=checkpoint_path,
                 output_path=Path(effective['spatial']['output']),
                 latent_output_path=Path(effective['spatial']['latents']),
                 device_override=effective['training']['device'],
-                batch_size_override=analysis['batch_size'], num_workers_override=analysis['num_workers'],
+                batch_size_override=batch_size, num_workers_override=analysis['num_workers'],
                 density_mc_samples=count, density_mc_seed=seed,
                 overwrite=switches['overwrite_inference'],
                 execution_overrides={'spatial_execution': analysis.get('spatial_execution', {}),

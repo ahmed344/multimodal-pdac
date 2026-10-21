@@ -118,7 +118,7 @@ def plot_objective_history(
     figure, axes = plt.subplots(rows, 4, figsize=(20, height), sharex=True)
     # Reserve a fixed-height header for formulas and one shared legend.
     figure.subplots_adjust(left=.05, right=.99, bottom=.45 / height,
-                           top=1 - 1.9 / height, hspace=.65, wspace=.25)
+                           top=1 - 1.9 / height, hspace=.25, wspace=.25)
     he_term = " + H&E" if he_enabled else ""
     selection_text = {"supervised_objective": "supervised objective", "cd8_loss": "mean valid CD8 loss"}.get(metric, "unavailable")
     selected_text = f"epoch {int(best_epoch)}" if best_epoch is not None else "unavailable"

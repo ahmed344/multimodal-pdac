@@ -201,7 +201,7 @@ architecture-derived halo. Capped labels are scattered across many footprints,
 so the smaller smoke batch avoids excessive spatial activation memory.
 The activated run name is `core32_attention010_radius15`, separate from the
 baseline and pilot. Aggregation, biology, H&E and discriminator all use GATv2
-with radius 1.5 and attention dropout 0.10. The full fit uses learning rate
+with radius 1.5 and attention dropout 0.10. The full fit uses starting learning rate
 0.0001, one physical 32,768-row batch (`microbatch_rows: null`), and eight physical
 validation tiles. It starts fresh with the seeded 90/10 split, at most 300 epochs
 and supervised-objective early stopping. `grl_horizon_updates: null` retains the
@@ -377,8 +377,38 @@ Total = Supervised + Batch_weighted             # backpropagation objective
 `cd8_loss` remains available for comparison and is the default when the setting
 is absent. It selects mean validation CD8 ZILN loss over valid CD8 rows.
 `early_stopping_min_delta` measures units of the selected score: supervised-objective
-units in the checked-in configuration. Weights, learning rates, GRL, patience,
-and the numeric minimum improvement are unchanged by this selection policy.
+units in the checked-in configuration. The selection policy itself does not
+change the optimized loss or GRL schedule.
+
+New runs enable validation-driven LR reduction through the shared block:
+
+```yaml
+training:
+  lr_scheduler:
+    enabled: true
+    factor: 0.5
+    patience: 5
+    cooldown: 2
+    threshold: 0.001
+    min_lr_factor: 0.01
+    eps: 0.0
+  early_stopping_patience: 20
+```
+
+`ReduceLROnPlateau` minimizes validation `supervised_objective`, regardless of the
+early-stopping metric. Improvement must exceed the absolute `threshold`; after
+six non-improving epochs (`patience: 5`) the LR halves, followed by two cooldown
+epochs. The scheduler steps once after completed validation, before checkpoint
+snapshots. Nonfinite monitored scores are rejected. LR reductions do not reset
+early-stopping patience or change GRL/optimizer-update accounting.
+
+The floor is computed once as `min_lr_factor ×` the selected execution mode's
+starting LR. With the checked-in spatial LR `0.0001` the floor is `0.000001`;
+pixel LR `0.001` gives `0.00001`. A spatial starting LR of `0.000001` gives a
+`0.00000001` floor. `eps: 0.0` permits reductions to these small floors.
+Omitting `lr_scheduler` or setting `enabled: false` keeps a fixed LR. Unknown
+settings, nonfinite numbers, invalid factors, and negative thresholds, epsilon,
+patience, or cooldown are rejected; patience and cooldown must be integers.
 
 Checkpoints save the exact split positions plus an ordered row/feature identity
 fingerprint; analysis reuses those splits and may cap them further. There is no
@@ -407,11 +437,21 @@ rate and other training settings stay in place; differing YAML values are report
 and ignored. `--smoke-test` cannot be combined with a resume checkpoint. Completed
 `history.csv` rows are kept and `loss_curves.png` is refreshed from that full history.
 
+Scheduled checkpoints save `lr_scheduler_state` with the optimizer, including the
+best supervised score, counters, cooldown, and original LR floor. Resume restores
+both states without stepping the scheduler or deriving a new floor from the
+reduced optimizer LR. Saved scheduler settings take precedence over conflicting
+YAML settings, which are reported and ignored. Legacy checkpoints without a
+scheduler block remain fixed-LR even when current YAML enables scheduling.
+Production resume rejects checkpoints that enable scheduling but lack its state.
+Changing the early-stopping metric resets only selection state; scheduler state
+continues because its monitored score remains `supervised_objective`.
+
 `performance.async_artifacts: true` moves checkpoint serialization, history and
 sampling-audit writes, and curve rendering into two persistent CPU workers. One
 worker writes files in order; the other renders immutable history snapshots. The
 next epoch can start while either worker is busy. Validation and stopping decisions
-remain synchronous, as does copying a consistent model/optimizer snapshot to CPU
+remain synchronous, as does copying a consistent model/optimizer/scheduler snapshot to CPU
 before training mutates it. CPU tensors are also copied, and CUDA transfers finish
 before a snapshot is handed to a worker. This covers MLP, CNN, GATv2, their mixed
 combinations, and optional H&E heads. Dataset identity and checkpoint contracts are
@@ -456,9 +496,14 @@ valid target-weight mass denominator, accumulated across the epoch. Positive
 contributions are not divided by positive counts. Sum reduction retains the
 existing sample-weighted average of batch sums for aggregate and per-signal reports.
 `selected_epoch` and `selection_start_epoch` preserve selection metadata in history.
+`learning_rate` records the LR used during the completed epoch, and
+`next_learning_rate` records the LR after validation scheduling (also on the final
+epoch). Both appear in epoch logs and are equal for fixed-LR runs. Older history
+rows without these columns remain blank when resumed; no past LR is inferred.
 
 The four-column plot is 20 inches wide and 33.4 inches tall for the four configured
-signals. In the first two rows, total objective sits directly above supervised
+signals, with compact row spacing to give each panel more height. In the first two
+rows, total objective sits directly above supervised
 objective in column one, discriminator accuracy above batch discriminator
 objective in column two, and H&E R² above H&E objective in column three. Every
 subsequent pair of rows places balanced hurdle accuracy and positive-logit R²
@@ -778,6 +823,14 @@ interactive latent reports remain within that stage under their existing
 `analysis` controls, including `analysis.peaks.enabled` and
 `analysis.latent_interactive`. Numerical and browser audits remain manual.
 Each stage retains its configured execution and memory budgets.
+
+Workflow inference derives its execution mode from the checkpoint architecture.
+`analysis.batch_size` counts rows for pixel models. Spatial models use
+`analysis.spatial_execution.tiles_per_batch` (currently 64) when optimized
+inference is enabled, or the checkpoint's saved `training.tiles_per_batch`
+(default 8) for legacy inference. A current YAML architecture that differs from
+the checkpoint does not change these batch units. Explicit standalone CLI
+`--batch-size` and `--tiles-per-batch` overrides retain their documented precedence.
 
 The current YAML supplies downstream switches, report settings, execution
 settings, and density sampling settings. The checkpoint supplies frozen model,

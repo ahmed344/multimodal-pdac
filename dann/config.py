@@ -71,6 +71,35 @@ def post_training_settings(settings: Mapping[str, Any] | None = None) -> dict[st
     return resolved
 
 
+def lr_scheduler_settings(training: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate plateau settings; an omitted block preserves fixed learning rates."""
+    defaults = dict(enabled=False, factor=0.5, patience=5, cooldown=2,
+                    threshold=0.001, min_lr_factor=0.01, eps=0.0)
+    supplied = training.get("lr_scheduler", {})
+    if not isinstance(supplied, Mapping):
+        raise ValueError("training.lr_scheduler must be a mapping.")
+    unknown = supplied.keys() - defaults.keys()
+    if unknown:
+        raise ValueError(f"Unknown training.lr_scheduler settings: {sorted(unknown)}")
+    resolved = {**defaults, **supplied}
+    if not isinstance(resolved["enabled"], bool):
+        raise ValueError("training.lr_scheduler.enabled must be a boolean.")
+    for key in ("patience", "cooldown"):
+        value = resolved[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"training.lr_scheduler.{key} must be a nonnegative integer.")
+    for key in ("factor", "threshold", "min_lr_factor", "eps"):
+        value = resolved[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value):
+            raise ValueError(f"training.lr_scheduler.{key} must be a finite number.")
+        if key in ("factor", "min_lr_factor"):
+            if not 0 < value < 1:
+                raise ValueError(f"training.lr_scheduler.{key} must be strictly between zero and one.")
+        elif value < 0:
+            raise ValueError(f"training.lr_scheduler.{key} must be nonnegative.")
+    return resolved
+
+
 def load_config(path: Path) -> dict[str, Any]:
     """Load and minimally validate a YAML configuration.
 
@@ -324,6 +353,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         training.update(training["pixel"])
     if mode in training:
         training.update(training[mode])
+    training["lr_scheduler"] = lr_scheduler_settings(training)
     if mode == "spatial":
         data = config["data"]
         for key in ("path", "x_column", "y_column", "batch_column"):

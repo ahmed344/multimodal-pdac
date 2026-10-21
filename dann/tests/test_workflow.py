@@ -14,6 +14,7 @@ import yaml
 from scipy import sparse
 
 from dann import workflow
+from dann.checkpoints import architecture_contract
 from dann.config import apply_smoke_overrides, load_config, post_training_settings, resolve_execution
 from dann.spatial import _file_identity, build_latent_output_table, build_output_table
 from dann.targets import target_contract
@@ -134,6 +135,29 @@ def test_order_current_settings_frozen_contracts_and_resumed_paths(run, stages):
     assert inference['overwrite']
     assert mocks['spatial_heatmaps'].call_args.kwargs['workers'] == config['analysis']['spatial_heatmaps']['workers']
     assert mocks['latent_variance'].call_args.args[0]['latent_variance']['latents'] == str(outputs['latents'])
+
+
+@pytest.mark.parametrize('saved_kind', ['mlp', 'cnn', 'gatv2'])
+@pytest.mark.parametrize('current_kind', ['mlp', 'gatv2'])
+def test_inference_batch_units_follow_checkpoint(run, stages, saved_kind, current_kind):
+    config, best, checkpoint = run
+    saved = checkpoint['config']
+    saved['model']['aggregation']['type'] = saved_kind
+    resolve_execution(saved)
+    checkpoint['architecture'] = architecture_contract(saved)
+    torch.save(checkpoint, best)
+    config['model']['aggregation']['type'] = current_kind
+    resolve_execution(config)
+    config['analysis']['batch_size'] = 4096
+    config['analysis']['spatial_execution']['tiles_per_batch'] = 64
+    config['post_training'].update(run_analysis=False, run_spatial_heatmaps=False,
+                                   run_latent_variance=False)
+
+    workflow.run_post_training_workflow(config, best)
+
+    inference = stages[1]['inference'].call_args.kwargs
+    assert inference['batch_size_override'] == (4096 if saved_kind == 'mlp' else None)
+    assert inference['execution_overrides']['spatial_execution']['tiles_per_batch'] == 64
 
 
 @pytest.mark.parametrize('switch', ['enabled', 'run_analysis', 'run_inference',
@@ -348,8 +372,10 @@ def test_training_only_and_resume_early_stopping(tmp_path, monkeypatch):
     monkeypatch.setattr(train, 'create_data_bundle', bundle)
     monkeypatch.setattr(train, 'refresh_loss_curves', Mock())
     monkeypatch.setattr(train, '_format_epoch_summary', lambda *args: 'synthetic epoch')
-    epochs = Mock(side_effect=[{'cd8_loss': 1.}, {'cd8_loss': 1.},
-                               {'cd8_loss': 2.}, {'cd8_loss': 2.}])
+    epochs = Mock(side_effect=[{'cd8_loss': 1., 'supervised_objective': 1.},
+                               {'cd8_loss': 1., 'supervised_objective': 1.},
+                               {'cd8_loss': 2., 'supervised_objective': 2.},
+                               {'cd8_loss': 2., 'supervised_objective': 2.}])
     monkeypatch.setattr(train, 'run_epoch', epochs)
     downstream = Mock(return_value={})
     monkeypatch.setattr(workflow, 'run_post_training_workflow', downstream)

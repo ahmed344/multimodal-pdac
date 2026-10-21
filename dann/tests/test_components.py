@@ -55,7 +55,8 @@ def spatial_config(tmp_path):
     for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
         group['mlp']['hidden_dims'] = [7]
         group['cnn'].update(channels=5, depth=2, dropout=0., residual=True)
-        group['gatv2'].update(channels=8, heads=2, depth=2, dropout=0., residual=True)
+        # Paired forward/update checks require both dropout sources disabled.
+        group['gatv2'].update(channels=8, heads=2, depth=2, dropout=0., attention_dropout=0., residual=True)
     config['training']['pixel'].update(batch_size=12, validation_batch_size=12, num_workers=0)
     config['training']['spatial'].update(core_size=4, tiles_per_batch=2, num_workers=0)
     config['training'].update(device='cpu', pin_memory=False)

@@ -60,7 +60,7 @@ model:
       neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
       residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
       dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-      attention_dropout: 0.10  # Drop attention coefficients during training.
+      attention_dropout: 0.0  # Drop attention coefficients during training.
 
   # 3. Prediction heads: choices are independent; all consume aggregation latents.
   heads:
@@ -80,7 +80,7 @@ model:
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.10  # Drop attention coefficients during training.
+        attention_dropout: 0.0  # Drop attention coefficients during training.
 
     he:
       enabled: true  # Auxiliary raw UNI2-h feature prediction.
@@ -100,7 +100,7 @@ model:
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.10  # Drop attention coefficients during training.
+        attention_dropout: 0.0  # Drop attention coefficients during training.
 
     discriminator:
       type: gatv2  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
@@ -118,7 +118,7 @@ model:
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.10  # Drop attention coefficients during training.
+        attention_dropout: 0.0  # Drop attention coefficients during training.
 
   # Shared MLP numerics and ZILN output transformation; CNN settings are above.
   activation: gelu  # MLP activation: relu, gelu, silu, or leaky_relu.
@@ -175,6 +175,14 @@ training:
   weight_decay: 0.00001  # AdamW decoupled weight decay.
   beta1: 0.9  # AdamW first-moment coefficient.
   beta2: 0.999  # AdamW second-moment coefficient.
+  lr_scheduler:  # Validation supervised_objective; saved settings are retained on resume.
+    enabled: true
+    factor: 0.5
+    patience: 5
+    cooldown: 2
+    threshold: 0.001  # Absolute improvement in supervised-objective units.
+    min_lr_factor: 0.01  # Floor relative to the selected mode's original starting LR.
+    eps: 0.0  # Allow reductions all the way to the floor, including very small LRs.
   gradient_clip_norm: 5.0  # Maximum global gradient norm; null disables clipping.
   grl_max_lambda: 0.25  # Maximum encoder-bound gradient reversal strength.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
@@ -182,7 +190,7 @@ training:
   grl_horizon_updates: null  # Full-fit epoch-based schedule (300 x 47 updates); the pilot's 500-update horizon is not used.
   early_stopping_enabled: true  # Disable only for bounded diagnostic comparisons.
   early_stopping_metric: supervised_objective  # Weighted IHC + H&E; cd8_loss is available for comparison. Omitted settings retain legacy CD8 selection.
-  early_stopping_patience: 10  # Epochs without improvement in the validation selection metric.
+  early_stopping_patience: 20  # Epochs without improvement in the validation selection metric.
   early_stopping_min_delta: 0.001  # Minimum improvement in supervised-objective units (or CD8-loss units when selected).
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
   resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, and early stopping may override.
@@ -293,7 +301,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: core32_attention010_radius15  # Fresh full fit, separate from the baseline and pilot.
+  run_name: core32_attention0_radius15  # Fresh full fit, separate from the baseline and pilot.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.
