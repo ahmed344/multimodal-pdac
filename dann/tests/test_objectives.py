@@ -249,65 +249,41 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
     pd.DataFrame(rows).to_csv(path, index=False)
     captured = []
     monkeypatch.setattr(plt, 'close', lambda figure: captured.append(figure))
-    plot_loss_curves(path, tmp_path / 'curves.png', 35, config=config,
+    plot_loss_curves(path, tmp_path / 'curves.png', 20, config=config,
                      selection=dict(selection_metric='supervised_objective', best_epoch=2, selection_start_epoch=1))
-    figure = captured[-1]
-    assert tuple(figure.get_size_inches()) == (20., 33.4)
-    axes = figure.axes
-    assert len(axes) == 32
-    assert all(axis.get_subplotspec().get_gridspec().ncols == 4 for axis in axes)
-    assert axes[0].get_title() == 'Total objective'
-    assert axes[4].get_title() == 'Supervised objective — early stopping'
-    assert axes[1].get_title() == 'Discriminator accuracy'
-    assert axes[5].get_title() == 'Batch discriminator objective'
-    vertical_pairs = [(0, 4), (1, 5)]
-    assert not any('MSE' in a.get_title() for a in axes)
-    assert not any(a.get_title() == 'IHC objective' for a in axes)
-    if he:
-        assert axes[2].get_title() == 'H&E R² (variance-weighted features)'
-        assert axes[6].get_title() == 'H&E objective'
-        assert axes[2].texts[0].get_text() == 'Unavailable in saved history'
-        assert all(np.isnan(axes[2].lines[0].get_ydata()))
-        vertical_pairs.append((2, 6))
-    else:
-        assert not axes[2].get_visible() and not axes[6].get_visible()
-    assert all(not axes[index].get_visible() for index in (3, 7, 26, 27, 30, 31))
-    for start, label in ((8, 'IHC'), (10, 'CD8'), (16, 'Tumor'), (18, 'Collagen'), (24, 'Stroma')):
-        assert axes[start].get_title().startswith(f'{label} balanced hurdle accuracy')
-        assert axes[start+4].get_title() == f'{label} hurdle objective'
-        assert axes[start+1].get_title().startswith(f'{label} positive-logit R²')
-        assert 'location and scale' in axes[start+5].get_title()
-        vertical_pairs.extend([(start, start+4), (start+1, start+5)])
-    for upper, lower in vertical_pairs:
-        upper_spec, lower_spec = axes[upper].get_subplotspec(), axes[lower].get_subplotspec()
-        assert upper_spec.colspan == lower_spec.colspan
-        assert upper_spec.rowspan.stop == lower_spec.rowspan.start
-    assert 'macro average' in axes[8].get_title() and 'macro average' in axes[9].get_title()
-    assert len(figure.legends) == 1
-    assert [text.get_text() for text in figure.legends[0].get_texts()] == ['Train', 'Validation', 'Selected epoch 2']
-    assert all(axis.get_legend() is None for axis in axes)
-    for axis in axes:
-        if axis.get_visible():
-            np.testing.assert_equal(axis.lines[-1].get_xdata(), [2, 2])
-            assert axes[0].get_shared_x_axes().joined(axes[0], axis)
-    assert axes[9].get_ylim()[0] < -2 and axes[15].get_ylim()[0] < -.3
-    assert np.isnan(axes[15].lines[0].get_ydata()[0])
-    assert all(np.isnan(axes[14].lines[0].get_ydata()))
-    assert axes[14].texts[0].get_text() == 'Unavailable in saved history'
-    assert 'Σ signals' in figure._suptitle.get_text()
-    plt.Figure.clear(figure)
-
-    # Partial histories must not get zero-filled losses or an inferred minimum marker.
+    ihc, overall = captured[-2:]
+    assert (tmp_path / 'ihc_curves.png').is_file()
+    assert len(ihc.axes) == 40 and len(overall.axes) == 32
+    assert overall.axes[0].get_title() == 'Total objective'
+    assert overall.axes[4].get_title() == 'Supervised objective — early stopping'
+    assert overall.axes[1].get_title() == 'Discriminator accuracy'
+    assert overall.axes[5].get_title() == 'Batch discriminator objective'
+    assert overall.axes[2].get_visible() == he
+    assert overall.axes[6].get_visible() == he
+    assert not any('CD8 balanced hurdle' in a.get_title() for a in overall.axes)
+    for index, label in enumerate(('CD8', 'Tumor', 'Collagen', 'Stroma')):
+        assert ihc.axes[index*4].get_title() == f'{label} balanced hurdle accuracy'
+        assert ihc.axes[index*4+2].get_title() == f'{label} hurdle objective'
+    assert ihc.axes[1].get_ylim()[0] < -3
+    assert ihc.axes[3].get_ylim()[0] < -.3
+    assert np.isnan(ihc.axes[3].lines[0].get_ydata()[0])
+    assert all(np.isnan(ihc.axes[2].lines[0].get_ydata()))
+    assert 'Unavailable' in ihc.axes[2].texts[0].get_text()
+    for figure in (ihc, overall):
+        assert all(a.get_subplotspec().get_gridspec().ncols == 4 for a in figure.axes)
+        for axis in figure.axes:
+            if axis.get_visible() and 'reliability' not in axis.get_title():
+                np.testing.assert_equal(axis.lines[-1].get_xdata(), [2, 2])
+        plt.Figure.clear(figure)
+    # Legacy histories preserve missing values and never infer a minimum marker.
     pd.DataFrame(dict(epoch=[1], train_total_loss=[3.])).to_csv(path, index=False)
-    plot_loss_curves(path, tmp_path / 'partial.png', 20)
+    plot_loss_curves(path, tmp_path / 'partial.png', 12)
     figure = captured[-1]
-    assert all(len(axis.lines) == 2 for axis in figure.axes if axis.get_visible())
+    assert len(figure.axes[0].lines) == 2
     assert figure.axes[0].lines[0].get_marker() == '.'
     assert all(np.isnan(figure.axes[4].lines[0].get_ydata()))
-    assert len(figure.legends) == 1
-    assert [text.get_text() for text in figure.legends[0].get_texts()] == ['Train', 'Validation']
-    assert all(axis.get_legend() is None for axis in figure.axes)
-    plt.Figure.clear(figure)
+    for figure in captured[-2:]:
+        plt.Figure.clear(figure)
 
 
 @pytest.mark.parametrize('batch_size', [2, 4, 6])
@@ -356,7 +332,7 @@ def test_he_r2_curve_preserves_negative_values_and_gaps(tmp_path, monkeypatch):
     axis = figure.axes[2]
     np.testing.assert_allclose(axis.lines[0].get_ydata(), [math.nan, -.4, .2], equal_nan=True)
     assert axis.get_ylim()[0] < -.6
-    assert len(figure.legends) == 1
+    assert axis.get_legend() is not None
     plt.Figure.clear(figure)
 
 

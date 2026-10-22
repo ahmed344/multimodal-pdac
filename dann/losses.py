@@ -22,6 +22,7 @@ class ZILNLossOutput:
     valid_weight_mass: torch.Tensor
     hurdle_per_target: torch.Tensor
     positive_per_target: torch.Tensor
+    differentiable_components: tuple[torch.Tensor, torch.Tensor] | None = None
 
 
 class ZILNLoss(nn.Module):
@@ -104,6 +105,7 @@ class ZILNLoss(nn.Module):
         targets: torch.Tensor,
         target_valid_mask: torch.Tensor | None = None,
         *, validate_targets: bool = True,
+        return_components: bool = False,
     ) -> ZILNLossOutput:
         """Evaluate hurdle and positive logit-normal loss branches.
 
@@ -114,6 +116,7 @@ class ZILNLoss(nn.Module):
             targets (torch.Tensor): Bounded density targets in ``[0, 1]``.
             target_valid_mask (torch.Tensor | None): Observed target entries.
             validate_targets (bool): Skip only for fixed targets validated during cache construction.
+            return_components (bool): Retain differentiable target branches for monitoring only.
 
         Returns:
             ZILNLossOutput: Total loss and additive reduced components.
@@ -166,6 +169,13 @@ class ZILNLoss(nn.Module):
             if self.reduction == "mean":
                 hurdle_per_target = hurdle_per_target / weight_mass.clamp_min(torch.finfo(hurdle_per_target.dtype).eps)
                 positive_per_target = positive_per_target / weight_mass.clamp_min(torch.finfo(positive_per_target.dtype).eps)
+        components = None
+        if return_components:
+            # Use the objective's common denominator, never per-target counts.
+            denominator = (weight_mass.clamp_min(torch.finfo(targets.dtype).eps)
+                           if self.reduction == "mean" else 1.)
+            components = ((hurdle * weights).sum(dim=0) / denominator,
+                          (positive_nll * weights).sum(dim=0) / denominator)
         return ZILNLossOutput(
             total=reduced_hurdle + reduced_positive,
             hurdle=reduced_hurdle,
@@ -174,4 +184,5 @@ class ZILNLoss(nn.Module):
             valid_weight_mass=weight_mass,
             hurdle_per_target=hurdle_per_target,
             positive_per_target=positive_per_target,
+            differentiable_components=components,
         )

@@ -20,12 +20,14 @@ import yaml
 from torch import nn
 from torch.nn import functional as F
 
-from dann.config import apply_smoke_overrides, load_config, lr_scheduler_settings, resolve_device, seed_everything
+from dann.config import (apply_smoke_overrides, load_config, lr_scheduler_settings, monitoring_settings,
+                         resolve_device, seed_everything)
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.sampling import SamplingEpochAudit
 from dann.losses import ZILNLoss
 from dann.lr_scheduler import create_lr_scheduler, step_lr_scheduler, validate_lr_scheduler_checkpoint
 from dann.model import AdversarialLatentFusion
+from dann.monitoring import GradientMonitor, ValidationMonitor, freeze_monitoring
 from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
@@ -141,6 +143,9 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     from dann.config import performance_settings, post_training_settings
     config['performance'] = performance_settings(requested_config)
     config['post_training'] = post_training_settings(requested_config.get('post_training'))
+    # Runtime sampling may change; definitions/cutoffs always come from the saved run.
+    config['monitoring'] = monitoring_settings(requested_config)
+
     for key in ('spectral_peak_budget', 'spectral_checkpointing', 'gatv2_tile_budget',
                 'gatv2_checkpointing', 'inference_peak_chunk_size'):
         if key in requested_config.get('model', {}):
@@ -806,6 +811,8 @@ def run_epoch(
     deadline: float | None = None,
     update_callback: Callable[[dict], None] | None = None,
     evaluation_callback: Callable[[Mapping, Mapping], None] | None = None,
+    monitoring: Mapping[str, Any] | None = None,
+    monitoring_definitions: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -836,6 +843,8 @@ def run_epoch(
         deadline (float | None): Monotonic deadline checked before starting a logical update.
         update_callback (Callable | None): Observe each completed logical update.
         evaluation_callback (Callable | None): Observe held-out predictions without changing evaluation.
+        monitoring (Mapping | None): Validated runtime switches; omitted disables monitoring.
+        monitoring_definitions (Mapping | None): Frozen training cutoffs and scientific definitions.
 
     Returns:
         dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
@@ -866,6 +875,15 @@ def run_epoch(
                         ziln_loss.include_normal_constant).to(device)
     steps_per_epoch = max(getattr(getattr(loader, 'sampler', None), 'logical_updates', len(loader)), 1)
     state = progress_state or TrainingProgress(epoch_index * steps_per_epoch, 0, epoch_index, 0)
+    monitor_settings = monitoring_settings({"monitoring": monitoring or {}})
+    gradient_monitor = (GradientMonitor(model, target_columns, steps_per_epoch,
+                                       monitor_settings["gradient_updates_per_epoch"])
+                        if training and monitor_settings["enabled"] else None)
+    validation_monitor = None
+    if not training and monitor_settings["enabled"]:
+        if monitoring_definitions is None:
+            raise ValueError("Validation monitoring requires frozen training definitions.")
+        validation_monitor = ValidationMonitor(monitoring_definitions, cd8_index)
     initial_updates = state.optimizer_updates
     if training and hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch_index)
@@ -897,6 +915,7 @@ def run_epoch(
                 optimizer.zero_grad(set_to_none=True)
             if outputs is None:
                 outputs = model(batch, grl_strength=strength)
+            sampled = gradient_monitor is not None and state.update_in_epoch in gradient_monitor.positions
             biology = ziln_loss(
                 outputs["pi_logits"],
                 outputs["mu"],
@@ -904,6 +923,7 @@ def run_epoch(
                 batch["targets"],
                 batch.get("target_valid_mask"),
                 validate_targets=validate_targets,
+                return_components=sampled,
             )
             with torch.no_grad():
                 selected = slice(cd8_index, cd8_index + 1)
@@ -932,13 +952,30 @@ def run_epoch(
                     f"Non-finite objective or model output at epoch {epoch_index + 1}, step {step + 1}."
                 )
             if training:
+                if sampled:
+                    components = {f"{name}_{branch}": biology_weight * values[index] * bio_scale
+                                  for branch, values in zip(("hurdle", "positive"), biology.differentiable_components)
+                                  for index, name in enumerate(gradient_monitor.names)}
+                    components["batch"] = batch_weight * discriminator * class_scale
+                    if 'he_prediction' in outputs:
+                        components["he"] = he_weight * he_loss * he_scale
+                    gradient_monitor.accumulate(components)
+                    del components
                 total.backward()
                 if audit is not None:
                     group_rows.append(cpu_batch["row_ids"])
                     group_batches.append(cpu_batch["batches"])
                 if last:
+                    if sampled:
+                        gradient_monitor.complete(strength)
                     if gradient_clip_norm is not None:
-                        nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+                        preclip_norm = nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+                    elif gradient_monitor is not None:
+                        # Measuring without clipping must not even multiply existing .grad buffers.
+                        preclip_norm = torch.linalg.vector_norm(torch.stack([
+                            torch.linalg.vector_norm(p.grad.detach()) for p in model.parameters() if p.grad is not None]))
+                    if gradient_monitor is not None:
+                        gradient_monitor.clipping(preclip_norm, gradient_clip_norm, strength)
                     optimizer.step()
                     state.optimizer_updates += 1
                     state.update_in_epoch += 1
@@ -961,8 +998,11 @@ def run_epoch(
                                              update_in_epoch=state.update_in_epoch, grl_strength=strength,
                                              seconds=perf_counter() - update_started))
                     update_started = perf_counter()
-            elif evaluation_callback is not None:
-                evaluation_callback(batch, outputs)
+            else:
+                if validation_monitor is not None:
+                    validation_monitor.update(batch, outputs)
+                if evaluation_callback is not None:
+                    evaluation_callback(batch, outputs)
 
             batch_size = int(batch["targets"].shape[0])
             metrics["samples"] += batch_size
@@ -1008,6 +1048,10 @@ def run_epoch(
     finalized["batch_weighted_loss"] = batch_weight * finalized["batch_loss"]
     finalized["supervised_objective"] = finalized["biology_weighted_loss"] + finalized.get("he_weighted_loss", 0.0)
     finalized["total_loss"] = finalized["supervised_objective"] + finalized["batch_weighted_loss"]
+    if gradient_monitor is not None:
+        finalized.update(gradient_monitor.finish())
+    if validation_monitor is not None:
+        finalized.update(validation_monitor.finish())
     if audit is not None and sampling_audit_dir is not None:
         summary = audit.summary() if audit.compositions else None
         if artifacts is None:
@@ -1059,6 +1103,7 @@ def checkpoint_metadata(
         pyg_version = None
     validate_checkpoint({"config": saved_config, "architecture": architecture}, config, model)
     return {
+        "monitoring_definitions": copy.deepcopy(config.get("monitoring_definitions")),
         "optimization": dict(
             logical_updates_per_epoch=getattr(bundle.loaders["train"].sampler, "logical_updates",
                                               len(bundle.loaders["train"])),
@@ -1233,6 +1278,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
     bundle = create_data_bundle(config, resume_payload.get("split_indices"), resume_payload.get("data_identity"))
     if resume_payload and tuple(resume_payload["batch_names"]) != bundle.metadata.batch_names:
         raise ValueError("Resume batch order is incompatible.")
+    config = freeze_monitoring(config, bundle.metadata, bundle.split_indices["train"])
+    training = config["training"]
     preparation_seconds = perf_counter() - preparation_started
     target_summary = summarize_target_validity(bundle, config)
     resident = getattr(bundle.datasets['train'], 'resident', None)
@@ -1360,6 +1407,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 grl_max_lambda=float(training["grl_max_lambda"]),
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=gradient_clip_norm,
+                monitoring=config.get("monitoring"),
+                monitoring_definitions=config.get("monitoring_definitions"),
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
                 sampling_audit_dir=output_dir / "sampling",
@@ -1383,6 +1432,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 grl_max_lambda=float(training["grl_max_lambda"]),
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=None,
+                monitoring=config.get("monitoring"),
+                monitoring_definitions=config.get("monitoring_definitions"),
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
                 artifacts=artifacts,

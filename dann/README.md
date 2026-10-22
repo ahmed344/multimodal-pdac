@@ -432,10 +432,10 @@ rejected. Unknown legacy selection rules also start a new selection period.
 Training resume copies the checkpoint configuration, then applies only the current
 YAML values for `epochs`, `num_workers`, `prefetch_factor`,
 `early_stopping_metric`, `early_stopping_patience`, and `early_stopping_min_delta`,
-plus the documented performance and post-training overrides. The checkpoint learning
+plus the documented performance, post-training, and monitoring overrides. The checkpoint learning
 rate and other training settings stay in place; differing YAML values are reported
 and ignored. `--smoke-test` cannot be combined with a resume checkpoint. Completed
-`history.csv` rows are kept and `loss_curves.png` is refreshed from that full history.
+`history.csv` rows are kept and both `loss_curves.png` and `ihc_curves.png` are refreshed from that full history.
 
 Scheduled checkpoints save `lr_scheduler_state` with the optimizer, including the
 best supervised score, counters, cooldown, and original LR floor. Resume restores
@@ -925,7 +925,8 @@ under `analysis/` (UMAP exports in `analysis/umap/`):
 
 - `best.pt`, `latest.pt`
 - `history.csv` (resume keeps completed epochs and appends new ones), `data_schema.json`, `resolved_config.yaml`
-- `loss_curves.png` (refreshed from the full history during training, and written again by analysis)
+- `loss_curves.png` (overall objectives, shared gradients, validation latent diversity, and CD8 probability quality)
+- `ihc_curves.png` (per-target fit, weighted losses, and target/branch gradient composition; both figures regenerate from history during training and analysis)
 
 `analysis/umap/`:
 
@@ -2446,3 +2447,101 @@ ARCHIVE_DIRECTORY`; completed stages are skipped only when their recorded files,
 configuration, inputs, and training artifacts remain unchanged. Archived caches
 are never reused. A failed stage skips that run's dependent stages and allows
 the remaining runs to proceed.
+
+
+### Gradient, representation, and probability monitoring
+
+The current YAML enables observational monitoring:
+
+```yaml
+monitoring:
+  enabled: true
+  gradient_updates_per_epoch: 5
+```
+
+Omitting the block disables collection for legacy callers. A positive sample count
+chooses unique, evenly spaced **logical optimizer updates**, including the first
+and last when the count is at least two. Short epochs use every update; `null`
+requests every update. Microbatch size and resume position do not change those
+positions. Enablement and frequency can change on resume, including when starting
+from an older checkpoint. Earlier history entries remain missing.
+
+For each sampled effective batch, additional `autograd.grad` traversals use the
+existing forward graph and accumulate gradients on every trainable encoder
+parameter, including latent aggregation. Prediction heads are excluded from this
+decomposition. Eight IHC branches include target weights, the biology multiplier,
+validity/positive masks, the original common loss denominator, and accumulation
+scales. Target and aggregate IHC gradients are sums of their branches. H&E and
+batch gradients include their objective weights; the batch gradient also includes
+the actual reversed GRL multiplier. These are objective gradients, not percentages
+of AdamW parameter updates. Normal backward, clipping, optimization, checkpoint
+selection, and LR scheduling are unchanged.
+
+`history.csv` stores per-sampled-update means, population standard deviations, and
+finite counts (`*_mean`, `*_std`, `*_count`) for weighted L2 magnitudes, magnitude
+shares, pairwise cosines, retained magnitude (norm of sum / sum of norms), and
+signed contributions (component dot sum / squared norm of sum). Pairwise conflict
+frequency is the mean of `cosine < 0`, excluding undefined cosines. Signed values
+may be negative or exceed one; they are missing if the combined norm is at most
+1e-6 of the summed component norms. Zero magnitudes remain zero; undefined ratios
+remain missing. Plotting omits zeros only on logarithmic magnitude axes and labels
+that omission. Whole-model pre-clipping norm, actual clipping multiplier, clipping
+fraction, and actual GRL strength summarize **all** optimizer updates.
+
+Validation uses every selected core observation with dropout disabled and fixed
+model weights. Centered float64 covariance merging records latent sample variance
+and participation ratio without exporting vectors. Participation ratio is missing
+for zero variance; covariance is unavailable for fewer than two observations.
+
+CD8 presence and unconditional exceedance Brier scores use valid transformed
+CD8 densities. Exploratory exceedance cutoffs are linear 50th/75th/90th percentiles
+of valid positive **selected training** densities. Their numerical values and
+metric definitions are frozen in `resolved_config.yaml`, checkpoint configuration,
+and checkpoint `monitoring_definitions`. Resume retains these definitions, including
+interval levels, even if current analysis settings change. Missing training
+positives yield unavailable exceedance scores. Repeated quantiles are flagged as
+degenerate but still define valid identical events; boundary cutoffs use exact
+probability limits. Events use strict `density > cutoff` comparisons.
+
+Positive-branch central interval coverage uses the existing configured levels
+(default 50% and 90%) and the clipped logit target convention. With no validation
+positives, coverage is missing. Each of presence and the three exceedance events
+also stores ten fixed reliability bins: count, mean predicted probability, and
+observed frequency. Empty bins retain count zero with missing means. Bin intervals
+are left-closed/right-open, except the final bin includes probability one. Figures
+show the latest saved epoch, without falling back to older available predictions.
+
+Both four-column figures use one immutable history snapshot in synchronous
+training, asynchronous artifacts, and post-training analysis. Selected checkpoint
+markers appear on epoch panels; old histories can be rendered with unavailable
+panels. The CSV contains cutoffs, coverage levels in column names, and all plotted
+statistics, so prediction exports are unnecessary.
+
+Run an isolated synthetic runtime/memory comparison without touching study data:
+
+```bash
+python -m dann.verification.monitoring_benchmark --output /tmp/dann-monitoring-benchmark
+```
+
+This runs disabled, five-sample, and every-update arms in fresh processes using the
+production model/training loop with deterministic CUDA operations (or `--device cpu`). Each arm warms up before timing three 20-update epochs with validation.
+The report includes median runtime, process peak RSS, allocated/reserved VRAM,
+overheads, and final parameter hashes. This small Deep Sets/MLP benchmark isolates
+monitoring cost; its relative overhead is not an estimate for a full spatial fit.
+
+
+Measured on 2026-10-22 with PyTorch 2.11.0/CUDA 12.8 and an RTX 5090
+(135,247 model parameters, 74,752 shared parameters; 2,560 training and 512
+validation rows per epoch, three timed epochs after train/validation warmup):
+
+| Monitoring | Median epoch seconds | Runtime overhead | Peak allocated GPU MiB | Process peak RSS MiB |
+| --- | ---: | ---: | ---: | ---: |
+| Disabled | 0.088 | — | 74.94 | 2293.94 |
+| Five updates | 0.504 | +474.5% | 79.52 (+4.57) | 2477.67 (+183.73) |
+| Every update (20) | 1.735 | +1877.0% | 79.52 (+4.57) | 2520.05 (+226.11) |
+
+All three deterministic arms produced identical final parameter hashes. The high
+relative runtime cost reflects the very short unmonitored synthetic epoch and the
+extra component backward passes. Peak RSS includes process/library initialization;
+allocated GPU memory isolates tensor memory more directly. The configured default
+remains five sampled updates per epoch.

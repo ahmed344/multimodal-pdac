@@ -329,6 +329,10 @@ class RenderQueue:
             elif function.__name__ in ('plot_pit', 'plot_hurdle_reliability'):
                 targets = len(args[1])
             area = max(36*12, 24*6*((targets+1)//2), 5*targets*9)
+            if function.__name__ == 'plot_loss_curves':
+                targets = len(kwargs.get('config', {}).get('data', {}).get('target_columns', range(4)))
+                area = 20 * (max(8, 2*targets+2) * 3.5 + 1.4)
+                dpi = int(args[2])
             self.canvas_bytes = max(self.canvas_bytes, area*dpi*dpi*4)
         self.tasks.append((function.__module__, function.__name__, self._encode(args), self._encode(kwargs)))
 

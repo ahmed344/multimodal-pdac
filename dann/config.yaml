@@ -55,12 +55,12 @@ model:
       dropout: 0.10  # Hidden dropout after per-pixel channel LayerNorm and GELU.
     gatv2:
       channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-      depth: 3  # Number of local attention layers.
+      depth: 2  # Number of local attention layers.
       heads: 4  # Each attention head emits channels / heads channels.
       neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
       residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
       dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-      attention_dropout: 0.0  # Drop attention coefficients during training.
+      attention_dropout: 0.05  # Drop attention coefficients during training.
 
   # 3. Prediction heads: choices are independent; all consume aggregation latents.
   heads:
@@ -75,12 +75,12 @@ model:
         dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
       gatv2:
         channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-        depth: 3  # Number of local attention layers.
+        depth: 2  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.0  # Drop attention coefficients during training.
+        attention_dropout: 0.05  # Drop attention coefficients during training.
 
     he:
       enabled: true  # Auxiliary raw UNI2-h feature prediction.
@@ -95,12 +95,12 @@ model:
         dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
       gatv2:
         channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-        depth: 3  # Number of local attention layers.
+        depth: 2  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.0  # Drop attention coefficients during training.
+        attention_dropout: 0.05  # Drop attention coefficients during training.
 
     discriminator:
       type: gatv2  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
@@ -113,12 +113,12 @@ model:
         dropout: 0.10  # Hidden dropout; missing tissue is masked throughout every CNN.
       gatv2:
         channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-        depth: 3  # Number of local attention layers.
+        depth: 2  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
-        attention_dropout: 0.0  # Drop attention coefficients during training.
+        attention_dropout: 0.05  # Drop attention coefficients during training.
 
   # Shared MLP numerics and ZILN output transformation; CNN settings are above.
   activation: gelu  # MLP activation: relu, gelu, silu, or leaky_relu.
@@ -134,7 +134,7 @@ model:
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
 
 loss:
-  he_weight: 1.0  # Baseline auxiliary MSE weight; not tuned.
+  he_weight: 10.0  # Baseline auxiliary MSE weight; not tuned.
   ziln_reduction: mean  # Reduction over valid weighted target entries: mean or sum.
   target_weights: [8.0, 4.0, 2.0, 1.0]  # Relative weights in data.target_columns order.
   logit_epsilon: 0.00001  # Clamp positive target densities before taking their logits.
@@ -142,6 +142,10 @@ loss:
   biology_weight: 5.0  # Multiplier for the complete weighted four-target ZILN objective.
   batch_weight: 1.0  # Multiplier for discriminator cross-entropy.
   balance_batch_classes: true  # Mean-one inverse-frequency weights from selected training rows.
+
+monitoring:
+  enabled: true
+  gradient_updates_per_epoch: 5  # Unique evenly spaced logical updates; null monitors every update.
 
 training:
   seed: 20260719  # Seed for data splits, initialization, and loader shuffling.
@@ -158,12 +162,12 @@ training:
     prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
 
   spatial:  # Used when any selected aggregation/head component is a CNN or GATv2.
-    core_size: 32  # Core side length in grid pixels; no edge pixels are discarded.
+    core_size: 8  # Core side length in grid pixels; no edge pixels are discarded.
     sampling_strategy: proportional_slide_tiles  # Independently shuffled slide queues, proportional row interleaving.
-    supervised_rows_per_batch: 32768  # Effective optimizer batch; final epoch batch may be smaller.
+    supervised_rows_per_batch: 2048  # Effective optimizer batch; final epoch batch may be smaller.
     microbatch_rows: null  # One physical batch, benchmarked at radius 1.5; use 16384 for two accumulation steps.
     tiles_per_batch: 8  # Validation/test tile count; also training count with legacy shuffled_tiles.
-    learning_rate: 0.0001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
+    learning_rate: 0.001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
     num_workers: 20  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
     prefetch_factor: 4  # Tile batches prefetched per worker; larger batches also increase host-memory use.
     # Halo is derived: aggregation radius + max(biology radius, discriminator radius, H&E radius).
@@ -301,7 +305,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: core32_attention0_radius15  # Fresh full fit, separate from the baseline and pilot.
+  run_name: he10_biology5_discriminator1  # Fresh full fit, separate from the baseline and pilot.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.

@@ -100,6 +100,23 @@ def lr_scheduler_settings(training: Mapping[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+def monitoring_settings(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate observational monitoring; absent settings keep it disabled."""
+    supplied = config.get("monitoring", {})
+    if not isinstance(supplied, Mapping):
+        raise ValueError("monitoring must be a mapping.")
+    defaults = dict(enabled=False, gradient_updates_per_epoch=5)
+    if supplied.keys() - defaults.keys():
+        raise ValueError(f"Unknown monitoring settings: {sorted(supplied.keys() - defaults.keys())}")
+    resolved = {**defaults, **supplied}
+    if not isinstance(resolved["enabled"], bool):
+        raise ValueError("monitoring.enabled must be a boolean.")
+    count = resolved["gradient_updates_per_epoch"]
+    if count is not None and (isinstance(count, bool) or not isinstance(count, int) or count < 1):
+        raise ValueError("monitoring.gradient_updates_per_epoch must be null or a positive integer.")
+    return resolved
+
+
 def load_config(path: Path) -> dict[str, Any]:
     """Load and minimally validate a YAML configuration.
 
@@ -320,6 +337,7 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve mode-specific settings and all run paths once, without overrides."""
+    monitoring_settings(config)
     weight = config.get("loss", {}).get("he_weight", 1.0)
     if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not np.isfinite(weight) or weight < 0:
         raise ValueError("loss.he_weight must be finite and nonnegative.")
