@@ -925,7 +925,7 @@ under `analysis/` (UMAP exports in `analysis/umap/`):
 
 - `best.pt`, `latest.pt`
 - `history.csv` (resume keeps completed epochs and appends new ones), `data_schema.json`, `resolved_config.yaml`
-- `loss_curves.png` (overall objectives, shared gradients, validation latent diversity, and CD8 probability quality)
+- `loss_curves.png` (overall objectives, shared gradients, and validation latent diversity)
 - `ihc_curves.png` (per-target fit, weighted losses, and target/branch gradient composition; both figures regenerate from history during training and analysis)
 
 `analysis/umap/`:
@@ -2449,7 +2449,7 @@ are never reused. A failed stage skips that run's dependent stages and allows
 the remaining runs to proceed.
 
 
-### Gradient, representation, and probability monitoring
+### Gradient and representation monitoring
 
 The current YAML enables observational monitoring:
 
@@ -2493,29 +2493,39 @@ model weights. Centered float64 covariance merging records latent sample varianc
 and participation ratio without exporting vectors. Participation ratio is missing
 for zero variance; covariance is unavailable for fewer than two observations.
 
-CD8 presence and unconditional exceedance Brier scores use valid transformed
-CD8 densities. Exploratory exceedance cutoffs are linear 50th/75th/90th percentiles
-of valid positive **selected training** densities. Their numerical values and
-metric definitions are frozen in `resolved_config.yaml`, checkpoint configuration,
-and checkpoint `monitoring_definitions`. Resume retains these definitions, including
-interval levels, even if current analysis settings change. Missing training
-positives yield unavailable exceedance scores. Repeated quantiles are flagged as
-degenerate but still define valid identical events; boundary cutoffs use exact
-probability limits. Events use strict `density > cutoff` comparisons.
+Only latent total variance and participation ratio are exported from validation
+monitoring. Covariance retains its internal observation count for sample-variance
+normalization. Training monitoring does not calculate CD8 Brier scores, interval
+coverage, reliability bins, probability observation counts, or training quantiles.
+Standalone post-training calibration remains available and unchanged.
 
-Positive-branch central interval coverage uses the existing configured levels
-(default 50% and 90%) and the clipped logit target convention. With no validation
-positives, coverage is missing. Each of presence and the three exceedance events
-also stores ten fixed reliability bins: count, mean predicted probability, and
-observed frequency. Empty bins retain count zero with missing means. Bin intervals
-are left-closed/right-open, except the final bin includes probability one. Figures
-show the latest saved epoch, without falling back to older available predictions.
+Version-two `monitoring_definitions` in the resolved configuration and checkpoints
+record this reduced scope. Resume accepts version-one definitions, retains the
+scientific definitions of the remaining diagnostics, and retires probability
+metadata. Existing history values are preserved; retired columns remain empty in
+new epochs. Fresh histories omit those columns entirely.
 
 Both four-column figures use one immutable history snapshot in synchronous
-training, asynchronous artifacts, and post-training analysis. Selected checkpoint
-markers appear on epoch panels; old histories can be rendered with unavailable
-panels. The CSV contains cutoffs, coverage levels in column names, and all plotted
-statistics, so prediction exports are unnecessary.
+training, asynchronous artifacts, and post-training analysis. The overall figure
+places IHC hurdle, IHC positive, H&E, and discriminator fit metrics directly above
+their objectives, followed by total/supervised objectives and GRL. The next two
+rows align objective pairwise cosine above conflict frequency and single-column
+latent participation ratio above total variance. Pre-clipping norm and clipping
+activity occupy the final row. The IHC figure keeps CD8, Tumor, Collagen, and
+Stroma in fixed columns: four fit/objective rows, two cross-target
+gradient rows, and four hurdle/positive gradient rows. Cross-target retained
+magnitude and signed contributions each span two columns.
+
+Figures are 24 inches wide with 14-point subplot titles, 12-point ticks/legends,
+and 18-point figure titles. Shared legends identify train/validation line styles,
+selected checkpoints, and component colors; only clipping and GRL use local
+legends. Target colors remain blue/orange/green/purple; hurdle is charcoal,
+positive is red, and adversarial is brown. Epoch ticks and checkpoint markers
+remain, without repeated axis labels. Missing values, negative objectives and
+signed contributions, zero reference lines, and logarithmic magnitudes are
+preserved. Dimensions in `curve_layout.py` also determine the artifact worker's
+canvas memory reservation. Old histories render unavailable panels without
+prediction exports.
 
 Run an isolated synthetic runtime/memory comparison without touching study data:
 
@@ -2530,7 +2540,8 @@ overheads, and final parameter hashes. This small Deep Sets/MLP benchmark isolat
 monitoring cost; its relative overhead is not an estimate for a full spatial fit.
 
 
-Measured on 2026-10-22 with PyTorch 2.11.0/CUDA 12.8 and an RTX 5090
+Historical measurement of version-one monitoring (including the now-retired CD8
+probability statistics), on 2026-10-22 with PyTorch 2.11.0/CUDA 12.8 and an RTX 5090
 (135,247 model parameters, 74,752 shared parameters; 2,560 training and 512
 validation rows per epoch, three timed epochs after train/validation warmup):
 

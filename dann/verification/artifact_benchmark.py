@@ -25,7 +25,7 @@ def compare_runs(sync_path: Path, async_path: Path, *, exact: bool = False) -> d
         left = torch.load(sync_path / name, map_location='cpu', weights_only=False)
         right = torch.load(async_path / name, map_location='cpu', weights_only=False)
         for key in ('epoch', 'best_epoch', 'selection_metric', 'selection_start_epoch',
-                    'early_stopping_state', 'architecture', 'sampler_state'):
+                    'early_stopping_state', 'architecture', 'sampler_state', 'monitoring_definitions'):
             assert left[key] == right[key], (name, key)
         for branch in ('model_state', 'optimizer_state'):
             maximum = 0.
@@ -50,7 +50,7 @@ def compare_runs(sync_path: Path, async_path: Path, *, exact: bool = False) -> d
             compare(left[branch], right[branch])
             differences[f'{name}_{branch}_max_abs_difference'] = maximum
     a, b = (pd.read_csv(path / 'history.csv') for path in (sync_path, async_path))
-    keys = [key for key in a if any(token in key for token in ('loss', 'objective', 'r2', 'accuracy', 'hurdle_acc'))]
+    keys = [key for key in a if any(token in key for token in ('loss', 'objective', 'r2', 'accuracy', 'hurdle_acc', 'gradient_', 'latent_'))]
     np.testing.assert_allclose(a[keys], b[keys], rtol=0. if exact else 5e-5,
                                atol=0. if exact else 1e-5, equal_nan=True)
     assert a.epoch.tolist() == b.epoch.tolist()

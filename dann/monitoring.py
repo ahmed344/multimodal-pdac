@@ -1,4 +1,4 @@
-"""Observational gradient, representation, and CD8 distribution monitoring.
+"""Observational gradient and latent representation monitoring.
 
 Gradients are weighted objective gradients on the encoder (including aggregation),
 not AdamW updates. Only scalar summaries and sufficient statistics leave an epoch.
@@ -14,9 +14,8 @@ import numpy as np
 import torch
 
 from dann.config import monitoring_settings
-from dann.targets import CD8, target_contract
+from dann.targets import target_contract
 
-QUANTILES = (0.5, 0.75, 0.9)
 SIGNED_TOLERANCE = 1e-6
 
 
@@ -32,34 +31,25 @@ def sampled_updates(total: int, count: int | None = 5) -> set[int]:
     return set(np.linspace(0, total - 1, min(total, count or total), dtype=int).tolist())
 
 
-def freeze_monitoring(config: Mapping[str, Any], metadata: Any, rows: np.ndarray) -> dict[str, Any]:
-    """Freeze definitions and training-only cutoffs, or reuse saved run semantics."""
+def freeze_monitoring(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Record the reduced scope, accepting version-one monitoring on resume.
+
+    Retained scientific definitions come from the saved run. Probability metadata
+    is retired without reading targets or changing any historical observations.
+    """
     config = copy.deepcopy(dict(config))
     settings = monitoring_settings(config)
     config["monitoring"] = settings
     saved = config.get("monitoring_definitions")
     if saved is not None:
-        if saved.get("version") != 1 or saved.get("target_transform") != target_contract(config):
+        if saved.get("version") not in (1, 2) or saved.get("target_transform") != target_contract(config):
             raise ValueError("Incompatible saved monitoring definitions.")
+    elif not settings["enabled"]:
         return config
-    if not settings["enabled"]:
-        return config
-    columns = config["data"]["target_columns"]
-    values = np.empty(0, dtype=np.float64)
-    if CD8 in columns:
-        index = columns.index(CD8)
-        values = np.asarray(metadata.targets[rows, index], dtype=np.float64)
-        valid = getattr(metadata, "target_valid_mask", None)
-        if valid is not None:
-            values = values[np.asarray(valid[rows, index], dtype=bool)]
-        values = values[np.isfinite(values) & (values > 0) & (values <= 1)]
-    levels = list(config.get("analysis", {}).get("calibration_coverage_levels", [0.5, 0.9]))
-    if (not levels or any(isinstance(v, bool) or not isinstance(v, (int, float))
-                          or not 0 < v < 1 for v in levels) or len(set(levels)) != len(levels)):
-        raise ValueError("calibration_coverage_levels must contain distinct levels in (0, 1).")
-    cutoffs = [float(np.quantile(values, q)) if values.size else None for q in QUANTILES]
-    config["monitoring_definitions"] = dict(
-        version=1, shared_parameters="encoder (including latent aggregation; excluding heads)",
+    definitions = dict(
+        version=2,
+        scope=["training_gradients", "validation_latent_total_variance", "validation_latent_participation_ratio"],
+        shared_parameters="encoder (including latent aggregation; excluding heads)",
         gradient_components="weighted hurdle/positive per target, H&E, reversed batch (actual GRL)",
         gradient_reduction="objective common denominator and effective-batch accumulation scaling",
         epoch_statistics="mean, population standard deviation, finite count over sampled updates",
@@ -70,18 +60,15 @@ def freeze_monitoring(config: Mapping[str, Any], metadata: Any, rows: np.ndarray
                                   signed="dot(component,sum components) / norm(sum components)^2",
                                   clipping="whole-model preclip norm; min(1, limit/(norm+1e-6)); fraction multiplier < 1"),
         participation_ratio="trace(sample covariance)^2 / sum(squared covariance entries); missing at zero variance",
-        quantile_method="linear",
         signed_contribution_relative_tolerance=SIGNED_TOLERANCE,
         covariance="sample covariance of all validation core latents, float64 centered merge",
-        target_transform=target_contract(config), logit_epsilon=float(config["loss"]["logit_epsilon"]),
-        cutoff_source="exploratory quantiles of valid positive transformed training targets after row selection",
-        training_positive_count=int(values.size), quantiles=list(QUANTILES), cutoffs=cutoffs,
-        # Duplicated cutoffs define the same valid event. Boundary cutoffs use exact 0/1 limits.
-        cutoff_degenerate=[v is not None and (v in (0., 1.) or cutoffs.count(v) > 1) for v in cutoffs],
-        event="density strictly greater than cutoff; unconditional probability includes hurdle",
-        coverage_levels=levels, reliability_bins=10,
-        reliability_intervals="[k/10, (k+1)/10), last bin includes 1",
+        target_transform=target_contract(config),
     )
+    if saved is not None:
+        for key in definitions.keys() - {"version", "scope"}:
+            if key in saved:
+                definitions[key] = saved[key]
+    config["monitoring_definitions"] = definitions
     return config
 
 
@@ -236,88 +223,5 @@ class StreamingCovariance:
             variance = float(covariance.trace().cpu())
             square = float(covariance.square().sum().cpu())
             participation = variance**2 / square if square > 0 else math.nan
-        return dict(latent_count=self.count, latent_total_variance=variance,
+        return dict(latent_total_variance=variance,
                     latent_participation_ratio=participation)
-
-
-def coverage_key(level: float) -> str:
-    """Encode arbitrary configured levels without integer-percent collisions."""
-    return f"{level * 100:g}".replace(".", "p")
-
-
-class ValidationMonitor:
-    """All-observation CD8 scores, reliability sufficient statistics, and latents."""
-
-    def __init__(self, definitions: Mapping[str, Any], cd8_index: int) -> None:
-        self.definitions = definitions
-        self.index = cd8_index
-        self.covariance = StreamingCovariance()
-        self.events = ["presence", "exceedance_q50", "exceedance_q75", "exceedance_q90"]
-        self.sums: torch.Tensor | None = None
-
-    def update(self, batch: Mapping[str, torch.Tensor], outputs: Mapping[str, torch.Tensor]) -> None:
-        """Consume selected core predictions in eval/inference mode."""
-        self.covariance.update(outputs["latent"])
-        targets = batch["targets"][:, self.index].double()
-        valid = batch.get("target_valid_mask", torch.ones_like(batch["targets"], dtype=torch.bool))[:, self.index]
-        valid = valid & torch.isfinite(targets) & (targets >= 0) & (targets <= 1)
-        targets = targets[valid]
-        pi_logits, mu, sigma = [outputs[k][:, self.index][valid].double() for k in ("pi_logits", "mu", "sigma")]
-        presence = torch.sigmoid(-pi_logits)
-        # Each event: count, squared error, then count/prediction sum/event sum for ten bins.
-        levels = self.definitions["coverage_levels"]
-        if self.sums is None:
-            self.sums = torch.zeros(4 * 32 + 1 + len(levels), dtype=torch.float64, device=targets.device)
-        probabilities, truths = [presence], [targets > 0]
-        for cutoff in self.definitions["cutoffs"]:
-            if cutoff is None:
-                probabilities.append(None)
-                truths.append(None)
-                continue
-            if cutoff <= 0:
-                probability = presence
-            elif cutoff >= 1:
-                probability = torch.zeros_like(presence)
-            else:
-                z = (math.log(cutoff / (1 - cutoff)) - mu) / sigma
-                probability = presence * (0.5 * torch.erfc(z / math.sqrt(2.)))
-            probabilities.append(probability)
-            truths.append(targets > cutoff)
-        for i, (probability, truth) in enumerate(zip(probabilities, truths)):
-            if probability is None:
-                continue
-            start = i * 32
-            self.sums[start] += len(targets)
-            self.sums[start + 1] += (probability - truth.double()).square().sum()
-            bins = (probability * 10).long().clamp(0, 9)
-            table = self.sums[start + 2:start + 32].reshape(3, 10)
-            for row, weights in enumerate((torch.ones_like(probability), probability, truth.double())):
-                table[row].scatter_add_(0, bins, weights)
-        positive = targets > 0
-        self.sums[128] += positive.sum()
-        epsilon = self.definitions["logit_epsilon"]
-        z = (torch.logit(targets[positive].clamp(epsilon, 1-epsilon)) - mu[positive]) / sigma[positive]
-        for i, level in enumerate(levels):
-            limit = math.sqrt(2.) * torch.erfinv(z.new_tensor(level))
-            self.sums[129 + i] += (z.abs() <= limit).sum()
-
-    def finish(self) -> dict[str, float]:
-        result = self.covariance.finish()
-        levels = self.definitions["coverage_levels"]
-        sums = (self.sums.cpu().numpy() if self.sums is not None else np.zeros(129 + len(levels)))
-        for i, event in enumerate(self.events):
-            count, error = sums[i*32:i*32+2]
-            key = f"cd8_{event}"
-            result.update({f"{key}_count": float(count), f"{key}_brier": float(error / count) if count else math.nan})
-            table = sums[i*32+2:i*32+32].reshape(3, 10)
-            for b in range(10):
-                n, prediction, observed = table[:, b]
-                result.update({f"{key}_bin{b}_count": float(n),
-                               f"{key}_bin{b}_predicted": float(prediction/n) if n else math.nan,
-                               f"{key}_bin{b}_observed": float(observed/n) if n else math.nan})
-        for i, cutoff in enumerate(self.definitions["cutoffs"]):
-            result[f"cd8_exceedance_q{int(QUANTILES[i]*100)}_cutoff"] = math.nan if cutoff is None else cutoff
-        result["cd8_positive_count"] = float(sums[128])
-        for i, level in enumerate(levels):
-            result[f"cd8_coverage_{coverage_key(level)}"] = float(sums[129+i]/sums[128]) if sums[128] else math.nan
-        return result

@@ -15,7 +15,6 @@ import subprocess
 import sys
 from pathlib import Path
 from time import perf_counter
-from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -58,9 +57,7 @@ def run_arm(arm: str, device: str, updates: int, epochs: int, output: Path) -> d
                             batches=torch.arange(rows) % 3, row_ids=torch.arange(rows)+index*rows,
                             he_targets=torch.randn(rows, 64)))
     validation = SyntheticBatches(batches[:4])
-    targets = torch.cat([b['targets'] for b in batches]).numpy()
-    valid = torch.cat([b['target_valid_mask'] for b in batches]).numpy()
-    config = freeze_monitoring(config, SimpleNamespace(targets=targets, target_valid_mask=valid), np.arange(len(targets)))
+    config = freeze_monitoring(config)
     model = AdversarialLatentFusion.from_config(config, 3, 4).to(device)
     loss = ZILNLoss.from_config(config).to(device)
     original = copy.deepcopy(model.state_dict())
@@ -68,7 +65,7 @@ def run_arm(arm: str, device: str, updates: int, epochs: int, output: Path) -> d
     kwargs = dict(model=model, ziln_loss=loss, device=torch.device(device), biology_weight=5., batch_weight=.3,
                   class_weights=None, total_epochs=epochs, grl_schedule='constant', grl_max_lambda=.3,
                   grl_gamma=10., target_columns=config['data']['target_columns'],
-                  monitoring=config['monitoring'], monitoring_definitions=config.get('monitoring_definitions'))
+                  monitoring=config['monitoring'])
     run_epoch(loader=SyntheticBatches(batches[:2]), optimizer=optimizer, epoch_index=0, gradient_clip_norm=1., **kwargs)
     run_epoch(loader=validation, optimizer=None, epoch_index=0, gradient_clip_norm=None, **kwargs)
     model.load_state_dict(original)
@@ -97,7 +94,7 @@ def run_arm(arm: str, device: str, updates: int, epochs: int, output: Path) -> d
         digest.update(value.detach().cpu().numpy().tobytes())
     output.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(records).to_csv(output/f'{arm}_history.csv', index=False)
-    report = dict(arm=arm, device=device, hardware=torch.cuda.get_device_name() if device == 'cuda' else 'CPU',
+    report = dict(monitoring_definitions=config.get('monitoring_definitions'), arm=arm, device=device, hardware=torch.cuda.get_device_name() if device == 'cuda' else 'CPU',
                   model='Deep Sets + MLP aggregation/heads, dropout 0.1; synthetic sparse inputs',
                   parameters=sum(p.numel() for p in model.parameters()), shared_parameters=sum(p.numel() for p in model.encoder.parameters()),
                   updates_per_epoch=updates, training_rows=rows*updates, validation_rows=rows*len(validation),

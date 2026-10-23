@@ -214,10 +214,8 @@ class TrainingArtifacts:
         self.error = None
         self.closing = self.closed = False
         self.report = dict(mode='async', jobs=[], coalesced_checkpoints=0, coalesced_plots=0)
-        targets = len(config['data']['target_columns'])
-        rows = max(8, 2 * targets + 2)  # Overall and IHC figures render sequentially.
-        dpi = int(config['analysis']['figure_dpi'])
-        self.render_reserve = int(4 * 20 * (rows * 3.5 + 1.4) * dpi * dpi * 4)
+        from dann.curve_layout import render_reservation_bytes
+        self.render_reserve = render_reservation_bytes(int(config['analysis']['figure_dpi']))
         self.budget = config['performance']['host_budget_gib'] * 2**30
         self.pools = {}
         # Reserve worker imports before launch, then use actual child RSS thereafter.

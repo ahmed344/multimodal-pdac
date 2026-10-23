@@ -244,6 +244,10 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
                 he_mse=3., mean_r2_cd8=-3., positive_weighted_loss_cd8=-.3,
             ).items()})
             row[f'{split}_positive_weighted_loss_cd8'] = math.nan if epoch == 1 else -.3
+        row.update(train_gradient_cd8_hurdle_norm_mean=[0., math.nan, 2.][epoch-1],
+                   train_gradient_cd8_positive_norm_mean=[1., math.nan, 3.][epoch-1],
+                   train_gradient_cd8_hurdle__positive_cosine_mean=[-.5, math.nan, .3][epoch-1],
+                   train_gradient_ihc_cd8_signed_mean=[-.4, math.nan, 1.4][epoch-1])
         rows.append(row)
     path = tmp_path / 'history.csv'
     pd.DataFrame(rows).to_csv(path, index=False)
@@ -253,35 +257,85 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
                      selection=dict(selection_metric='supervised_objective', best_epoch=2, selection_start_epoch=1))
     ihc, overall = captured[-2:]
     assert (tmp_path / 'ihc_curves.png').is_file()
-    assert len(ihc.axes) == 40 and len(overall.axes) == 32
-    assert overall.axes[0].get_title() == 'Total objective'
-    assert overall.axes[4].get_title() == 'Supervised objective — early stopping'
-    assert overall.axes[1].get_title() == 'Discriminator accuracy'
-    assert overall.axes[5].get_title() == 'Batch discriminator objective'
+    from dann.curve_layout import figure_size, render_reservation_bytes
+    from dann.objective_curves import COLORS
+    assert len(ihc.axes) == 38 and len(overall.axes) == 22
+    title = lambda axis: axis.get_title().replace('\n', ' ')
+    position = lambda axis: (axis.get_subplotspec().rowspan.start, axis.get_subplotspec().colspan.start)
+    assert [title(axis) for axis in overall.axes[:8]] == [
+        'IHC balanced hurdle accuracy (macro average)', 'IHC positive-logit R² (macro average)',
+        'H&E R² (variance-weighted features)' if he else '', 'Discriminator accuracy',
+        'IHC hurdle objective', 'IHC positive objective (location and scale)',
+        'H&E objective' if he else '', 'Batch discriminator objective']
+    for column in range(4):
+        assert position(overall.axes[column]) == (0, column)
+        assert position(overall.axes[4+column]) == (1, column)
+    assert title(overall.axes[8]) == 'Total objective'
+    assert title(overall.axes[9]) == 'Supervised objective — early stopping'
     assert overall.axes[2].get_visible() == he
     assert overall.axes[6].get_visible() == he
-    assert not any('CD8 balanced hurdle' in a.get_title() for a in overall.axes)
     for index, label in enumerate(('CD8', 'Tumor', 'Collagen', 'Stroma')):
-        assert ihc.axes[index*4].get_title() == f'{label} balanced hurdle accuracy'
-        assert ihc.axes[index*4+2].get_title() == f'{label} hurdle objective'
-    assert ihc.axes[1].get_ylim()[0] < -3
-    assert ihc.axes[3].get_ylim()[0] < -.3
-    assert np.isnan(ihc.axes[3].lines[0].get_ydata()[0])
-    assert all(np.isnan(ihc.axes[2].lines[0].get_ydata()))
-    assert 'Unavailable' in ihc.axes[2].texts[0].get_text()
-    for figure in (ihc, overall):
+        for row, metric in enumerate(('balanced hurdle accuracy', 'hurdle objective',
+                                      'positive-logit R²', 'positive objective (location and scale)')):
+            axis = ihc.axes[row*4+index]
+            assert title(axis) == f'{label} {metric}'
+            assert position(axis) == (row, index)
+        for row, offset in enumerate((22, 26, 30, 34), 6):
+            assert position(ihc.axes[offset+index]) == (row, index)
+            assert title(ihc.axes[offset+index]).startswith(label + ':')
+    for axis, column in zip(ihc.axes[20:22], (0, 2)):
+        assert position(axis) == (5, column)
+        assert axis.get_subplotspec().colspan.stop == column + 2
+    for row, index, label in ((3, 15, 'participation ratio'), (4, 19, 'total variance')):
+        axis = overall.axes[index]
+        assert title(axis) == f'Validation latent {label}'
+        assert position(axis) == (row, 3)
+        assert axis.get_subplotspec().colspan.stop == 4
+    for row, index, label in ((3, 14, 'pairwise cosine'), (4, 18, 'conflict frequency')):
+        axis = overall.axes[index]
+        assert title(axis).startswith(f'Objectives: {label}')
+        assert position(axis) == (row, 2)
+        assert axis.get_subplotspec().colspan.stop == 3
+    assert ihc.axes[8].get_ylim()[0] < -3
+    assert ihc.axes[12].get_ylim()[0] < -.3
+    assert np.isnan(ihc.axes[12].lines[0].get_ydata()[0])
+    assert all(np.isnan(ihc.axes[4].lines[0].get_ydata()))
+    assert 'Unavailable' in ihc.axes[4].texts[0].get_text()
+    assert ihc.axes[22].get_yscale() == 'log'
+    np.testing.assert_allclose(ihc.axes[22].lines[0].get_ydata(), [math.nan, math.nan, 2.], equal_nan=True)
+    assert 'Zeros omitted' in ihc.axes[22].texts[0].get_text()
+    np.testing.assert_allclose(ihc.axes[30].lines[0].get_ydata(), [-.5, math.nan, .3], equal_nan=True)
+    np.testing.assert_allclose(ihc.axes[21].lines[0].get_ydata(), [-.4, math.nan, 1.4], equal_nan=True)
+    assert ihc.axes[21].get_ylim()[0] < -.4 and ihc.axes[21].get_ylim()[1] > 1.4
+    for axis in (ihc.axes[30], ihc.axes[21]):
+        np.testing.assert_equal(axis.lines[-2].get_ydata(), [0, 0])
+    assert COLORS['batch'] != COLORS['positive'] != COLORS['hurdle']
+    assert [line.get_color() for line in ihc.axes[22].lines[:2]] == [COLORS['hurdle'], COLORS['positive']]
+    for figure, kind in ((ihc, 'ihc'), (overall, 'loss')):
+        np.testing.assert_equal(figure.get_size_inches(), figure_size(kind))
+        assert figure._suptitle.get_fontsize() == 18
+        assert len(figure.legends) == 2
+        legend_labels = [text.get_text() for legend in figure.legends for text in legend.get_texts()]
+        assert {'Train', 'Validation', 'Selected checkpoint: epoch 2', 'Hurdle', 'Positive'} <= set(legend_labels)
+        assert all(text.get_fontsize() == 12 for legend in figure.legends for text in legend.get_texts())
         assert all(a.get_subplotspec().get_gridspec().ncols == 4 for a in figure.axes)
         for axis in figure.axes:
-            if axis.get_visible() and 'reliability' not in axis.get_title():
+            assert axis.get_xlabel() == ''
+            assert not any(word in title(axis).lower() for word in ('brier', 'coverage', 'reliability', 'observations'))
+            if axis.get_visible():
                 np.testing.assert_equal(axis.lines[-1].get_xdata(), [2, 2])
+                assert axis.title.get_fontsize() == 14
+                assert all(t.get_fontsize() == 12 for t in axis.get_xticklabels() + axis.get_yticklabels())
+                assert (axis.get_legend() is not None) == (title(axis).startswith(('Actual GRL', 'Clipping activity')))
         plt.Figure.clear(figure)
+    assert render_reservation_bytes(20) == int(np.prod(figure_size('ihc')) * 20**2 * 16)
     # Legacy histories preserve missing values and never infer a minimum marker.
     pd.DataFrame(dict(epoch=[1], train_total_loss=[3.])).to_csv(path, index=False)
     plot_loss_curves(path, tmp_path / 'partial.png', 12)
     figure = captured[-1]
-    assert len(figure.axes[0].lines) == 2
-    assert figure.axes[0].lines[0].get_marker() == '.'
-    assert all(np.isnan(figure.axes[4].lines[0].get_ydata()))
+    assert len(figure.axes[8].lines) == 2
+    assert figure.axes[8].lines[0].get_marker() == '.'
+    assert all(np.isnan(figure.axes[9].lines[0].get_ydata()))
     for figure in captured[-2:]:
         plt.Figure.clear(figure)
 
@@ -332,7 +386,8 @@ def test_he_r2_curve_preserves_negative_values_and_gaps(tmp_path, monkeypatch):
     axis = figure.axes[2]
     np.testing.assert_allclose(axis.lines[0].get_ydata(), [math.nan, -.4, .2], equal_nan=True)
     assert axis.get_ylim()[0] < -.6
-    assert axis.get_legend() is not None
+    assert axis.get_legend() is None
+    assert figure.legends
     plt.Figure.clear(figure)
 
 

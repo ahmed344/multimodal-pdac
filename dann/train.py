@@ -27,7 +27,7 @@ from dann.sampling import SamplingEpochAudit
 from dann.losses import ZILNLoss
 from dann.lr_scheduler import create_lr_scheduler, step_lr_scheduler, validate_lr_scheduler_checkpoint
 from dann.model import AdversarialLatentFusion
-from dann.monitoring import GradientMonitor, ValidationMonitor, freeze_monitoring
+from dann.monitoring import GradientMonitor, StreamingCovariance, freeze_monitoring
 from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
@@ -143,7 +143,7 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     from dann.config import performance_settings, post_training_settings
     config['performance'] = performance_settings(requested_config)
     config['post_training'] = post_training_settings(requested_config.get('post_training'))
-    # Runtime sampling may change; definitions/cutoffs always come from the saved run.
+    # Runtime sampling may change; retained definitions come from the saved run.
     config['monitoring'] = monitoring_settings(requested_config)
 
     for key in ('spectral_peak_budget', 'spectral_checkpointing', 'gatv2_tile_budget',
@@ -812,7 +812,6 @@ def run_epoch(
     update_callback: Callable[[dict], None] | None = None,
     evaluation_callback: Callable[[Mapping, Mapping], None] | None = None,
     monitoring: Mapping[str, Any] | None = None,
-    monitoring_definitions: Mapping[str, Any] | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -844,7 +843,6 @@ def run_epoch(
         update_callback (Callable | None): Observe each completed logical update.
         evaluation_callback (Callable | None): Observe held-out predictions without changing evaluation.
         monitoring (Mapping | None): Validated runtime switches; omitted disables monitoring.
-        monitoring_definitions (Mapping | None): Frozen training cutoffs and scientific definitions.
 
     Returns:
         dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
@@ -879,11 +877,7 @@ def run_epoch(
     gradient_monitor = (GradientMonitor(model, target_columns, steps_per_epoch,
                                        monitor_settings["gradient_updates_per_epoch"])
                         if training and monitor_settings["enabled"] else None)
-    validation_monitor = None
-    if not training and monitor_settings["enabled"]:
-        if monitoring_definitions is None:
-            raise ValueError("Validation monitoring requires frozen training definitions.")
-        validation_monitor = ValidationMonitor(monitoring_definitions, cd8_index)
+    validation_monitor = StreamingCovariance() if not training and monitor_settings["enabled"] else None
     initial_updates = state.optimizer_updates
     if training and hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch_index)
@@ -1000,7 +994,7 @@ def run_epoch(
                     update_started = perf_counter()
             else:
                 if validation_monitor is not None:
-                    validation_monitor.update(batch, outputs)
+                    validation_monitor.update(outputs["latent"])
                 if evaluation_callback is not None:
                     evaluation_callback(batch, outputs)
 
@@ -1278,7 +1272,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
     bundle = create_data_bundle(config, resume_payload.get("split_indices"), resume_payload.get("data_identity"))
     if resume_payload and tuple(resume_payload["batch_names"]) != bundle.metadata.batch_names:
         raise ValueError("Resume batch order is incompatible.")
-    config = freeze_monitoring(config, bundle.metadata, bundle.split_indices["train"])
+    config = freeze_monitoring(config)
     training = config["training"]
     preparation_seconds = perf_counter() - preparation_started
     target_summary = summarize_target_validity(bundle, config)
@@ -1408,7 +1402,6 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=gradient_clip_norm,
                 monitoring=config.get("monitoring"),
-                monitoring_definitions=config.get("monitoring_definitions"),
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
                 sampling_audit_dir=output_dir / "sampling",
@@ -1433,7 +1426,6 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=None,
                 monitoring=config.get("monitoring"),
-                monitoring_definitions=config.get("monitoring_definitions"),
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
                 artifacts=artifacts,

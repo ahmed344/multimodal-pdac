@@ -9,15 +9,13 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-from scipy.special import expit
-from scipy.stats import norm
 from torch.nn import functional as F
 from torch.utils.checkpoint import checkpoint
 
 from dann.config import monitoring_settings
 from dann.losses import ZILNLoss
 from dann.model import GradientReversal
-from dann.monitoring import (GradientMonitor, ScalarSummaries, StreamingCovariance, ValidationMonitor,
+from dann.monitoring import (GradientMonitor, ScalarSummaries, StreamingCovariance,
                              freeze_monitoring, gradient_statistics, sampled_updates)
 from dann.tests.test_objectives import Batches, TARGETS, WEIGHTS, objective_batches
 from dann.tests.test_training_artifacts import assert_nested_equal
@@ -47,14 +45,10 @@ class SharedModel(torch.nn.Module):
         return outputs
 
 
-def definitions(targets=None, valid=None, rows=None):
+def definitions():
     config = dict(monitoring=dict(enabled=True), data=dict(target_columns=TARGETS),
                   loss=dict(logit_epsilon=1e-6), analysis=dict(calibration_coverage_levels=[.5, .9]))
-    if targets is None:
-        targets = np.array([[.1, .2, .3, .4], [.2, .3, .4, .5], [.5, 0, 0, 0], [.9, 0, 0, 0]])
-    metadata = SimpleNamespace(targets=targets, target_valid_mask=valid)
-    rows = np.arange(len(targets)) if rows is None else rows
-    return freeze_monitoring(config, metadata, rows)
+    return freeze_monitoring(config)
 
 
 @pytest.mark.parametrize('bad', [None, True, [], dict(enabled=1), dict(typo=True),
@@ -186,7 +180,8 @@ def test_streamed_covariance_reference(constant, offset):
         monitor.update(torch.from_numpy(part))
     result = monitor.finish()
     covariance = np.cov(values, rowvar=False)
-    assert result['latent_count'] == len(values)
+    assert monitor.count == len(values)
+    assert set(result) == {'latent_total_variance', 'latent_participation_ratio'}
     assert result['latent_total_variance'] == pytest.approx(np.trace(covariance), rel=2e-8, abs=1e-12)
     if constant:
         assert math.isnan(result['latent_participation_ratio'])
@@ -194,78 +189,69 @@ def test_streamed_covariance_reference(constant, offset):
         assert result['latent_participation_ratio'] == pytest.approx(np.trace(covariance)**2 / np.square(covariance).sum(), rel=2e-8)
 
 
-def test_probability_metrics_match_independent_reference_and_empty_bins():
-    rng = np.random.default_rng(9)
-    n = 57
-    targets = rng.uniform(0, 1, (n, 4))
-    targets[::3, 0] = 0
-    valid = np.ones_like(targets, dtype=bool)
-    valid[::5, 0] = False
-    targets[~valid] = np.nan
+@pytest.mark.parametrize('count', [0, 1])
+def test_covariance_without_enough_observations(count):
+    monitor = StreamingCovariance()
+    monitor.update(torch.zeros(count, 3))
+    assert monitor.count == count
+    assert all(math.isnan(value) for value in monitor.finish().values())
+
+
+def test_reduced_definitions_need_no_targets_or_probability_settings(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail('Monitoring must not calculate training quantiles')
+    monkeypatch.setattr(np, 'quantile', forbidden)
     config = definitions()
-    frozen = config['monitoring_definitions']
-    logits, mu, sigma = rng.normal(size=n), rng.normal(size=n), rng.uniform(.1, 2, n)
-    output = dict(latent=torch.from_numpy(rng.normal(size=(n, 5))))
-    output.update({k: torch.from_numpy(np.tile(v[:, None], (1, 4))) for k, v in
-                   [('pi_logits', logits), ('mu', mu), ('sigma', sigma)]})
-    monitor = ValidationMonitor(frozen, 0)
-    for indices in np.array_split(np.arange(n), 4):
-        monitor.update(dict(targets=torch.from_numpy(targets[indices]), target_valid_mask=torch.from_numpy(valid[indices])),
-                       {k: v[indices] for k, v in output.items()})
-    actual = monitor.finish()
-    y, presence, m, s = targets[valid[:, 0], 0], expit(-logits[valid[:, 0]]), mu[valid[:, 0]], sigma[valid[:, 0]]
-    probabilities = [presence] + [presence * norm.sf((np.log(t/(1-t))-m)/s) for t in frozen['cutoffs']]
-    truths = [y > 0] + [y > t for t in frozen['cutoffs']]
-    for event, probability, truth in zip(monitor.events, probabilities, truths):
-        key = f'cd8_{event}'
-        assert actual[f'{key}_brier'] == pytest.approx(np.square(probability-truth).mean(), abs=1e-14)
-        bins = np.minimum((probability * 10).astype(int), 9)
-        for b in range(10):
-            mask = bins == b
-            assert actual[f'{key}_bin{b}_count'] == mask.sum()
-            expected = probability[mask].mean() if mask.any() else math.nan
-            np.testing.assert_allclose(actual[f'{key}_bin{b}_predicted'], expected, equal_nan=True)
-            expected = truth[mask].mean() if mask.any() else math.nan
-            np.testing.assert_allclose(actual[f'{key}_bin{b}_observed'], expected, equal_nan=True)
-    positive = y > 0
-    z = (np.log(y[positive]/(1-y[positive]))-m[positive])/s[positive]
-    for level in (.5, .9):
-        assert actual[f'cd8_coverage_{int(level*100)}'] == pytest.approx((abs(z) <= norm.ppf((1+level)/2)).mean())
-
-
-@pytest.mark.parametrize('values', [np.zeros((4, 4)), np.ones((4, 4)), np.full((4, 4), .3)])
-def test_empty_positive_and_degenerate_thresholds(values):
-    frozen = definitions(values)['monitoring_definitions']
-    assert frozen['cutoffs'] == ([None]*3 if values[0, 0] == 0 else [values[0, 0]]*3)
-    monitor = ValidationMonitor(frozen, 0)
-    output = dict(latent=torch.zeros(4, 3), pi_logits=torch.zeros(4, 4), mu=torch.zeros(4, 4), sigma=torch.ones(4, 4))
-    monitor.update(dict(targets=torch.from_numpy(values)), output)
-    result = monitor.finish()
-    if values[0, 0] == 0:
-        assert math.isnan(result['cd8_coverage_50'])
-        assert math.isnan(result['cd8_exceedance_q50_brier'])
-    elif values[0, 0] == 1:
-        assert result['cd8_exceedance_q50_brier'] == 0
-        assert frozen['cutoff_degenerate'] == [True]*3
-    empty = ValidationMonitor(frozen, 0)
-    empty.update(dict(targets=torch.from_numpy(values), target_valid_mask=torch.zeros(4, 4, dtype=torch.bool)), output)
-    assert math.isnan(empty.finish()['cd8_presence_brier'])
-
-
-def test_cutoffs_use_transformed_selected_training_rows_and_survive_resume():
-    from dann.targets import prepare_targets
-    raw = np.array([[.1, .5, 0, 0], [.2, .5, 0, 0], [.8, .5, 0, 0], [.9, 0, 0, 0]])
-    transformed, valid, _ = prepare_targets(raw, TARGETS, dict(enabled=True))
-    config = definitions(transformed, valid, np.array([0, 1, 2]))
-    frozen = config['monitoring_definitions']
-    np.testing.assert_allclose(frozen['cutoffs'], np.quantile([.2, .4], [.5, .75, .9]))
-    assert frozen['training_positive_count'] == 2
-    saved = copy.deepcopy(config)
-    config['analysis']['calibration_coverage_levels'] = [.8]
+    frozen = copy.deepcopy(config['monitoring_definitions'])
+    assert frozen['version'] == 2
+    assert frozen['scope'] == ['training_gradients', 'validation_latent_total_variance',
+                               'validation_latent_participation_ratio']
+    config['analysis']['calibration_coverage_levels'] = 'standalone analysis only'
     config['monitoring']['gradient_updates_per_epoch'] = None
-    changed = freeze_monitoring(config, SimpleNamespace(targets=np.ones_like(raw)), np.array([3]))
-    assert changed['monitoring_definitions'] == saved['monitoring_definitions']
+    changed = freeze_monitoring(config)
+    assert changed['monitoring_definitions'] == frozen
     assert changed['monitoring']['gradient_updates_per_epoch'] is None
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_old_monitoring_definitions_migrate_without_mutation(enabled):
+    config = definitions()
+    expected = copy.deepcopy(config['monitoring_definitions'])
+    legacy = config['monitoring_definitions']
+    legacy.pop('scope')
+    legacy.update(version=1, cutoffs=[.1, .2, .3], training_positive_count=123,
+                  quantiles=[.5, .75, .9], coverage_levels=[.5, .9], reliability_bins=10)
+    config['monitoring']['enabled'] = enabled
+    saved = copy.deepcopy(config)
+    assert freeze_monitoring(config)['monitoring_definitions'] == expected
+    assert config == saved
+    config['monitoring_definitions']['version'] = 999
+    with pytest.raises(ValueError, match='Incompatible saved monitoring'):
+        freeze_monitoring(config)
+    config['monitoring_definitions']['version'] = 1
+    config['data']['target_columns'] = TARGETS[::-1]
+    with pytest.raises(ValueError, match='Incompatible saved monitoring'):
+        freeze_monitoring(config)
+
+
+@pytest.mark.parametrize('he', [False, True])
+def test_validation_collects_only_latent_statistics_and_preserves_fits(he):
+    torch.manual_seed(23)
+    model = SharedModel(he=he).double()
+    kwargs = dict(model=model, loader=objective_batches(), ziln_loss=ZILNLoss(WEIGHTS),
+                  device=torch.device('cpu'), biology_weight=5., batch_weight=.3, class_weights=None,
+                  optimizer=None, epoch_index=0, total_epochs=1, grl_schedule='constant',
+                  grl_max_lambda=.2, grl_gamma=10., gradient_clip_norm=None, target_columns=TARGETS)
+    plain = run_epoch(**kwargs)
+    observed = run_epoch(**kwargs, monitoring=dict(enabled=True))
+    assert observed.keys() - plain.keys() == {'latent_total_variance', 'latent_participation_ratio'}
+    for key, value in plain.items():
+        np.testing.assert_allclose(observed[key], value, equal_nan=True)
+    with torch.inference_mode():
+        latents = torch.cat([model(batch)['latent'] for batch in objective_batches()]).numpy()
+    covariance = np.cov(latents, rowvar=False)
+    assert observed['latent_total_variance'] == pytest.approx(np.trace(covariance))
+    assert observed['latent_participation_ratio'] == pytest.approx(np.trace(covariance)**2 / np.square(covariance).sum())
 
 
 from dann.tests.test_components import spatial_config
@@ -321,7 +307,7 @@ def test_resume_starts_monitoring_and_keeps_frozen_definitions(spatial_config, m
     second = torch.load(output/'latest.pt', weights_only=False)
     definitions = second['monitoring_definitions']
     assert definitions == second['config']['monitoring_definitions']
-    assert definitions['training_positive_count'] > 0
+    assert definitions['version'] == 2
     config['training']['epochs'] = 3
     config['monitoring']['gradient_updates_per_epoch'] = None
     config['analysis']['calibration_coverage_levels'] = [.8]
@@ -336,8 +322,35 @@ def test_resume_starts_monitoring_and_keeps_frozen_definitions(spatial_config, m
     assert math.isnan(history.train_gradient_sampled_updates.iloc[0])
     assert history.train_gradient_sampled_updates.iloc[1] == min(5, history.train_optimizer_updates.iloc[1])
     assert history.train_gradient_sampled_updates.iloc[2] == history.train_optimizer_updates.iloc[2]
-    assert history.validation_latent_count.iloc[2] == len(third['split_indices']['validation'])
-    assert 'validation_cd8_coverage_50' in history and 'validation_cd8_coverage_80' not in history
+    assert np.isfinite(history.validation_latent_total_variance.iloc[2])
+    assert np.isfinite(history.validation_latent_participation_ratio.iloc[2])
+    assert 'validation_latent_count' not in history
+    assert not any(key.startswith('validation_cd8_coverage_') for key in history)
+
+    legacy = copy.deepcopy(third)
+    legacy_definitions = legacy['config']['monitoring_definitions']
+    legacy_definitions.pop('scope')
+    legacy_definitions.update(version=1, cutoffs=[.1, .2, .3], training_positive_count=7,
+                              coverage_levels=[.5, .9], reliability_bins=10)
+    legacy['monitoring_definitions'] = copy.deepcopy(legacy_definitions)
+    torch.save(legacy, output/'latest.pt')
+    removed = dict(validation_latent_count=7., validation_cd8_presence_brier=.25,
+                   validation_cd8_presence_count=7., validation_cd8_positive_count=4.,
+                   validation_cd8_coverage_50=.5, validation_cd8_exceedance_q50_cutoff=.1,
+                   validation_cd8_presence_bin5_count=2., validation_cd8_presence_bin5_predicted=.5,
+                   validation_cd8_presence_bin5_observed=.4)
+    for key, value in removed.items():
+        history[key] = value
+    history.to_csv(output/'history.csv', index=False)
+    old_lines = (output/'history.csv').read_text().splitlines()
+    config['training']['epochs'] = 4
+    train.train_model(config)
+    resumed = torch.load(output/'latest.pt', weights_only=False)
+    assert resumed['monitoring_definitions'] == definitions
+    assert (output/'history.csv').read_text().splitlines()[:len(old_lines)] == old_lines
+    appended = pd.read_csv(output/'history.csv').iloc[-1]
+    assert appended[list(removed)].isna().all()
+    assert np.isfinite(appended.validation_latent_total_variance)
 
 
 def test_figures_sync_async_and_analysis_share_snapshot(tmp_path, monkeypatch):
