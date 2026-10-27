@@ -455,12 +455,14 @@ def test_epoch_summary_aligns_each_target():
             metrics[f'{branch}_weighted_loss'] = metrics[f'{branch}_loss']
         metrics['supervised_objective'] = metrics['biology_weighted_loss']
         metrics['total_loss'] = metrics['supervised_objective'] + metrics['batch_weighted_loss']
+        metrics['batch_aware_objective'] = metrics['supervised_objective'] + .123
     summary = _format_epoch_summary(12, 300, train, validation, columns, 'supervised_objective')
     expected = "\n".join([
         "epoch=12/300 | total objective = 1.735801, 1.858023 | "
         "stopping objective (supervised_objective) = 1.234567, 1.345678 | "
         "IHC objective = 1.234567, 1.345678 | batch objective = 0.501234, 0.512345 | "
-        "hurdle objective = 0.401234, 0.412345 | positive objective (location + scale) = 0.833333, 0.933333",
+        "hurdle objective = 0.401234, 0.412345 | positive objective (location + scale) = 0.833333, 0.933333 | "
+        "batch-aware objective = 1.357567, 1.468678",
         "  batch_acc = 0.8123, 0.7901 | macro hurdle_acc = 0.7100, 0.6800 | macro mean_r2 = 0.2100, 0.1800",
         "  [CD8]      hurdle_acc = 0.7200, 0.7000 | mean_r2 = 0.2200, 0.2000",
         "  [Tumor]    hurdle_acc = 0.7000, 0.6800 | mean_r2 = 0.1700, 0.1500",
@@ -468,6 +470,9 @@ def test_epoch_summary_aligns_each_target():
         "  [Stroma]   hurdle_acc = 0.6700, 0.6400 | mean_r2 = 0.1500, 0.1300",
     ])
     assert summary == expected
+    selected_summary = _format_epoch_summary(12, 300, train, validation, columns, 'batch_aware_objective')
+    assert 'stopping objective (batch_aware_objective) = 1.357567, 1.468678' in selected_summary
+    assert ' | batch-aware objective' not in selected_summary
     assert "step=" not in summary
     missing = dict(train)
     missing["mean_r2_stroma"] = math.nan

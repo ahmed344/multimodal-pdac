@@ -201,7 +201,8 @@ def test_async_scheduler_snapshot_is_frozen(checkpoint_setup, worker, tmp_path):
 
 
 @pytest.mark.parametrize("async_artifacts", [False, True])
-@pytest.mark.parametrize("metric, count", [("supervised_objective", 5), ("cd8_loss", 7)])
+@pytest.mark.parametrize("metric, count", [("supervised_objective", 5), ("cd8_loss", 7),
+                                         ("batch_aware_objective", 7)])
 def test_training_history_checkpoint_timing_and_stopping(
     spatial_config, monkeypatch, capsys, async_artifacts, metric, count,
 ):
@@ -223,6 +224,7 @@ def test_training_history_checkpoint_timing_and_stopping(
         metrics = real_epoch(**kwargs)
         if kwargs["optimizer"] is None:
             metrics.update(supervised_objective=10., cd8_loss=10. - kwargs["epoch_index"],
+                           batch_aware_objective=12. - .1 * kwargs["epoch_index"],
                            total_loss=20. - kwargs["epoch_index"],
                            batch_weighted_loss=10. - kwargs["epoch_index"])
         else:
@@ -286,7 +288,8 @@ def test_legacy_production_resume_stays_fixed_lr(checkpoint_setup, tmp_path, mon
                                   lr_scheduler=dict(enabled=True, patience=0))
     monkeypatch.setattr(train, "refresh_loss_curves", Mock())
     monkeypatch.setattr(train, "_format_epoch_summary", lambda *args: "synthetic epoch")
-    monkeypatch.setattr(train, "run_epoch", lambda **kwargs: dict(supervised_objective=2., cd8_loss=2.))
+    monkeypatch.setattr(train, "run_epoch", lambda **kwargs: dict(
+        supervised_objective=2., cd8_loss=2., batch_aware_objective=2.))
     history_path = Path(config["training"]["output_dir"]) / "history.csv"
     history_path.parent.mkdir(parents=True, exist_ok=True)
     history_path.write_text("epoch,validation_supervised_objective\n1,1.0\n")
@@ -307,7 +310,7 @@ def test_production_metric_switch_retains_scheduler_without_history(spatial_conf
     monkeypatch.setattr(train, "refresh_loss_curves", Mock())
     monkeypatch.setattr(train, "_format_epoch_summary", lambda *args: "synthetic epoch")
     monkeypatch.setattr(train, "run_epoch", lambda **kwargs: dict(
-        supervised_objective=10., cd8_loss=10. - kwargs["epoch_index"]))
+        supervised_objective=10., cd8_loss=10. - kwargs["epoch_index"], batch_aware_objective=10.))
     best = train.train_model(config)
     latest_path = best.with_name("latest.pt")
     initial = torch.load(latest_path, weights_only=False)

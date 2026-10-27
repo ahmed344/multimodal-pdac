@@ -21,7 +21,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from dann.config import (apply_smoke_overrides, load_config, lr_scheduler_settings, monitoring_settings,
-                         resolve_device, seed_everything)
+                         resolve_device, seed_everything, validate_batch_selection_settings)
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.sampling import SamplingEpochAudit
 from dann.losses import ZILNLoss
@@ -719,6 +719,8 @@ def _format_epoch_summary(
     )
     if "he_mse" in train_metrics:
         loss_parts += (("H&E objective", "he_weighted_loss", 6),)
+    if metric != "batch_aware_objective" and "batch_aware_objective" in train_metrics:
+        loss_parts += (("batch-aware objective", "batch_aware_objective", 6),)
     fit_parts = (
         ("batch_acc", "batch_accuracy", 4),
         ("macro hurdle_acc", "hurdle_acc", 4),
@@ -890,6 +892,7 @@ def run_epoch(
     from dann.execution import device_batches, evaluation_groups
     batches = ((cpu, batch, None) for cpu, batch in device_batches(loader, device)) if training else evaluation_groups(model, loader, device)
     group_rows, group_batches = [], []
+    batch_class_count = None
     update_started = perf_counter()
     with (torch.enable_grad() if training else torch.inference_mode()):
         for step, (cpu_batch, batch, outputs) in enumerate(batches):
@@ -909,6 +912,7 @@ def run_epoch(
                 optimizer.zero_grad(set_to_none=True)
             if outputs is None:
                 outputs = model(batch, grl_strength=strength)
+            batch_class_count = outputs["batch_logits"].shape[-1]
             sampled = gradient_monitor is not None and state.update_in_epoch in gradient_monitor.positions
             biology = ziln_loss(
                 outputs["pi_logits"],
@@ -1042,6 +1046,12 @@ def run_epoch(
     finalized["batch_weighted_loss"] = batch_weight * finalized["batch_loss"]
     finalized["supervised_objective"] = finalized["biology_weighted_loss"] + finalized.get("he_weighted_loss", 0.0)
     finalized["total_loss"] = finalized["supervised_objective"] + finalized["batch_weighted_loss"]
+    # Selection uses completed epoch means and a fixed coefficient, independent
+    # of the instantaneous GRL schedule. Empty capped epochs stay unavailable.
+    finalized["batch_chance_loss"] = math.log(batch_class_count) if batch_class_count is not None else math.nan
+    finalized["batch_selection_penalty"] = grl_max_lambda * batch_weight * max(
+        finalized["batch_chance_loss"] - finalized["batch_loss"], 0.0)
+    finalized["batch_aware_objective"] = finalized["supervised_objective"] + finalized["batch_selection_penalty"]
     if gradient_monitor is not None:
         finalized.update(gradient_monitor.finish())
     if validation_monitor is not None:
@@ -1262,6 +1272,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 and int(training["epochs"]) <= int(resume_payload["epoch"]) + 1):
             raise ValueError("Changing the selection metric requires at least one additional epoch; increase training.epochs.")
     metric = selection_metric(config)
+    validate_batch_selection_settings(config)
     seed_everything(
         int(training["seed"]), bool(training["deterministic_algorithms"])
     )

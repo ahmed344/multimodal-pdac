@@ -74,8 +74,12 @@ def objective_batches():
 
 @pytest.mark.parametrize('reduction', ['mean', 'sum'])
 @pytest.mark.parametrize('he', [False, True])
-def test_weighted_epoch_decomposition_and_unchanged_gradients(reduction, he):
+@pytest.mark.parametrize('below_chance', [False, True])
+def test_weighted_epoch_decomposition_and_unchanged_gradients(reduction, he, below_chance):
     batches = objective_batches()
+    if below_chance:
+        for batch in batches:
+            batch['batches'].zero_()
     model = TableModel(he)
     reference = copy.deepcopy(model)
     loss = ZILNLoss(WEIGHTS, reduction=reduction)
@@ -113,6 +117,9 @@ def test_weighted_epoch_decomposition_and_unchanged_gradients(reduction, he):
     assert metrics['positive_weighted_loss'] < 0
     assert metrics['supervised_objective'] == pytest.approx(metrics['biology_weighted_loss'] + metrics.get('he_weighted_loss', 0.))
     assert metrics['total_loss'] == pytest.approx(metrics['supervised_objective'] + metrics['batch_weighted_loss'])
+    assert metrics['batch_aware_objective'] == pytest.approx(
+        metrics['supervised_objective'] + .2 * .3 * max(0., math.log(2) - metrics['batch_loss']))
+    assert (metrics['batch_selection_penalty'] > 0) == below_chance
     assert ('he_weighted_loss' in metrics) == he
     assert ('he_r2' in metrics) == he
     if he:
@@ -141,7 +148,10 @@ def test_weighted_epoch_decomposition_and_unchanged_gradients(reduction, he):
 
 def test_selection_config_defaults_and_validation():
     config = load_config(Path('dann/config.yaml'))
-    assert selection_metric(config) == 'supervised_objective'
+    assert selection_metric(config) == 'batch_aware_objective'
+    for metric in ('supervised_objective', 'cd8_loss', 'batch_aware_objective'):
+        config['training']['early_stopping_metric'] = metric
+        assert resolve_execution(config)['training']['early_stopping_metric'] == metric
     del config['training']['early_stopping_metric']
     assert resolve_execution(config)['training']['early_stopping_metric'] == 'cd8_loss'
     config['training']['early_stopping_metric'] = 'total_loss'
@@ -149,7 +159,68 @@ def test_selection_config_defaults_and_validation():
         resolve_execution(config)
 
 
-@pytest.mark.parametrize('metric, expected_epoch', [('supervised_objective', 2), ('cd8_loss', 3)])
+@pytest.mark.parametrize('section, key', [('loss', 'batch_weight'), ('training', 'grl_max_lambda')])
+@pytest.mark.parametrize('value', [-1., math.inf, -math.inf, math.nan, True, '0.25', None])
+def test_batch_selection_coefficients_reject_invalid_values(section, key, value):
+    config = load_config(Path('dann/config.yaml'))
+    config[section][key] = value
+    with pytest.raises(ValueError, match=f'{section}.{key} must be finite and nonnegative'):
+        resolve_execution(config)
+
+
+@pytest.mark.parametrize('he', [False, True])
+@pytest.mark.parametrize('classes, ratios, batch_weight, maximum', [
+    (43, [.5]*6, .3, .25),  # Better than chance, despite only class zero being observed.
+    (43, [1.]*6, 2., .25),
+    (43, [2.]*6, 2., .25),
+    (43, [.5]*6, 0., .25),
+    (43, [.5]*6, 2., 0.),
+    (1, [0.]*6, .3, .25),
+    (2, [.1, .1, 2., 2., 2., 2.], 2., .25),  # Cap the epoch mean, not each batch.
+])
+def test_batch_aware_epoch_score(he, classes, ratios, batch_weight, maximum):
+    model = TableModel(he)
+    chance = math.log(classes)
+    expected_losses = torch.tensor(ratios, dtype=torch.float64) * chance
+    logits = torch.zeros(6, classes, dtype=torch.float64)
+    if classes > 1:
+        logits[:, 0] = torch.log((classes - 1) / torch.expm1(expected_losses))
+    model.batch_logits = torch.nn.Parameter(logits)
+    batches = objective_batches()
+    for batch in batches:
+        batch['batches'].zero_()
+    metrics = train.run_epoch(model, batches, ZILNLoss(WEIGHTS), torch.device('cpu'), 5., batch_weight,
+                              None, None, 0, 1, 'constant', maximum, 10., None,
+                              he_weight=2., target_columns=TARGETS)
+    assert metrics['batch_loss'] == pytest.approx(expected_losses.mean().item(), abs=1e-14)
+    assert metrics['batch_chance_loss'] == chance
+    penalty = maximum * batch_weight * max(0., chance - expected_losses.mean().item())
+    assert metrics['batch_selection_penalty'] == pytest.approx(penalty, abs=1e-14)
+    supervised = metrics['biology_weighted_loss'] + metrics.get('he_weighted_loss', 0.)
+    assert metrics['batch_aware_objective'] == pytest.approx(supervised + penalty)
+
+
+def test_batch_aware_score_is_independent_of_instantaneous_grl():
+    metrics, strengths = [], []
+    for schedule in ('linear', 'constant'):
+        model = TableModel(False)
+        # Make discriminator better than chance so a schedule-dependent penalty would differ.
+        batches = objective_batches()
+        for batch in batches:
+            batch['batches'].zero_()
+        model.forward = Mock(wraps=model.forward)
+        metrics.append(train.run_epoch(model, batches, ZILNLoss(WEIGHTS), torch.device('cpu'), 5., .3,
+            None, torch.optim.SGD(model.parameters(), lr=0.), 0, 10, schedule, .25, 10., None,
+            target_columns=TARGETS))
+        strengths.append([call.kwargs['grl_strength'] for call in model.forward.call_args_list])
+    assert strengths[0] != strengths[1]
+    assert metrics[0]['batch_selection_penalty'] > 0
+    for key in ('supervised_objective', 'batch_loss', 'batch_aware_objective'):
+        assert metrics[0][key] == metrics[1][key]
+
+
+@pytest.mark.parametrize('metric, expected_epoch', [('supervised_objective', 2), ('cd8_loss', 3),
+                                                  ('batch_aware_objective', 2)])
 def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, metric, expected_epoch):
     config = spatial_config
     config['training'].update(epochs=3, early_stopping_patience=1, early_stopping_metric=metric,
@@ -159,6 +230,14 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     # Supervised prefers epoch 2; CD8 and total prefer epoch 3; discriminator prefers epoch 1.
     rows = [dict(cd8_loss=c, supervised_objective=s, batch_weighted_loss=b, total_loss=s+b)
             for c, s, b in [(3., 5., 0.), (2., 3., 2.), (1., 4., .5)]]
+    if metric == 'batch_aware_objective':
+        # Confusion improves enough to outweigh the small supervised regression at epoch 2.
+        # Above chance, epoch 3 earns no further reward and uses up patience.
+        for row, supervised, batch_loss in zip(rows, [3., 3.05, 3.1], [0., math.log(2), math.log(2)+.5]):
+            penalty = .25 * max(0., math.log(2)-batch_loss)
+            row.update(supervised_objective=supervised, batch_loss=batch_loss, batch_chance_loss=math.log(2),
+                       batch_selection_penalty=penalty, batch_aware_objective=supervised+penalty,
+                       batch_weighted_loss=batch_loss, total_loss=supervised+batch_loss)
     epoch = Mock(side_effect=[row for row in rows for _ in range(2)])
     monkeypatch.setattr(train, 'run_epoch', epoch)
     best = train.train_model(config)
@@ -169,7 +248,7 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     assert latest['selection_metric'] == metric
     assert latest['best_selection_score'] == rows[expected_epoch-1][metric]
     assert 'best_validation_cd8' not in latest and 'best_validation_biology' not in latest
-    assert latest['early_stopping_state']['stale_epochs'] == (1 if metric == 'supervised_objective' else 0)
+    assert latest['early_stopping_state']['stale_epochs'] == (0 if metric == 'cd8_loss' else 1)
     assert latest['selection_start_epoch'] == 1
 
     requested = copy.deepcopy(config)
@@ -179,16 +258,16 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     history_text = history_path.read_text()
     history_path.unlink()
     requested['training']['early_stopping_min_delta'] = .01
-    if metric == 'supervised_objective':
+    if metric != 'cd8_loss':
         train.train_model(requested)
         assert epoch.call_count == 6
     history_path.write_text(history_text)
-    switched = 'cd8_loss' if metric == 'supervised_objective' else 'supervised_objective'
+    switched = 'supervised_objective' if metric == 'batch_aware_objective' else 'batch_aware_objective'
     requested['training'].update(early_stopping_metric=switched, epochs=3)
     with pytest.raises(ValueError, match='at least one additional epoch'):
         train.train_model(requested)
     requested['training']['epochs'] = 4
-    fresh_row = dict(cd8_loss=100., supervised_objective=100.)
+    fresh_row = dict(cd8_loss=100., supervised_objective=100., batch_aware_objective=100.)
     epoch.side_effect = [fresh_row, fresh_row]
     train.train_model(requested)
     switched_payload = torch.load(best, weights_only=False)
@@ -199,6 +278,12 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     history = pd.read_csv(history_path)
     assert history.epoch.tolist() == [1, 2, 3, 4]
     assert history.selected_epoch.iloc[-1] == 4
+    if metric != 'batch_aware_objective':
+        assert history.validation_batch_aware_objective.iloc[:3].isna().all()
+    else:
+        for split in ('train', 'validation'):
+            for key in ('batch_chance_loss', 'batch_selection_penalty', 'batch_aware_objective'):
+                np.testing.assert_allclose(history[f'{split}_{key}'].iloc[:3], [row[key] for row in rows])
 
 
 def test_legacy_selection_restoration():
@@ -212,7 +297,8 @@ def test_legacy_selection_restoration():
     assert math.isinf(stopper.best) and stopper.stale_epochs == 0
 
 
-def test_resume_uses_saved_progress_and_legacy_threshold():
+@pytest.mark.parametrize('metric', ['supervised_objective', 'batch_aware_objective'])
+def test_resume_uses_saved_progress_and_legacy_threshold(metric):
     # A new min_delta applies only to future epochs, even on a legacy resume.
     history = [dict(epoch=i, validation_cd8_loss=v) for i, v in enumerate([1., .95, .94], 1)]
     legacy = dict(epoch=2, selection_metric='mean_valid_cd8_ziln', best_validation_cd8=1.,
@@ -221,15 +307,50 @@ def test_resume_uses_saved_progress_and_legacy_threshold():
     assert train.restore_selection_state(stopper, legacy, 'cd8_loss', history) == (1, 1)
     assert stopper.best == 1. and stopper.stale_epochs == 2 and stopper.min_delta == .001
     assert stopper.update(.96) == (True, False)
-    checkpoint = dict(epoch=7, selection_metric='supervised_objective', best_selection_score=4.,
+    checkpoint = dict(epoch=7, selection_metric=metric, best_selection_score=4.,
                       best_epoch=5, selection_start_epoch=3, early_stopping_state=dict(stale_epochs=3))
-    assert train.restore_selection_state(stopper, checkpoint, 'supervised_objective', history) == (5, 3)
+    assert train.restore_selection_state(stopper, checkpoint, metric, []) == (5, 3)
     assert stopper.best == 4. and stopper.stale_epochs == 3
     assert stopper.update(5.) == (False, True)
 
 
+def test_batch_aware_resume_retains_saved_weights_and_class_count(spatial_config, monkeypatch):
+    config = spatial_config
+    for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
+        group['type'] = 'mlp'
+    config['training'].update(epochs=1, early_stopping_metric='batch_aware_objective', grl_max_lambda=.4)
+    config['loss'].update(batch_weight=1.7, biology_weight=3.)
+    resolve_execution(config)
+    monkeypatch.setattr(train, 'refresh_loss_curves', Mock())
+    best = train.train_model(config)
+    checkpoint = torch.load(best, weights_only=False)
+    assert len(checkpoint['batch_names']) == 2
+    requested = copy.deepcopy(config)
+    requested['training'].update(epochs=2, resume_checkpoint=str(best), grl_max_lambda=8.)
+    requested['loss'].update(batch_weight=9., biology_weight=10.)
+    train.train_model(requested)
+    latest = torch.load(best.with_name('latest.pt'), weights_only=False)
+    assert latest['config']['training']['grl_max_lambda'] == .4
+    assert latest['config']['loss']['batch_weight'] == 1.7
+    assert latest['config']['loss']['biology_weight'] == 3.
+    assert latest['batch_names'] == checkpoint['batch_names']
+    assert latest['selection_start_epoch'] == 1
+    history = pd.read_csv(best.with_name('history.csv'))
+    assert history.epoch.tolist() == [1., 2.]
+    for split in ('train', 'validation'):
+        row = history.iloc[-1]
+        assert row[f'{split}_batch_chance_loss'] == math.log(2)
+        assert row[f'{split}_supervised_objective'] == pytest.approx(3. * row[f'{split}_biology_loss'])
+        penalty = .4 * 1.7 * max(0., math.log(2) - row[f'{split}_batch_loss'])
+        assert row[f'{split}_batch_selection_penalty'] == pytest.approx(penalty)
+        assert row[f'{split}_batch_aware_objective'] == pytest.approx(row[f'{split}_supervised_objective'] + penalty)
+    expected_best = min(checkpoint['best_selection_score'], history.validation_batch_aware_objective.iloc[-1])
+    assert latest['best_selection_score'] == pytest.approx(expected_best)
+
+
 @pytest.mark.parametrize('he', [False, True])
-def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, he):
+@pytest.mark.parametrize('metric', ['supervised_objective', 'batch_aware_objective'])
+def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, he, metric):
     config = load_config(Path('dann/config.yaml'))
     config['model']['heads']['he']['enabled'] = he
     config['data']['target_columns'] = TARGETS[::-1]
@@ -244,6 +365,8 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
                 he_mse=3., mean_r2_cd8=-3., positive_weighted_loss_cd8=-.3,
             ).items()})
             row[f'{split}_positive_weighted_loss_cd8'] = math.nan if epoch == 1 else -.3
+            if epoch > 1:
+                row[f'{split}_batch_aware_objective'] = epoch + .4
         row.update(train_gradient_cd8_hurdle_norm_mean=[0., math.nan, 2.][epoch-1],
                    train_gradient_cd8_positive_norm_mean=[1., math.nan, 3.][epoch-1],
                    train_gradient_cd8_hurdle__positive_cosine_mean=[-.5, math.nan, .3][epoch-1],
@@ -254,7 +377,7 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
     captured = []
     monkeypatch.setattr(plt, 'close', lambda figure: captured.append(figure))
     plot_loss_curves(path, tmp_path / 'curves.png', 20, config=config,
-                     selection=dict(selection_metric='supervised_objective', best_epoch=2, selection_start_epoch=1))
+                     selection=dict(selection_metric=metric, best_epoch=2, selection_start_epoch=1))
     ihc, overall = captured[-2:]
     assert (tmp_path / 'ihc_curves.png').is_file()
     from dann.curve_layout import figure_size, render_reservation_bytes
@@ -271,7 +394,14 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
         assert position(overall.axes[column]) == (0, column)
         assert position(overall.axes[4+column]) == (1, column)
     assert title(overall.axes[8]) == 'Total objective'
-    assert title(overall.axes[9]) == 'Supervised objective — early stopping'
+    assert title(overall.axes[9]) == 'Supervised objective' + (' — early stopping' if metric == 'supervised_objective' else '')
+    assert title(overall.axes[11]) == 'Batch-aware objective' + (' — early stopping' if metric == 'batch_aware_objective' else '')
+    assert position(overall.axes[11]) == (2, 3)
+    assert overall.axes[11].get_visible()
+    for line in overall.axes[11].lines[:2]:
+        np.testing.assert_allclose(line.get_ydata(), [math.nan, 2.4, 3.4], equal_nan=True)
+    assert any(f'Selection metric: {metric}' in text.get_text() for text in overall.texts)
+    assert overall.axes[14].collections[0].cmap.name == 'coolwarm'
     assert overall.axes[2].get_visible() == he
     assert overall.axes[6].get_visible() == he
     for index, label in enumerate(('CD8', 'Tumor', 'Collagen', 'Stroma')):
@@ -336,6 +466,8 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
     assert len(figure.axes[8].lines) == 2
     assert figure.axes[8].lines[0].get_marker() == '.'
     assert all(np.isnan(figure.axes[9].lines[0].get_ydata()))
+    assert all(np.isnan(figure.axes[11].lines[0].get_ydata()))
+    assert 'Unavailable' in figure.axes[11].texts[0].get_text()
     for figure in captured[-2:]:
         plt.Figure.clear(figure)
 
@@ -400,6 +532,7 @@ def test_old_history_weights_use_saved_configuration_without_inventing_signal_lo
     assert resolved.train_biology_weighted_loss.iloc[0] == 14.
     assert resolved.train_batch_weighted_loss.iloc[0] == .8
     assert resolved.train_supervised_objective.iloc[0] == 29.
+    assert 'train_batch_aware_objective' not in resolved
     assert not any('_cd8' in column for column in resolved)
     frame['train_biology_weighted_loss'] = math.nan
     assert weighted_history(frame, config).train_biology_weighted_loss.isna().all()

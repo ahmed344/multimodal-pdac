@@ -248,7 +248,8 @@ def test_memory_pressure_waits_for_required_output_without_dropping_it(tmp_path,
         assert (tmp_path / 'sampling' / 'epoch_0000_summary.json').exists()
 
 
-@pytest.mark.parametrize('metric, expected_epoch', [('supervised_objective', 2), ('cd8_loss', 3)])
+@pytest.mark.parametrize('metric, expected_epoch', [('supervised_objective', 2), ('cd8_loss', 3),
+                                                  ('batch_aware_objective', 2)])
 def test_async_selection_and_resume(spatial_config, monkeypatch, metric, expected_epoch):
     from dann.tests.test_objectives import test_training_selection_roundtrip_and_resume
     spatial_config['performance']['async_artifacts'] = True
@@ -274,7 +275,7 @@ def test_next_epoch_starts_before_outputs_finish_and_interruption_drains(spatial
                 assert not release.is_set()
                 release.set()
                 raise interruption('stop during the next epoch')
-            return dict(supervised_objective=1., cd8_loss=1.)
+            return dict(supervised_objective=1., cd8_loss=1., batch_aware_objective=1.)
 
         monkeypatch.setattr(train, 'run_epoch', epoch)
         try:

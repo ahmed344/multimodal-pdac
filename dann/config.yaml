@@ -32,7 +32,7 @@ data:
 
 model:
   num_peaks: 5808  # Number of aligned m/z bins in both MSI files.
-  latent_dim: 256  # Aggregation output width; this is the exported latent before either head.
+  latent_dim: 512  # Aggregation output width; this is the exported latent before either head.
 
   # 1. Per-pixel spectral processing: learned embeddings -> intensity weighting
   #    -> per-peak MLP -> mean pooling over active peaks. Empty spectra pool to zero.
@@ -40,22 +40,22 @@ model:
     type: deep_sets  # Supported spectral encoder: deep_sets.
     deep_sets:
       embedding_dim: 128  # Width of each learned peak embedding.
-      peak_hidden_dims: [256, 256]  # Hidden widths of the original per-peak MLP.
-      peak_output_dim: 256  # Pooled pixel width passed to the aggregation component.
+      peak_hidden_dims: [512, 512]  # Hidden widths of the original per-peak MLP.
+      peak_output_dim: 512  # Pooled pixel width passed to the aggregation component.
 
   # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
     type: gatv2  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
-      hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
+      hidden_dims: [512, 512]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
       channels: 128  # Pointwise input projection and hidden convolution width.
       depth: 3  # Number of 3x3, stride-one convolutions; spatial radius equals depth.
-      residual: false  # Normalized skip connections within hidden 3x3 blocks; false restores the plain CNN.
+      residual: true  # Normalized skip connections within hidden 3x3 blocks; false restores the plain CNN.
       dropout: 0.10  # Hidden dropout after per-pixel channel LayerNorm and GELU.
     gatv2:
       channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-      depth: 2  # Number of local attention layers.
+      depth: 3  # Number of local attention layers.
       heads: 4  # Each attention head emits channels / heads channels.
       neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
       residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
@@ -75,7 +75,7 @@ model:
         dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
       gatv2:
         channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-        depth: 2  # Number of local attention layers.
+        depth: 3  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
@@ -95,7 +95,7 @@ model:
         dropout: 0.10  # Hidden dropout; normalization is per pixel, never across the tile.
       gatv2:
         channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-        depth: 2  # Number of local attention layers.
+        depth: 3  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
@@ -113,7 +113,7 @@ model:
         dropout: 0.10  # Hidden dropout; missing tissue is masked throughout every CNN.
       gatv2:
         channels: 128  # Total hidden width across concatenated heads; divisible by heads.
-        depth: 2  # Number of local attention layers.
+        depth: 3  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
         residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
@@ -134,13 +134,13 @@ model:
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
 
 loss:
-  he_weight: 10.0  # Baseline auxiliary MSE weight; not tuned.
   ziln_reduction: mean  # Reduction over valid weighted target entries: mean or sum.
   target_weights: [8.0, 4.0, 2.0, 1.0]  # Relative weights in data.target_columns order.
   logit_epsilon: 0.00001  # Clamp positive target densities before taking their logits.
   include_normal_constant: false  # Preserve the original loss scale by omitting the normal-density constant.
-  biology_weight: 5.0  # Multiplier for the complete weighted four-target ZILN objective.
-  batch_weight: 1.0  # Multiplier for discriminator cross-entropy.
+  biology_weight: 2.0  # Multiplier for the complete weighted four-target ZILN objective.
+  he_weight: 10.0  # H&E auxiliary MSE weight.
+  batch_weight: 1.0  # Finite, nonnegative discriminator cross-entropy weight; also scales the selection penalty.
   balance_batch_classes: true  # Mean-one inverse-frequency weights from selected training rows.
 
 monitoring:
@@ -188,14 +188,16 @@ training:
     min_lr_factor: 0.01  # Floor relative to the selected mode's original starting LR.
     eps: 0.0  # Allow reductions all the way to the floor, including very small LRs.
   gradient_clip_norm: 5.0  # Maximum global gradient norm; null disables clipping.
-  grl_max_lambda: 0.25  # Maximum encoder-bound gradient reversal strength.
+  grl_max_lambda: 0.25  # Finite, nonnegative maximum GRL strength; fixed multiplier for the selection penalty.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
   grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
   grl_horizon_updates: null  # Full-fit epoch-based schedule (300 x 47 updates); the pilot's 500-update horizon is not used.
   early_stopping_enabled: true  # Disable only for bounded diagnostic comparisons.
-  early_stopping_metric: supervised_objective  # Weighted IHC + H&E; cd8_loss is available for comparison. Omitted settings retain legacy CD8 selection.
+  # S = supervised_objective + grl_max_lambda * batch_weight * max(0, ln(K) - batch_loss).
+  # K is the discriminator output width. Selection starts at the first validation epoch.
+  early_stopping_metric: batch_aware_objective  # Also supports supervised_objective and cd8_loss; omission retains legacy CD8 selection.
   early_stopping_patience: 20  # Epochs without improvement in the validation selection metric.
-  early_stopping_min_delta: 0.001  # Minimum improvement in supervised-objective units (or CD8-loss units when selected).
+  early_stopping_min_delta: 0.001  # Minimum improvement in the selected score's units.
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
   resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, and early stopping may override.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
@@ -305,7 +307,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: he10_biology5_discriminator1  # Fresh full fit, separate from the baseline and pilot.
+  run_name: he10_biology2_discriminator1_512  # Fresh full fit, separate from the baseline and pilot.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.

@@ -176,7 +176,7 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
                              np.r_[epochs[0]-(epochs[1]-epochs[0])/2, (epochs[:-1]+epochs[1:])/2,
                                    epochs[-1]+(epochs[-1]-epochs[-2])/2])
                     axis.pcolormesh(edges, np.arange(len(data)+1)-.5, np.ma.masked_invalid(data),
-                                    cmap='Reds' if panel.get('conflict') else 'RdBu',
+                                    cmap=panel.get('cmap', 'Reds' if panel.get('conflict') else 'RdBu'),
                                     vmin=0 if panel.get('conflict') else -1, vmax=1, shading='flat')
                 axis.set_yticks(np.arange(len(panel['series'])), [label for _, label in panel['series']])
             if not available:
@@ -220,6 +220,7 @@ def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi:
           else any('he_weighted_loss' in c or 'he_mse' in c or 'he_r2' in c for c in history))
     overall = ['ihc', *(['he'] if he else []), 'batch']
     gradients = _gradient_panels('gradient_overall', overall, 'Objectives')
+    gradients[2]['cmap'] = 'coolwarm'
     rows = [
         [_fit('hurdle_acc', 'IHC balanced hurdle accuracy (macro average)', COLORS['hurdle']),
          _fit('mean_r2', 'IHC positive-logit R² (macro average)', COLORS['positive']),
@@ -233,7 +234,7 @@ def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi:
          _fit('supervised_objective', 'Supervised objective' + (' — early stopping' if metric == 'supervised_objective' else '')),
          _lines('Actual GRL strength', [('train_gradient_grl_strength_mean', 'All updates', COLORS['batch'], '-'),
                                       ('train_gradient_sampled_grl_strength_mean', 'Sampled updates', 'C4', '--')], legend=True),
-         None],
+         _fit('batch_aware_objective', 'Batch-aware objective' + (' — early stopping' if metric == 'batch_aware_objective' else ''))],
         [*gradients[:3],
          _lines('Validation latent participation ratio', [('validation_latent_participation_ratio', 'Participation ratio', 'C0', '--')])],
         [*gradients[4:], gradients[3],

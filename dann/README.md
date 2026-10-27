@@ -362,23 +362,35 @@ counts, then assign the remainder to test. Loading or resuming historical
 checkpoints preserves their saved split membership even if configured fractions
 have changed. H&E-mediated transfer is assessed separately.
 
-Checkpoint selection and early stopping both use **validation supervised objective**
-with `training.early_stopping_metric: supervised_objective` in the checked-in YAML.
+Checkpoint selection and early stopping both use **validation batch-aware objective**
+with `training.early_stopping_metric: batch_aware_objective` in the checked-in YAML.
 The optimized loss is unchanged:
 
 ```text
 IHC_weighted = biology_weight * IHC_loss
 HE_weighted = he_weight * he_mse                 # omitted when disabled
 Batch_weighted = batch_weight * batch_cross_entropy
-Supervised = IHC_weighted + HE_weighted          # stopping / best.pt score
+Supervised = IHC_weighted + HE_weighted          # LR scheduling score
 Total = Supervised + Batch_weighted             # backpropagation objective
+Batch_chance = ln(K)                            # discriminator output class count
+Batch_selection_penalty = grl_max_lambda * batch_weight * max(0, Batch_chance - batch_cross_entropy)
+Batch_aware = Supervised + Batch_selection_penalty  # stopping / best.pt score
 ```
 
-`cd8_loss` remains available for comparison and is the default when the setting
-is absent. It selects mean validation CD8 ZILN loss over valid CD8 rows.
-`early_stopping_min_delta` measures units of the selected score: supervised-objective
-units in the checked-in configuration. The selection policy itself does not
-change the optimized loss or GRL schedule.
+The score uses finalized epoch losses and the discriminator's full output width
+for `K`, including classes absent from a particular minibatch or validation split.
+The fixed coefficient uses the configured maximum GRL strength, not the current
+schedule value. With the current weights and 43 classes, the penalty is
+`0.25 * max(0, 3.7612 - batch_cross_entropy)`. It decreases as the discriminator
+approaches chance cross-entropy and remains zero above chance. Both `batch_weight`
+and `grl_max_lambda` must be finite and nonnegative. Selection starts at the first
+completed validation epoch, with no additional warmup.
+
+`supervised_objective` and `cd8_loss` remain available for comparison. An absent
+setting retains legacy `cd8_loss` selection: mean validation CD8 ZILN loss over
+valid CD8 rows. `early_stopping_min_delta` measures units of the selected score.
+The selection policy does not change the optimized loss, gradients, GRL schedule,
+or LR scheduling on `supervised_objective`.
 
 New runs enable validation-driven LR reduction through the shared block:
 
@@ -421,7 +433,7 @@ are checked before resume. Incompatible components or targets are rejected.
 Checkpoints explicitly record `selection_metric`, `best_selection_score`,
 `best_epoch` (one-based), `selection_start_epoch` (one-based), and
 `early_stopping_state` (stale epochs, patience, minimum improvement, stopped flag).
-Supervised scores are never written under CD8-labelled fields. Compatible resumes
+Selection scores are never written under CD8-labelled fields. Compatible resumes
 restore the score, selected epoch, and stale-epoch count even without `history.csv`;
 recognized old CD8 checkpoints can replay their saved CD8 history for patience.
 Changing the metric resets the score and patience at the next epoch, records that
@@ -434,7 +446,9 @@ YAML values for `epochs`, `num_workers`, `prefetch_factor`,
 `early_stopping_metric`, `early_stopping_patience`, and `early_stopping_min_delta`,
 plus the documented performance, post-training, and monitoring overrides. The checkpoint learning
 rate and other training settings stay in place; differing YAML values are reported
-and ignored. `--smoke-test` cannot be combined with a resume checkpoint. Completed
+and ignored. Batch-aware selection uses the saved loss weights and maximum GRL
+strength, with the saved class count enforced by the checkpoint's batch order
+and discriminator state. `--smoke-test` cannot be combined with a resume checkpoint. Completed
 `history.csv` rows are kept and both `loss_curves.png` and `ihc_curves.png` are refreshed from that full history.
 
 Scheduled checkpoints save `lr_scheduler_state` with the optimizer, including the
@@ -487,8 +501,9 @@ deterministic GPU kernels only in these comparison runs and requires exact state
 and metric equality; production training settings are unchanged.
 
 History retains raw loss and fit columns and adds `biology_weighted_loss`,
-`hurdle_weighted_loss`, `positive_weighted_loss`, `batch_weighted_loss`, and
-`supervised_objective`, each prefixed by `train_` or `validation_`. Per-signal
+`hurdle_weighted_loss`, `positive_weighted_loss`, `batch_weighted_loss`,
+`supervised_objective`, `batch_chance_loss`, `batch_selection_penalty`, and
+`batch_aware_objective`, each prefixed by `train_` or `validation_`. Per-signal
 `hurdle_weighted_loss_<signal>` and `positive_weighted_loss_<signal>` include both
 the signal's target weight and `biology_weight`. Their sums equal the aggregate
 IHC objective. For mean reduction, every signal and both branches share the total
@@ -501,17 +516,16 @@ existing sample-weighted average of batch sums for aggregate and per-signal repo
 epoch). Both appear in epoch logs and are equal for fixed-LR runs. Older history
 rows without these columns remain blank when resumed; no past LR is inferred.
 
-The four-column plot is 20 inches wide and 33.4 inches tall for the four configured
-signals, with compact row spacing to give each panel more height. In the first two
-rows, total objective sits directly above supervised
-objective in column one, discriminator accuracy above batch discriminator
-objective in column two, and H&E R² above H&E objective in column three. Every
-subsequent pair of rows places balanced hurdle accuracy and positive-logit R²
-directly above their weighted hurdle and positive likelihood objectives. These
-blocks show aggregate IHC macro fit metrics beside CD8, then Tumor beside
-Collagen, then Stroma. The combined IHC objective remains in history and the
-additive formulas, while its two branches occupy separate metric/objective pairs
-in the figure. Unused cells and disabled H&E panels are hidden. One shared legend
+The four-column overall plot pairs IHC balanced hurdle accuracy, IHC positive-logit
+R², H&E R², and discriminator accuracy with their objectives directly below.
+The next row shows total objective, supervised objective, actual GRL strength,
+and batch-aware objective. The active selection metric is labelled in the figure
+header, and the supervised or batch-aware panel is marked when selected.
+Epoch summaries also report the new score.
+Historical rows without batch-aware metrics remain gaps, even if raw batch losses
+are available. The separate IHC figure places each signal's fit metrics above its
+weighted hurdle and positive likelihood objectives. The combined IHC objective
+remains in history and the additive formulas. Disabled H&E panels are hidden. One shared legend
 identifies Train, Validation, and the selected checkpoint epoch across all panels.
 Epoch axes are aligned, with numeric ticks and no repeated "Epoch" axis labels;
 no minimum is inferred from incomplete history.

@@ -335,6 +335,14 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
+def validate_batch_selection_settings(config: Mapping[str, Any]) -> None:
+    """Require finite, nonnegative coefficients for batch-aware selection."""
+    for section, key in (("loss", "batch_weight"), ("training", "grl_max_lambda")):
+        value = config[section][key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0:
+            raise ValueError(f"{section}.{key} must be finite and nonnegative.")
+
+
 def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve mode-specific settings and all run paths once, without overrides."""
     monitoring_settings(config)
@@ -371,6 +379,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         training.update(training["pixel"])
     if mode in training:
         training.update(training[mode])
+    validate_batch_selection_settings(config)
     training["lr_scheduler"] = lr_scheduler_settings(training)
     if mode == "spatial":
         data = config["data"]
