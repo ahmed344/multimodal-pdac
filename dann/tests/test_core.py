@@ -362,6 +362,8 @@ def test_normal_checkpoint_round_trip(tmp_path: Path, tiny_h5ad: Path) -> None:
     from dann.data_loader import create_data_bundle
     from dann.train import save_checkpoint, load_training_checkpoint
     config = load_config(Path("dann/config.yaml"))
+    config["training"]["warmup"]["epochs"] = 0  # Historical fixed-LR checkpoint contract.
+    config["training"]["head_initialization"]["enabled"] = False
     config["data"]["path"] = str(tiny_h5ad)
     config["training"].update(num_workers=0, batch_size=2, validation_batch_size=2)
     for key in ("spectral_encoder", "aggregation", "heads"):
@@ -529,6 +531,8 @@ def test_resume_optimizer_keeps_saved_learning_rate(tmp_path: Path, tiny_h5ad: P
     from dann.data_loader import create_data_bundle
     from dann.train import load_training_checkpoint, save_checkpoint
     config = load_config(Path("dann/config.yaml"))
+    config["training"]["warmup"]["epochs"] = 0  # Historical fixed-LR checkpoint contract.
+    config["training"]["head_initialization"]["enabled"] = False
     config["data"]["path"] = str(tiny_h5ad)
     config["training"].update(num_workers=0, batch_size=2, validation_batch_size=2, learning_rate=0.01)
     for key in ("spectral_encoder", "aggregation", "heads"):

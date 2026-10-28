@@ -39,6 +39,12 @@ def spatial_config(tmp_path):
     tissue.write_h5ad(tmp_path/'tissue.h5ad')
     tissue[np.arange(0, len(keys), 2)].copy().write_h5ad(tmp_path/'labels.h5ad')
     config = load_config(Path('dann/config.yaml'))
+    # Keep historical tests independent of editable stabilization defaults.
+    config['training']['warmup']['epochs'] = 0
+    config['training']['head_initialization']['enabled'] = False
+    config['model']['spectral_encoder']['deep_sets'].update(peak_mlp_residual=False, pool_centering='none')
+    for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
+        group['mlp']['residual'] = False
     # Exercise the legacy path unless a test explicitly opts into execution caches.
     config['model']['heads'].pop('he', None)
     config['performance'] = {}

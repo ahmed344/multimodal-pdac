@@ -25,7 +25,9 @@ from dann.config import (apply_smoke_overrides, load_config, lr_scheduler_settin
 from dann.data_loader import DataBundle, create_data_bundle
 from dann.sampling import SamplingEpochAudit
 from dann.losses import ZILNLoss
-from dann.lr_scheduler import create_lr_scheduler, step_lr_scheduler, validate_lr_scheduler_checkpoint
+from dann.lr_scheduler import (create_lr_scheduler, step_lr_scheduler, validate_lr_scheduler_checkpoint,
+                               UpdateWarmup, validate_warmup_checkpoint)
+from dann.initialization import initialize_supervised_heads
 from dann.model import AdversarialLatentFusion
 from dann.monitoring import GradientMonitor, StreamingCovariance, freeze_monitoring
 from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
@@ -128,6 +130,17 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
         checkpoint learning rate stays in place.
     """
 
+    saved_components = architecture_contract(saved_config)['components'] if 'model' in saved_config else {}
+    requested_components = architecture_contract(requested_config)['components'] if 'model' in requested_config else {}
+    for name, group in saved_components.items():
+        requested_group = requested_components.get(name, {})
+        if name == 'spectral_encoder':
+            keys = ('pool_centering', 'peak_mlp_residual')
+            if any(group['deep_sets'][key] != requested_group.get('deep_sets', {}).get(key) for key in keys):
+                raise ValueError('Incompatible spectral centering or MLP residual settings on resume; use saved settings or fresh training.')
+        elif group['type'] == requested_group.get('type') == 'mlp':
+            if group['mlp']['residual'] != requested_group['mlp']['residual']:
+                raise ValueError(f'Incompatible {name} MLP residual settings on resume; use saved settings or fresh training.')
     has_he = any(c.get('model', {}).get('heads', {}).get('he', {}).get('enabled', False)
                  for c in (saved_config, requested_config))
     if has_he and architecture_contract(saved_config)['components'].get('he') != architecture_contract(requested_config)['components'].get('he'):
@@ -146,7 +159,7 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     # Runtime sampling may change; retained definitions come from the saved run.
     config['monitoring'] = monitoring_settings(requested_config)
 
-    for key in ('spectral_peak_budget', 'spectral_checkpointing', 'gatv2_tile_budget',
+    for key in ('spectral_peak_budget', 'spectral_checkpointing', 'pixel_spectral_microbatching', 'gatv2_tile_budget',
                 'gatv2_checkpointing', 'inference_peak_chunk_size'):
         if key in requested_config.get('model', {}):
             config['model'][key] = requested_config['model'][key]
@@ -814,6 +827,7 @@ def run_epoch(
     update_callback: Callable[[dict], None] | None = None,
     evaluation_callback: Callable[[Mapping, Mapping], None] | None = None,
     monitoring: Mapping[str, Any] | None = None,
+    warmup: UpdateWarmup | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -845,6 +859,7 @@ def run_epoch(
         update_callback (Callable | None): Observe each completed logical update.
         evaluation_callback (Callable | None): Observe held-out predictions without changing evaluation.
         monitoring (Mapping | None): Validated runtime switches; omitted disables monitoring.
+        warmup (UpdateWarmup | None): Advance the LR only at logical optimizer boundaries.
 
     Returns:
         dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
@@ -880,6 +895,8 @@ def run_epoch(
                                        monitor_settings["gradient_updates_per_epoch"])
                         if training and monitor_settings["enabled"] else None)
     validation_monitor = StreamingCovariance() if not training and monitor_settings["enabled"] else None
+    used_lrs = []
+    warmup_updates = 0
     initial_updates = state.optimizer_updates
     if training and hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch_index)
@@ -909,6 +926,8 @@ def run_epoch(
                 progress, grl_schedule, grl_max_lambda, grl_gamma
             )
             if training and first:
+                used_lrs.extend(float(group["lr"]) for group in optimizer.param_groups)
+                warmup_updates += int(warmup is not None and warmup.active)
                 optimizer.zero_grad(set_to_none=True)
             if outputs is None:
                 outputs = model(batch, grl_strength=strength)
@@ -975,6 +994,8 @@ def run_epoch(
                     if gradient_monitor is not None:
                         gradient_monitor.clipping(preclip_norm, gradient_clip_norm, strength)
                     optimizer.step()
+                    if warmup is not None:
+                        warmup.step()
                     state.optimizer_updates += 1
                     state.update_in_epoch += 1
                     state.supervised_rows += group.get("rows", len(batch["targets"]))
@@ -1063,6 +1084,10 @@ def run_epoch(
         else:
             artifacts.submit_audit(sampling_audit_dir, epoch_index, audit.compositions, summary)
     if training:
+        finalized.update(learning_rate_min=min(used_lrs, default=math.nan),
+                         learning_rate_max=max(used_lrs, default=math.nan),
+                         warmup_updates=warmup_updates,
+                         next_learning_rate=float(optimizer.param_groups[0]["lr"]))
         finalized.update(optimizer_updates=state.optimizer_updates - initial_updates,
                          cumulative_optimizer_updates=state.optimizer_updates,
                          cumulative_supervised_rows=state.supervised_rows)
@@ -1158,10 +1183,11 @@ def save_checkpoint(
     stopper: EarlyStopping | None = None,
     progress_state: TrainingProgress | None = None,
     lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    warmup: UpdateWarmup | None = None,
 ) -> None:
     """Synchronously save an atomic, portable checkpoint for existing callers."""
     metadata = checkpoint_metadata(model, config, bundle)
-    state = cpu_snapshot(training_state(model, optimizer, lr_scheduler))
+    state = cpu_snapshot(training_state(model, optimizer, lr_scheduler, warmup))
     payload = checkpoint_payload(metadata, state, epoch, best_selection_score,
                                  best_epoch=best_epoch, selection_start_epoch=selection_start_epoch, stopper=stopper,
                                  progress_state=progress_state)
@@ -1178,6 +1204,7 @@ def load_training_checkpoint(
     selected_rows=None,
     *,
     lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    warmup: UpdateWarmup | None = None,
 ) -> tuple[int, float]:
     """Restore model and optimizer state for resumed training.
 
@@ -1211,8 +1238,17 @@ def load_training_checkpoint(
         if not lr_scheduler_settings(checkpoint["config"]["training"])["enabled"]:
             raise ValueError("Cannot enable LR scheduling when resuming a fixed-LR checkpoint.")
         lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state"])
+    validate_warmup_checkpoint(checkpoint)
+    if warmup is not None:
+        from dann.config import warmup_settings
+        if warmup.settings != warmup_settings(checkpoint["config"]["training"]):
+            raise ValueError("Cannot change warmup settings when resuming a checkpoint.")
+    if warmup is None and checkpoint.get("warmup_state", {}).get("horizon", 0):
+        raise ValueError("Cannot resume enabled warmup without an UpdateWarmup controller.")
     model.load_state_dict(checkpoint["model_state"])
     optimizer.load_state_dict(checkpoint["optimizer_state"])
+    if warmup is not None and "warmup_state" in checkpoint:
+        warmup.load_state_dict(checkpoint["warmup_state"])
     saved = checkpoint_selection(checkpoint)
     return int(checkpoint["epoch"]) + 1, (
         saved["best_selection_score"] if saved["selection_metric"] == selection_metric(config) else math.inf
@@ -1264,6 +1300,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
         resume_payload = torch.load(resume, map_location="cpu", weights_only=False)
         config = resume_training_config(checkpoint_config(resume_payload), requested)
         validate_lr_scheduler_checkpoint(resume_payload)
+        validate_warmup_checkpoint(resume_payload)
         ignored = ignored_resume_settings(requested, config)
         if ignored:
             print("Resume kept checkpoint values for: " + ", ".join(ignored), flush=True)
@@ -1297,6 +1334,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
         num_batches=len(bundle.metadata.batch_names),
         num_targets=len(config["data"]["target_columns"]),
     ).to(device)
+    initialization = (resume_payload.get("head_initialization", {"resumed_without_reinitialization": True})
+                      if resume else initialize_supervised_heads(model, bundle, config))
     ziln_loss = ZILNLoss.from_config(config).to(device)
     class_weights = (
         bundle.batch_class_weights.to(device)
@@ -1310,13 +1349,15 @@ def train_model(config: Mapping[str, Any]) -> Path:
         betas=(float(training["beta1"]), float(training["beta2"])),
     )
     lr_scheduler = create_lr_scheduler(optimizer, config)
+    logical_updates = getattr(bundle.loaders["train"].sampler, "logical_updates", len(bundle.loaders["train"]))
+    warmup = UpdateWarmup(optimizer, config, logical_updates)
     start_epoch = 0
     prior_best = math.inf
     resume = training.get("resume_checkpoint")
     if resume:
         start_epoch, prior_best = load_training_checkpoint(
             Path(resume), model, optimizer, device, config, bundle.split_indices["train"],
-            lr_scheduler=lr_scheduler,
+            lr_scheduler=lr_scheduler, warmup=warmup,
         )
     stopper = EarlyStopping(
         patience=int(training["early_stopping_patience"]),
@@ -1325,7 +1366,10 @@ def train_model(config: Mapping[str, Any]) -> Path:
     )
     output_dir = Path(training["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
-    logical_updates = getattr(bundle.loaders["train"].sampler, "logical_updates", len(bundle.loaders["train"]))
+    atomic_json(output_dir / "head_initialization.json", initialization)
+    for record in initialization.get("biology", []):
+        if record["fallbacks"]:
+            print(f"Initialization {record['target']}: {record['fallbacks']}", flush=True)
     progress_state = TrainingProgress.from_checkpoint(
         resume_payload, logical_updates, len(bundle.split_indices["train"]))
     with (output_dir / "execution_startup.json").open('w') as handle:
@@ -1392,6 +1436,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
         gradient_clip_norm = None if clip is None else float(clip)
         target_columns = list(config["data"]["target_columns"])
         metadata = checkpoint_metadata(model, config, bundle)
+        metadata["head_initialization"] = initialization
         for epoch in range(start_epoch, epochs):
             if artifacts is not None:
                 artifacts.check()
@@ -1419,6 +1464,7 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 artifacts=artifacts,
                 progress_state=progress_state,
                 grl_horizon_updates=training.get("grl_horizon_updates"),
+                warmup=warmup,
             )
             validation_metrics = run_epoch(
                 model=model,
@@ -1449,7 +1495,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
             )
             if not math.isfinite(validation_metrics[metric]):
                 raise ValueError(f"Validation requires a finite {metric} for checkpoint selection.")
-            step_lr_scheduler(lr_scheduler, validation_metrics)
+            if not train_metrics.get("warmup_updates", 0):
+                step_lr_scheduler(lr_scheduler, validation_metrics)
             next_learning_rate = float(optimizer.param_groups[0]["lr"])
             row.update(learning_rate=learning_rate, next_learning_rate=next_learning_rate)
             improved, should_stop = stopper.update(validation_metrics[metric])
@@ -1467,8 +1514,8 @@ def train_model(config: Mapping[str, Any]) -> Path:
             payload, snapshot_seconds = None, 0.
             if destinations:
                 snapshot_started = perf_counter()
-                state = (artifacts.snapshot(model, optimizer, lr_scheduler) if artifacts is not None else
-                         cpu_snapshot(training_state(model, optimizer, lr_scheduler)))
+                state = (artifacts.snapshot(model, optimizer, lr_scheduler, warmup) if artifacts is not None else
+                         cpu_snapshot(training_state(model, optimizer, lr_scheduler, warmup)))
                 snapshot_seconds = perf_counter() - snapshot_started
                 payload = checkpoint_payload(metadata, state, epoch, stopper.best, best_epoch=best_epoch,
                                              selection_start_epoch=selection_start_epoch, stopper=stopper,

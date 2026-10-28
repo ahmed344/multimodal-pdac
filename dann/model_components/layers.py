@@ -25,6 +25,25 @@ def build_activation(name: str) -> nn.Module:
     return activations[name]()
 
 
+class NormalizedResidual(nn.Sequential):
+    """Equal-width hidden update with normalized identity addition."""
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return (value + super().forward(value)) / math.sqrt(2)
+
+
+def without_dropout(module: nn.Module, value: torch.Tensor) -> torch.Tensor:
+    """Evaluate an MLP reference with gradients, without RNG draws or mode changes."""
+    if isinstance(module, nn.Dropout):
+        return value
+    if isinstance(module, nn.Sequential):
+        update = value
+        for child in module:
+            update = without_dropout(child, update)
+        return (value + update) / math.sqrt(2) if isinstance(module, NormalizedResidual) else update
+    return module(value)
+
+
 def build_mlp(
     input_dim: int,
     hidden_dims: Sequence[int],
@@ -32,6 +51,7 @@ def build_mlp(
     activation: str,
     dropout: float,
     use_layer_norm: bool,
+    residual: bool = False,
 ) -> nn.Sequential:
     """Build an MLP with normalized, activated hidden layers.
 
@@ -42,20 +62,27 @@ def build_mlp(
         activation (str): Hidden activation name.
         dropout (float): Hidden dropout probability.
         use_layer_norm (bool): Add LayerNorm after each hidden linear layer.
+        residual (bool): Normalize identity additions around equal-width hidden blocks.
 
     Returns:
         nn.Sequential: Configured feed-forward network.
     """
 
+    if not isinstance(residual, bool):
+        raise ValueError("MLP residual must be boolean.")
     layers: list[nn.Module] = []
     previous = input_dim
     for width in hidden_dims:
+        start = len(layers)
         layers.append(nn.Linear(previous, int(width)))
         if use_layer_norm:
             layers.append(nn.LayerNorm(int(width)))
         layers.append(build_activation(activation))
         if dropout > 0.0:
             layers.append(nn.Dropout(dropout))
+        if residual and previous == int(width):
+            block = NormalizedResidual(*layers[start:])
+            layers[start:] = [block]
         previous = int(width)
     layers.append(nn.Linear(previous, output_dim))
     return nn.Sequential(*layers)

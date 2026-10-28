@@ -2570,3 +2570,106 @@ relative runtime cost reflects the very short unmonitored synthetic epoch and th
 extra component backward passes. Peak RSS includes process/library initialization;
 allocated GPU memory isolates tensor memory more directly. The configured default
 remains five sampled updates per epoch.
+
+### Training stabilization and version 7 checkpoints
+
+`model.spectral_encoder.deep_sets.peak_mlp_residual` and each component's
+`mlp.residual` enable `(input + update) / sqrt(2)` around equal-width hidden
+blocks. Unequal-width blocks and final projections stay ordinary transformations.
+Omitting these flags preserves the original MLP construction, parameter names,
+registration order, and seeded draws. CNN and GATv2 residual flags remain separate.
+
+`deep_sets.pool_centering: zero_input` subtracts the dropout-free `peak_mlp(0)`
+from each nonempty spectrum's active-peak mean. Empty spectra remain exactly zero.
+The reference retains gradients, uses no dropout RNG, and never changes module
+training modes. Direct pooling, spectral checkpointing, and pass-local inference
+caches share this operation; cached features are already centered. There are no
+batch statistics or fitted preprocessing state. Omission means `none`.
+
+Fresh training can initialize the biology and H&E heads from selected training
+rows using `training.head_initialization`:
+
+```yaml
+head_initialization:
+  enabled: true
+  output_weight_scale: 0.01
+  min_positive_sigma: 0.1
+warmup:
+  epochs: 1
+  start_factor: 0.1
+```
+
+Biology initialization uses the transformed targets and per-target validity masks:
+zero-fraction logits, positive-logit means, and population standard deviations
+floored at `min_positive_sigma`. The raw scale inverts
+`sigma = softplus(raw_sigma) + model.sigma_min`. Probabilities use the loss epsilon.
+Unobserved targets use zero probability 0.5; targets without positives use
+`mu=0, sigma=1`. H&E biases use streamed means of raw
+training features in stored column order. Both supervised final projection weights
+are scaled, preserving nonzero upstream gradients; discriminator parameters retain
+their original initialization. Counts, means, scales, and explicit fallbacks are
+saved in `head_initialization.json` and production checkpoint metadata. Omission
+disables initialization, and resume never recomputes these statistics.
+
+Warmup uses actual logical optimizer updates per epoch, including the final partial
+batch. For N > 1 warmup updates, the first uses `start_factor * configured_lr` and
+the Nth uses the configured LR; N=1 uses the start rate then installs the base rate.
+Accumulated microbatches share a rate. Validation epochs containing any warmup
+updates do not advance the plateau scheduler. Subsequent plateau behavior and its
+floor relative to the original configured LR are unchanged. Histories record
+`train_learning_rate_min`, `train_learning_rate_max`, `train_warmup_updates`, and
+`next_learning_rate`. `epochs: 0` (the omitted default) disables warmup. Both
+synchronous and asynchronous checkpoints save its resolved horizon, base rates,
+and completed updates. Enabled-warmup resumes reject missing or inconsistent state.
+Existing epoch-only resume restrictions still apply to partial-epoch checkpoints.
+
+New checkpoints use architecture contract version 7. Versions 2–6 reconstruct
+historical MLP and pooling behavior. Changing centering or residual semantics is
+incompatible with loading those weights as a new architecture; start a fresh fit.
+Inference target order, prediction fields, sparse processing, and frozen target
+transformation contracts are unchanged.
+
+Learning rates remain explicit in `training.pixel.learning_rate` and
+`training.spatial.learning_rate`; there is no automatic width-based LR scaling.
+Use wider-model rates as an empirical tuning choice, assessed with latent variation
+and predictive distribution calibration as well as loss.
+
+In the matched 2026-10-28 three-epoch width-1024 experiment, explicit LR 0.0005
+produced participation ratio 16.81 versus 13.45 at 0.001, presence Brier 0.1831
+versus 0.1835, and between-slide variance fraction 0.475 versus 0.497. CD8 loss
+was slightly worse (0.9750 versus 0.9730). These single-seed early results support
+trying the lower rate for representation preservation; they do not establish a
+universal scaling rule or final convergence. Both wide arms used identical
+checkpointed spectral chunks and the same 300-epoch GRL horizon.
+
+A reproducible three-epoch comparison driver creates new directories only:
+
+```bash
+python -m dann.verification.stabilization --output NEW_DIRECTORY --prepare-only
+python -m dann.verification.stabilization --output NEW_DIRECTORY --run-all
+python -m dann.verification.stabilization --output NEW_DIRECTORY --summarize
+```
+
+It runs six width-512 MLP ablations, width-1024 combined runs at explicit 0.001 and
+0.0005 rates, and baseline/combined CNN and GATv2 runs (GATv2 aggregation depth 4).
+Peak hidden/output, latent, and MLP aggregation hidden widths follow the experiment
+width; CNN/GATv2 channels and all head hidden widths retain the source configuration.
+Baseline CNN residual flags
+are preserved; baseline GATv2 residuals are disabled. All arms retain seed, split,
+sampling, and losses, and save initial parameter hashes before marginal
+initialization. The GRL horizon stays at 300 full epochs. Tissue exports and
+post-training analysis are disabled. Per-arm histories and early probes, final
+CSV comparisons, and PNG/PDF plots separate latent variation from loss and CD8
+calibration. These runs establish early behavior, not final convergence or
+biological usefulness of the representation.
+
+Wide pixel MLPs may opt into `model.pixel_spectral_microbatching: true` to apply the
+existing `spectral_peak_budget` and `spectral_checkpointing` controls before MLP
+aggregation. The default is false, preserving historical pixel execution. This
+changes memory use and dropout draw grouping, without changing parameter names,
+logical optimizer batches, the sampling order, or the architecture contract.
+Evaluation and gradients match direct pooling with dropout disabled; checkpoint
+recomputation preserves RNG with dropout enabled. The width-1024 comparisons use
+this path with a 262144-peak budget in both learning-rate arms because the direct
+path exhausted the RTX 5090 during gradient monitoring. The failed attempt is
+retained separately and excluded from comparison tables.

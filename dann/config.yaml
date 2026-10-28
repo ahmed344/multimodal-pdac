@@ -32,22 +32,25 @@ data:
 
 model:
   num_peaks: 5808  # Number of aligned m/z bins in both MSI files.
-  latent_dim: 512  # Aggregation output width; this is the exported latent before either head.
+  latent_dim: 256  # Aggregation output width; this is the exported latent before either head.
 
   # 1. Per-pixel spectral processing: learned embeddings -> intensity weighting
   #    -> per-peak MLP -> mean pooling over active peaks. Empty spectra pool to zero.
   spectral_encoder:
     type: deep_sets  # Supported spectral encoder: deep_sets.
     deep_sets:
+      peak_mlp_residual: true  # Normalized skips around equal-width hidden blocks.
+      pool_centering: zero_input  # Subtract the dropout-free peak_mlp(0) for nonempty spectra.
       embedding_dim: 128  # Width of each learned peak embedding.
-      peak_hidden_dims: [512, 512]  # Hidden widths of the original per-peak MLP.
-      peak_output_dim: 512  # Pooled pixel width passed to the aggregation component.
+      peak_hidden_dims: [256, 256]  # Hidden widths of the original per-peak MLP.
+      peak_output_dim: 256  # Pooled pixel width passed to the aggregation component.
 
   # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
-    type: gatv2  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
+    type: mlp  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
-      hidden_dims: [512, 512]  # Hidden widths after pooling; final width is latent_dim.
+      residual: true
+      hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
       channels: 128  # Pointwise input projection and hidden convolution width.
       depth: 3  # Number of 3x3, stride-one convolutions; spatial radius equals depth.
@@ -58,15 +61,16 @@ model:
       depth: 3  # Number of local attention layers.
       heads: 4  # Each attention head emits channels / heads channels.
       neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
-      residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+      residual: true  # Independent normalized identity skip: (hidden + update) / sqrt(2).
       dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
       attention_dropout: 0.05  # Drop attention coefficients during training.
 
   # 3. Prediction heads: choices are independent; all consume aggregation latents.
   heads:
     biology:
-      type: gatv2  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
+      type: mlp  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
       mlp:
+        residual: true
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
         channels: 128  # Hidden spatial width; final pointwise projection emits target parameters.
@@ -78,15 +82,16 @@ model:
         depth: 3  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
-        residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+        residual: true  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
         attention_dropout: 0.05  # Drop attention coefficients during training.
 
     he:
       enabled: true  # Auxiliary raw UNI2-h feature prediction.
       output_dim: 1536
-      type: gatv2  # Choices: mlp, cnn, gatv2. Emits unrestricted linear feature predictions.
+      type: mlp  # Choices: mlp, cnn, gatv2. Emits unrestricted linear feature predictions.
       mlp:
+        residual: true
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
         channels: 128  # Hidden spatial width; final pointwise projection emits target parameters.
@@ -98,13 +103,14 @@ model:
         depth: 3  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
-        residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+        residual: true  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
         attention_dropout: 0.05  # Drop attention coefficients during training.
 
     discriminator:
-      type: gatv2  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
+      type: mlp  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
       mlp:
+        residual: true
         hidden_dims: [256, 128, 64]  # Original batch-discriminator hidden widths.
       cnn:
         channels: 128  # Hidden spatial width; final projection emits batch-class logits.
@@ -116,7 +122,7 @@ model:
         depth: 3  # Number of local attention layers.
         heads: 4  # Each attention head emits channels / heads channels.
         neighbor_radius: 1.5  # Per-layer Euclidean cutoff in grid units; includes eight immediate neighbors.
-        residual: false  # Independent normalized identity skip: (hidden + update) / sqrt(2).
+        residual: true  # Independent normalized identity skip: (hidden + update) / sqrt(2).
         dropout: 0.10  # Hidden feature dropout after per-node LayerNorm and GELU.
         attention_dropout: 0.05  # Drop attention coefficients during training.
 
@@ -129,6 +135,7 @@ model:
   # Execution controls change memory use, not the selected architecture.
   gatv2_checkpointing: false  # Independent of spectral checkpointing; preserves parameter names.
   gatv2_tile_budget: 64  # Independent tile graphs per internal attention call; all neighbors and optimizer rows are retained.
+  pixel_spectral_microbatching: false  # Opt in to bounded checkpointed pooling for wide MLP training.
   spectral_peak_budget: 524288  # Spatial spectral microbatch budget in active peaks; complete spectra stay together.
   spectral_checkpointing: true  # Recompute spectral activations during spatial backward, preserving dropout RNG.
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
@@ -179,6 +186,13 @@ training:
   weight_decay: 0.00001  # AdamW decoupled weight decay.
   beta1: 0.9  # AdamW first-moment coefficient.
   beta2: 0.999  # AdamW second-moment coefficient.
+  head_initialization:
+    enabled: true
+    output_weight_scale: 0.01
+    min_positive_sigma: 0.1
+  warmup:
+    epochs: 1
+    start_factor: 0.1
   lr_scheduler:  # Validation supervised_objective; saved settings are retained on resume.
     enabled: true
     factor: 0.5
@@ -191,7 +205,7 @@ training:
   grl_max_lambda: 0.25  # Finite, nonnegative maximum GRL strength; fixed multiplier for the selection penalty.
   grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
   grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
-  grl_horizon_updates: null  # Full-fit epoch-based schedule (300 x 47 updates); the pilot's 500-update horizon is not used.
+  grl_horizon_updates: null  # Full-fit epoch-based schedule derived from actual logical updates; the pilot's 500-update horizon is not used.
   early_stopping_enabled: true  # Disable only for bounded diagnostic comparisons.
   # S = supervised_objective + grl_max_lambda * batch_weight * max(0, ln(K) - batch_loss).
   # K is the discriminator output width. Selection starts at the first validation epoch.
@@ -307,7 +321,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: he10_biology2_discriminator1_512  # Fresh full fit, separate from the baseline and pilot.
+  run_name: he10_biology2_discriminator1_non_centered  # Fresh full fit, separate from the baseline and pilot.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.

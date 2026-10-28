@@ -96,11 +96,14 @@ def training_state(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+    warmup=None,
 ) -> dict[str, Any]:
     """Collect live training state; callers must freeze it before further updates."""
     state = dict(model_state=model.state_dict(), optimizer_state=optimizer.state_dict())
     if lr_scheduler is not None:
         state["lr_scheduler_state"] = lr_scheduler.state_dict()
+    if warmup is not None:
+        state["warmup_state"] = warmup.state_dict()
     return state
 
 
@@ -287,9 +290,10 @@ class TrainingArtifacts:
     def snapshot(
         self, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
         lr_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None,
+        warmup=None,
     ) -> dict[str, Any]:
         """Reserve memory before freezing model, optimizer, and optional scheduler."""
-        state = training_state(model, optimizer, lr_scheduler)
+        state = training_state(model, optimizer, lr_scheduler, warmup)
         self.reserve(3 * state_bytes(state))
         return cpu_snapshot(state)
 

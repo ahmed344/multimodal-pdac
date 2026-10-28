@@ -100,6 +100,39 @@ def lr_scheduler_settings(training: Mapping[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+def warmup_settings(training: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolve update-based warmup; omission preserves historical learning rates."""
+    supplied = training.get("warmup", {})
+    defaults = dict(epochs=0, start_factor=0.1)
+    if not isinstance(supplied, Mapping) or supplied.keys() - defaults.keys():
+        raise ValueError("Invalid training.warmup settings.")
+    resolved = {**defaults, **supplied}
+    epochs, factor = resolved["epochs"], resolved["start_factor"]
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs < 0:
+        raise ValueError("training.warmup.epochs must be a nonnegative integer.")
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)) or not 0 < factor <= 1:
+        raise ValueError("training.warmup.start_factor must be in (0, 1].")
+    return resolved
+
+
+def head_initialization_settings(training: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate fresh-run marginal initialization, disabled for historical configs."""
+    supplied = training.get("head_initialization", {})
+    defaults = dict(enabled=False, output_weight_scale=0.01, min_positive_sigma=0.1)
+    if not isinstance(supplied, Mapping) or supplied.keys() - defaults.keys():
+        raise ValueError("Invalid training.head_initialization settings.")
+    resolved = {**defaults, **supplied}
+    if not isinstance(resolved["enabled"], bool):
+        raise ValueError("training.head_initialization.enabled must be boolean.")
+    for key in ("output_weight_scale", "min_positive_sigma"):
+        value = resolved[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value <= 0:
+            raise ValueError(f"training.head_initialization.{key} must be finite and positive.")
+    if resolved["output_weight_scale"] > 1:
+        raise ValueError("training.head_initialization.output_weight_scale must be <= 1.")
+    return resolved
+
+
 def monitoring_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     """Validate observational monitoring; absent settings keep it disabled."""
     supplied = config.get("monitoring", {})
@@ -284,6 +317,12 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
     else:
         settings["heads"].pop("he", None)
     spectral = settings["spectral_encoder"]["deep_sets"]
+    spectral.setdefault("peak_mlp_residual", False)
+    spectral.setdefault("pool_centering", "none")
+    if not isinstance(spectral["peak_mlp_residual"], bool):
+        raise ValueError("peak_mlp_residual must be boolean.")
+    if spectral["pool_centering"] not in ("none", "zero_input"):
+        raise ValueError("pool_centering must be none or zero_input.")
     positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
                 spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
                 model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144),
@@ -293,6 +332,9 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
         if group["type"] not in {"mlp", "cnn", "gatv2"}:
             raise ValueError("Component type must be mlp or cnn or gatv2.")
         group.setdefault("mlp", {"hidden_dims": [512, 512]})
+        group["mlp"].setdefault("residual", False)
+        if not isinstance(group["mlp"]["residual"], bool):
+            raise ValueError(f"model.{name}.mlp.residual must be boolean.")
         group["cnn"] = {"channels": 128, "depth": 3, "dropout": .10,
                         "residual": True, **group.get("cnn", {})}
         group["gatv2"] = gatv2_settings(group.get("gatv2", {}))
@@ -305,6 +347,8 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("Model widths, depths, and peak budgets must be positive integers.")
     if not isinstance(model.get("gatv2_checkpointing", True), bool):
         raise ValueError("model.gatv2_checkpointing must be boolean.")
+    if not isinstance(model.get("pixel_spectral_microbatching", False), bool):
+        raise ValueError("model.pixel_spectral_microbatching must be boolean.")
     if not isinstance(model.get("spectral_checkpointing", True), bool):
         raise ValueError("model.spectral_checkpointing must be boolean.")
     if not 0 <= model["dropout"] < 1 or model["sigma_min"] <= 0:
@@ -381,6 +425,10 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         training.update(training[mode])
     validate_batch_selection_settings(config)
     training["lr_scheduler"] = lr_scheduler_settings(training)
+    training["warmup"] = warmup_settings(training)
+    training["head_initialization"] = head_initialization_settings(training)
+    if training["head_initialization"]["enabled"] and training["head_initialization"]["min_positive_sigma"] <= config["model"]["sigma_min"]:
+        raise ValueError("min_positive_sigma must exceed model.sigma_min.")
     if mode == "spatial":
         data = config["data"]
         for key in ("path", "x_column", "y_column", "batch_column"):

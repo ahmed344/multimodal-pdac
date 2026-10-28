@@ -3,7 +3,7 @@ from typing import Sequence
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
-from .layers import build_mlp
+from .layers import build_mlp, without_dropout
 
 class DeepSetsEncoder(nn.Module):
     """PDF-defined Deep Sets encoder over only active MSI peaks."""
@@ -20,6 +20,8 @@ class DeepSetsEncoder(nn.Module):
         inference_peak_chunk_size: int = 262_144,
         *,
         initialize_embeddings: bool = True,
+        peak_mlp_residual: bool = False,
+        pool_centering: str = "none",
     ) -> None:
         """Initialize the learnable peak dictionary and Deep Sets MLPs.
 
@@ -35,12 +37,19 @@ class DeepSetsEncoder(nn.Module):
                 the per-peak MLP at once when gradients are disabled.
             initialize_embeddings (bool): Defer the final embedding draw when a
                 compatibility wrapper must first construct aggregation layers.
+            peak_mlp_residual (bool): Enable normalized equal-width hidden skips.
+            pool_centering (str): Subtract the dropout-free zero-input reference
+                for nonempty spectra when set to ``zero_input``.
 
         Returns:
             None: Module parameters are initialized.
         """
 
         super().__init__()
+        if pool_centering not in {"none", "zero_input"}:
+            raise ValueError("pool_centering must be none or zero_input.")
+        self.pool_centering = pool_centering
+        self.peak_mlp_residual = peak_mlp_residual
         self.num_peaks = int(num_peaks)
         self.embedding_dim = int(embedding_dim)
         self.inference_peak_chunk_size = int(inference_peak_chunk_size)
@@ -54,6 +63,7 @@ class DeepSetsEncoder(nn.Module):
             activation,
             dropout,
             use_layer_norm,
+            residual=peak_mlp_residual,
         )
         if initialize_embeddings:
             nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
@@ -110,6 +120,11 @@ class DeepSetsEncoder(nn.Module):
                     peak_features,
                 )
         pooled = pooled / peak_counts.clamp_min(1).to(pooled.dtype).unsqueeze(-1)
+        if self.pool_centering == "zero_input":
+            reference = without_dropout(
+                self.peak_mlp, self.embedding.weight.new_zeros((1, self.embedding_dim)))
+            pooled = torch.where(peak_counts.unsqueeze(-1) > 0, pooled - reference,
+                                 torch.zeros_like(pooled))
         return pooled
 
 

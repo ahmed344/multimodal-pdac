@@ -28,13 +28,15 @@ class IntensityWeightedPeakEncoder(DeepSetsEncoder):
     """Compatibility wrapper around spectral pooling and MLP aggregation."""
     def __init__(self, num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
                  aggregation_hidden_dims, latent_dim, activation="gelu", dropout=0.,
-                 use_layer_norm=True, inference_peak_chunk_size=262144):
+                 use_layer_norm=True, inference_peak_chunk_size=262144,
+                 peak_mlp_residual=False, pool_centering="none", aggregation_residual=False):
         super().__init__(num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
                          activation, dropout, use_layer_norm, inference_peak_chunk_size,
-                         initialize_embeddings=False)
+                         initialize_embeddings=False, peak_mlp_residual=peak_mlp_residual,
+                         pool_centering=pool_centering)
         self.aggregation_mlp = MLPAggregation(
             peak_output_dim, aggregation_hidden_dims, latent_dim, activation=activation,
-            dropout=dropout, use_layer_norm=use_layer_norm)
+            dropout=dropout, use_layer_norm=use_layer_norm, residual=aggregation_residual)
         # Preserve the original seeded draw order: peak MLP, aggregation, embedding.
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
 
@@ -45,9 +47,9 @@ class IntensityWeightedPeakEncoder(DeepSetsEncoder):
 class BiologyPredictor(MLPBiology):
     """Legacy public pointwise predictor, including shared transformation."""
     def __init__(self, latent_dim, hidden_dims, num_targets, sigma_min,
-                 activation, dropout, use_layer_norm):
+                 activation, dropout, use_layer_norm, residual=False):
         super().__init__(latent_dim, hidden_dims, num_targets * 3,
-                         activation=activation, dropout=dropout, use_layer_norm=use_layer_norm)
+                         activation=activation, dropout=dropout, use_layer_norm=use_layer_norm, residual=residual)
         self.num_targets, self.sigma_min = num_targets, sigma_min
 
     def forward(self, latent):
@@ -55,9 +57,9 @@ class BiologyPredictor(MLPBiology):
 
 
 class BatchDiscriminator(MLPDiscriminator):
-    def __init__(self, latent_dim, hidden_dims, num_batches, activation, dropout, use_layer_norm):
+    def __init__(self, latent_dim, hidden_dims, num_batches, activation, dropout, use_layer_norm, residual=False):
         super().__init__(latent_dim, hidden_dims, num_batches, activation=activation,
-                         dropout=dropout, use_layer_norm=use_layer_norm)
+                         dropout=dropout, use_layer_norm=use_layer_norm, residual=residual)
 
 
 class _GradientReversalFunction(torch.autograd.Function):
@@ -138,6 +140,7 @@ class AdversarialLatentFusion(nn.Module):
             int(values["num_peaks"]), **spectral,
             aggregation_hidden_dims=settings["aggregation"]["mlp"]["hidden_dims"],
             latent_dim=values["latent_dim"],
+            aggregation_residual=settings["aggregation"]["mlp"]["residual"],
             inference_peak_chunk_size=values.get("inference_peak_chunk_size", 262144), **common)
         if settings["aggregation"]["type"] == "cnn":
             encoder.aggregation_mlp = CNNAggregation(spectral["peak_output_dim"],
@@ -149,13 +152,13 @@ class AdversarialLatentFusion(nn.Module):
         disc = settings["heads"]["discriminator"]
         if bio["type"] == "mlp":
             biology = BiologyPredictor(values["latent_dim"], bio["mlp"]["hidden_dims"],
-                                       num_targets, values["sigma_min"], **common)
+                                       num_targets, values["sigma_min"], residual=bio["mlp"]["residual"], **common)
         else:
             biology = {"cnn": CNNBiology, "gatv2": BiologyGATv2}[bio["type"]](
                 values["latent_dim"], num_targets * 3, **bio[bio["type"]])
         if disc["type"] == "mlp":
             discriminator = BatchDiscriminator(values["latent_dim"], disc["mlp"]["hidden_dims"],
-                                               num_batches, **common)
+                                               num_batches, residual=disc["mlp"]["residual"], **common)
         else:
             discriminator = {"cnn": CNNDiscriminator, "gatv2": DiscriminatorGATv2}[disc["type"]](
                 values["latent_dim"], num_batches, **disc[disc["type"]])
@@ -163,7 +166,7 @@ class AdversarialLatentFusion(nn.Module):
         he_predictor = None
         if he is not None:
             if he["type"] == "mlp":
-                he_predictor = MLPBiology(values["latent_dim"], he["mlp"]["hidden_dims"], he["output_dim"], **common)
+                he_predictor = MLPBiology(values["latent_dim"], he["mlp"]["hidden_dims"], he["output_dim"], residual=he["mlp"]["residual"], **common)
             else:
                 he_predictor = {"cnn": CNNBiology, "gatv2": BiologyGATv2}[he["type"]](
                     values["latent_dim"], he["output_dim"], **he[he["type"]])
@@ -177,6 +180,7 @@ class AdversarialLatentFusion(nn.Module):
         model.num_targets, model.sigma_min = num_targets, values["sigma_min"]
         model.latent_dim = int(values["latent_dim"])
         model.spatial = any(x["type"] in {"cnn", "gatv2"} for x in (settings["aggregation"], *settings["heads"].values()))
+        model.pixel_spectral_microbatching = values.get("pixel_spectral_microbatching", False)
         model.peak_budget = values.get("spectral_peak_budget", 65536)
         model.checkpointing = values.get("spectral_checkpointing", True)
         model.halo = encoder.aggregation_mlp.radius + max(biology.radius, discriminator.radius, he_predictor.radius if he_predictor is not None else 0)
@@ -227,8 +231,13 @@ class AdversarialLatentFusion(nn.Module):
         """Return core aggregation latents, preserving context during aggregation."""
         if self.spatial:
             return self._select(self._latent_map(batch), batch)
-        return self.encoder(*[batch[key] for key in
-                            ("peak_indices", "intensities", "sample_indices", "peak_counts")])
+        args = [batch[key] for key in
+                ("peak_indices", "intensities", "sample_indices", "peak_counts")]
+        if getattr(self, "pixel_spectral_microbatching", False):
+            pooled = self.encoder.microbatched(*args, peak_budget=self.peak_budget,
+                checkpointing=self.checkpointing, chunks=batch.get('spectral_chunks'))
+            return self.encoder.aggregation_mlp(pooled)
+        return self.encoder(*args)
 
     def forward(self, batch: Mapping[str, torch.Tensor],
                 grl_strength: float = 1.0, *, predict_he: bool = True) -> dict[str, torch.Tensor]:
