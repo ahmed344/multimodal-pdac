@@ -39,8 +39,11 @@ model:
   spectral_encoder:
     type: deep_sets  # Supported spectral encoder: deep_sets.
     deep_sets:
+      pooling: occurrence_mlp  # Or intensity_weighted_dictionary; requires fresh training.
+      normalization: count  # occurrence_mlp: count; dictionary: l1 or l2 (transformed intensities).
+      normalization_epsilon: 1.0e-8  # Positive row-norm floor for dictionary pooling.
       peak_mlp_residual: true  # Normalized skips around equal-width hidden blocks.
-      pool_centering: zero_input  # Subtract the dropout-free peak_mlp(0) for nonempty spectra.
+      pool_centering: zero_input  # occurrence: none/zero_input; dictionary: none/dictionary_mean.
       embedding_dim: 128  # Width of each learned peak embedding.
       peak_hidden_dims: [256, 256]  # Hidden widths of the original per-peak MLP.
       peak_output_dim: 256  # Pooled pixel width passed to the aggregation component.

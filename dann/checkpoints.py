@@ -19,7 +19,7 @@ def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         if group['type'] == 'gatv2':
             selected[name]['graph_semantics'] = copy.deepcopy(GRAPH_SEMANTICS)
             selected[name]['reach'] = graph_reach(group['gatv2']['depth'], group['gatv2']['neighbor_radius'])
-    return {'version': 7, 'components': selected,
+    return {'version': 8, 'components': selected,
             'numerics': {key: config['model'][key] for key in
                          ('num_peaks', 'latent_dim', 'activation', 'dropout', 'use_layer_norm', 'sigma_min')},
             'spatial': execution_settings(config)}
@@ -35,8 +35,19 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(checkpoint['config'])
     saved = copy.deepcopy(checkpoint.get('architecture'))
     version = saved['version'] if saved is not None else 2
-    if version not in (2, 3, 4, 5, 6, 7):
+    if version not in (2, 3, 4, 5, 6, 7, 8):
         raise ValueError('Unsupported checkpoint architecture version.')
+    if version == 8 and not {'pooling', 'normalization', 'normalization_epsilon'} <= set(
+            saved.get('components', {}).get('spectral_encoder', {}).get('deep_sets', {})):
+        raise ValueError('Version 8 checkpoint architecture requires explicit pooling, normalization and normalization_epsilon.')
+    if 'spectral_encoder' in config['model']:
+        spectral = config['model']['spectral_encoder']['deep_sets']
+        if version < 8:
+            spectral.update(pooling='occurrence_mlp', normalization='count', normalization_epsilon=1.0e-8)
+        elif not {'pooling', 'normalization', 'normalization_epsilon'} <= spectral.keys():
+            # The architecture is fully resolved even if the original YAML omitted defaults.
+            for key in ('pooling', 'normalization', 'normalization_epsilon'):
+                spectral.setdefault(key, saved['components']['spectral_encoder']['deep_sets'][key])
     if version < 7 and 'spectral_encoder' in config['model']:
         spectral = config['model']['spectral_encoder']['deep_sets']
         spectral.update(peak_mlp_residual=False, pool_centering='none')
@@ -80,7 +91,10 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
             for name, group in saved['components'].items():
                 if name != 'spectral_encoder' and group['type'] == 'mlp':
                     group['mlp']['residual'] = False
-        saved['version'] = 7
+        if version < 8:
+            saved['components']['spectral_encoder']['deep_sets'].update(
+                pooling='occurrence_mlp', normalization='count', normalization_epsilon=1.0e-8)
+        saved['version'] = 8
         if saved != architecture_contract(config):
             raise ValueError('Checkpoint configuration disagrees with architecture metadata.')
     return config
@@ -97,7 +111,7 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
     saved = architecture_contract(checkpoint_config(checkpoint))
     requested = architecture_contract(config)
     if saved != requested:
-        message = 'Checkpoint components or numerical settings are incompatible; adding or changing H&E requires fresh training.'
+        message = 'Checkpoint components or numerical settings are incompatible; changing pooling, normalization or H&E requires fresh training.'
         for name in ('aggregation', 'biology', 'discriminator'):
             saved_group = saved['components'][name]
             requested_group = requested['components'][name]
@@ -109,8 +123,8 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
     if model is not None:
         from dann.model_components.layers import NormalizedResidual
         spectral = requested['components']['spectral_encoder']['deep_sets']
-        if (model.encoder.pool_centering != spectral['pool_centering']
-                or model.encoder.peak_mlp_residual != spectral['peak_mlp_residual']):
+        if any(getattr(model.encoder, key) != spectral[key] for key in
+               ('pool_centering', 'peak_mlp_residual', 'pooling', 'normalization', 'normalization_epsilon')):
             raise ValueError('Model spectral centering/residual settings are incompatible.')
         for name, module in [('aggregation', model.encoder.aggregation_mlp),
                              ('biology', model.biology_predictor),

@@ -1,12 +1,29 @@
-"""Intensity-weighted Deep Sets through active-peak mean pooling."""
+"""Sparse spectral pooling with historical occurrence or weighted dictionary MLPs."""
+import math
 from typing import Sequence
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from .layers import build_mlp, without_dropout
 
+
+def validate_pooling(pooling: str, normalization: str, pool_centering: str,
+                     normalization_epsilon: float) -> None:
+    """Reject ambiguous pooling semantics before constructing parameters."""
+    if pooling not in {"occurrence_mlp", "intensity_weighted_dictionary"}:
+        raise ValueError("pooling must be occurrence_mlp or intensity_weighted_dictionary.")
+    allowed = ({"count"}, {"none", "zero_input"}) if pooling == "occurrence_mlp" else (
+        {"l1", "l2"}, {"none", "dictionary_mean"})
+    if normalization not in allowed[0] or pool_centering not in allowed[1]:
+        raise ValueError(f"{pooling} requires normalization in {sorted(allowed[0])} and "
+                         f"pool_centering in {sorted(allowed[1])}; changing pooling requires fresh training.")
+    if (isinstance(normalization_epsilon, bool) or not isinstance(normalization_epsilon, (int, float))
+            or not math.isfinite(normalization_epsilon) or normalization_epsilon <= 0):
+        raise ValueError("normalization_epsilon must be finite and positive.")
+
+
 class DeepSetsEncoder(nn.Module):
-    """PDF-defined Deep Sets encoder over only active MSI peaks."""
+    """Sparse occurrence or intensity-weighted dictionary spectral pooling."""
 
     def __init__(
         self,
@@ -22,6 +39,9 @@ class DeepSetsEncoder(nn.Module):
         initialize_embeddings: bool = True,
         peak_mlp_residual: bool = False,
         pool_centering: str = "none",
+        pooling: str = "occurrence_mlp",
+        normalization: str = "count",
+        normalization_epsilon: float = 1.0e-8,
     ) -> None:
         """Initialize the learnable peak dictionary and Deep Sets MLPs.
 
@@ -39,15 +59,22 @@ class DeepSetsEncoder(nn.Module):
                 compatibility wrapper must first construct aggregation layers.
             peak_mlp_residual (bool): Enable normalized equal-width hidden skips.
             pool_centering (str): Subtract the dropout-free zero-input reference
-                for nonempty spectra when set to ``zero_input``.
+                for nonempty occurrence pools with ``zero_input``, or subtract
+                the transformed vocabulary mean with ``dictionary_mean``.
+            pooling (str): Historical ``occurrence_mlp`` or
+                ``intensity_weighted_dictionary`` sparse projection.
+            normalization (str): Occurrence ``count`` or dictionary ``l1``/``l2``.
+            normalization_epsilon (float): Positive dictionary row-norm floor.
 
         Returns:
             None: Module parameters are initialized.
         """
 
         super().__init__()
-        if pool_centering not in {"none", "zero_input"}:
-            raise ValueError("pool_centering must be none or zero_input.")
+        validate_pooling(pooling, normalization, pool_centering, normalization_epsilon)
+        self.pooling = pooling
+        self.normalization = normalization
+        self.normalization_epsilon = float(normalization_epsilon)
         self.pool_centering = pool_centering
         self.peak_mlp_residual = peak_mlp_residual
         self.num_peaks = int(num_peaks)
@@ -68,6 +95,44 @@ class DeepSetsEncoder(nn.Module):
         if initialize_embeddings:
             nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
 
+    def effective_dictionary(self) -> torch.Tensor:
+        """Transform every peak once, sharing dropout across all rows in this call.
+
+        The result is invocation-local: no detached cache can outlive an update.
+        Occurrence pooling has intensity-conditioned responses, not a dictionary.
+        """
+        if self.pooling != "intensity_weighted_dictionary":
+            raise ValueError("occurrence_mlp has no intensity-independent effective dictionary.")
+        return self._transform_dictionary(self.embedding.weight)
+
+    def _transform_dictionary(self, embeddings: torch.Tensor) -> torch.Tensor:
+        # The explicit tensor argument also tells checkpoint which device RNG
+        # to preserve. A closure-only call does not capture CUDA dropout state.
+        values = self.peak_mlp(embeddings)
+        if self.pool_centering == "dictionary_mean":
+            values = values - values.mean(dim=0, keepdim=True)
+        return values
+
+    def _dictionary_pool(self, dictionary: torch.Tensor, peak_indices: torch.Tensor,
+                         intensities: torch.Tensor, sample_indices: torch.Tensor,
+                         peak_counts: torch.Tensor) -> torch.Tensor:
+        # Intensities have already been transformed by the data loader. Coalesce
+        # before norms so duplicate entries denote a single combined peak.
+        matrix = torch.sparse_coo_tensor(
+            torch.stack((sample_indices, peak_indices)), intensities,
+            (peak_counts.numel(), self.num_peaks), device=dictionary.device,
+            dtype=dictionary.dtype).coalesce()
+        values = matrix.values()
+        row_norm = values.new_zeros(peak_counts.numel())
+        row_norm = row_norm.index_add(0, matrix.indices()[0],
+                                     values.square() if self.normalization == "l2" else values)
+        if self.normalization == "l2":
+            denominator = row_norm.clamp_min(self.normalization_epsilon ** 2).sqrt()
+        else:
+            denominator = row_norm.clamp_min(self.normalization_epsilon)
+        # No nnz-by-output-width occurrence tensor, including during backward.
+        return torch.sparse.mm(matrix, dictionary) / denominator.unsqueeze(-1)
+
     def forward(
         self,
         peak_indices: torch.Tensor,
@@ -75,7 +140,7 @@ class DeepSetsEncoder(nn.Module):
         sample_indices: torch.Tensor,
         peak_counts: torch.Tensor,
     ) -> torch.Tensor:
-        """Mean-pool concatenated sparse peaks into one representation per pixel.
+        """Pool concatenated sparse peaks into one representation per pixel.
 
         Args:
             peak_indices (torch.Tensor): Flattened peak dictionary indices.
@@ -87,6 +152,9 @@ class DeepSetsEncoder(nn.Module):
             torch.Tensor: Pooled representations with shape ``[batch, peak_output_dim]``.
         """
 
+        if self.pooling == "intensity_weighted_dictionary":
+            return self._dictionary_pool(self.effective_dictionary(), peak_indices,
+                                         intensities, sample_indices, peak_counts)
         batch_size = int(peak_counts.numel())
         if peak_indices.numel() == 0:
             pooled = self.embedding.weight.new_zeros(
@@ -136,15 +204,28 @@ class DeepSetsEncoder(nn.Module):
         if chunks is None:
             from dann.execution import spectral_chunks
             chunks = spectral_chunks(peak_counts.detach().cpu().tolist(), peak_budget)
+        dictionary = None
+        if self.pooling == "intensity_weighted_dictionary":
+            if checkpointing and self.training and torch.is_grad_enabled():
+                dictionary = checkpoint(self._transform_dictionary, self.embedding.weight, use_reentrant=False,
+                                        preserve_rng_state=True)
+            else:
+                dictionary = self.effective_dictionary()
         pieces = []
         for start, stop, offset, end in chunks:
             args = (peak_indices[offset:end], intensities[offset:end],
                     sample_indices[offset:end] - start, peak_counts[start:stop])
-            if checkpointing and self.training and torch.is_grad_enabled():
+            if dictionary is not None:
+                piece = self._dictionary_pool(dictionary, *args)
+            elif checkpointing and self.training and torch.is_grad_enabled():
                 piece = checkpoint(DeepSetsEncoder.forward, self, *args,
                                    use_reentrant=False, preserve_rng_state=True)
             else:
                 piece = DeepSetsEncoder.forward(self, *args)
             pieces.append(piece)
             offset = end
+        if not pieces:
+            if dictionary is not None:
+                return self._dictionary_pool(dictionary, peak_indices, intensities, sample_indices, peak_counts)
+            return DeepSetsEncoder.forward(self, peak_indices, intensities, sample_indices, peak_counts)
         return torch.cat(pieces, dim=0)

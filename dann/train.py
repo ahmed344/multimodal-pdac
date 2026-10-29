@@ -135,9 +135,9 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     for name, group in saved_components.items():
         requested_group = requested_components.get(name, {})
         if name == 'spectral_encoder':
-            keys = ('pool_centering', 'peak_mlp_residual')
+            keys = ('pool_centering', 'peak_mlp_residual', 'pooling', 'normalization', 'normalization_epsilon')
             if any(group['deep_sets'][key] != requested_group.get('deep_sets', {}).get(key) for key in keys):
-                raise ValueError('Incompatible spectral centering or MLP residual settings on resume; use saved settings or fresh training.')
+                raise ValueError('Incompatible spectral pooling, normalization, centering or MLP residual settings on resume; use saved settings or fresh training.')
         elif group['type'] == requested_group.get('type') == 'mlp':
             if group['mlp']['residual'] != requested_group['mlp']['residual']:
                 raise ValueError(f'Incompatible {name} MLP residual settings on resume; use saved settings or fresh training.')
@@ -828,6 +828,7 @@ def run_epoch(
     evaluation_callback: Callable[[Mapping, Mapping], None] | None = None,
     monitoring: Mapping[str, Any] | None = None,
     warmup: UpdateWarmup | None = None,
+    update_callback_updates: Sequence[int] | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -1004,7 +1005,8 @@ def run_epoch(
                         record = audit.update(dict(row_ids=torch.cat(group_rows), batches=torch.cat(group_batches),
                             unique_tiles=group.get("tiles", len(cpu_batch.get("occupancy", ())))))
                         group_rows, group_batches = [], []
-                    if update_callback is not None:
+                    if update_callback is not None and (update_callback_updates is None
+                            or state.optimizer_updates in update_callback_updates):
                         if device.type == 'cuda':
                             torch.cuda.synchronize(device)
                         if hasattr(loader.sampler, 'row_budget'):
@@ -1280,11 +1282,16 @@ def summarize_target_validity(bundle: DataBundle, config: Mapping[str, Any]) -> 
     return summary
 
 
-def train_model(config: Mapping[str, Any]) -> Path:
+def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
+                observer_updates: Sequence[int] = (1, 5, 10)) -> Path:
     """Train adversarial latent fusion and save best/latest checkpoints.
 
     Args:
         config (Mapping[str, Any]): Effective DANN configuration.
+        observer (Callable | None): Optional read-only callback with event, model,
+            bundle, effective config, and update record. RNG and module modes are
+            restored after observation; callbacks must not mutate parameters.
+        observer_updates (Sequence[int]): Completed optimizer updates to observe.
 
     Returns:
         Path: Best validation checkpoint path.
@@ -1334,8 +1341,27 @@ def train_model(config: Mapping[str, Any]) -> Path:
         num_batches=len(bundle.metadata.batch_names),
         num_targets=len(config["data"]["target_columns"]),
     ).to(device)
+    def observe(event, record=None):
+        if observer is None:
+            return
+        import random
+        python_rng, numpy_rng = random.getstate(), np.random.get_state()
+        modes = {module: module.training for module in model.modules()}
+        try:
+            with torch.random.fork_rng(), torch.no_grad():
+                model.eval()
+                observer(event, model, bundle, config, record or {})
+        finally:
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+            for module, mode in modes.items():
+                module.training = mode
+    if not resume:
+        observe('parameters_initialized')
     initialization = (resume_payload.get("head_initialization", {"resumed_without_reinitialization": True})
                       if resume else initialize_supervised_heads(model, bundle, config))
+    if not resume:
+        observe('heads_initialized', {'head_initialization': initialization})
     ziln_loss = ZILNLoss.from_config(config).to(device)
     class_weights = (
         bundle.batch_class_weights.to(device)
@@ -1465,6 +1491,9 @@ def train_model(config: Mapping[str, Any]) -> Path:
                 progress_state=progress_state,
                 grl_horizon_updates=training.get("grl_horizon_updates"),
                 warmup=warmup,
+                update_callback=(lambda record: observe('update', record)
+                    if record['optimizer_updates'] in observer_updates else None) if observer is not None else None,
+                update_callback_updates=observer_updates,
             )
             validation_metrics = run_epoch(
                 model=model,

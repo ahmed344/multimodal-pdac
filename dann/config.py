@@ -319,10 +319,14 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
     spectral = settings["spectral_encoder"]["deep_sets"]
     spectral.setdefault("peak_mlp_residual", False)
     spectral.setdefault("pool_centering", "none")
+    spectral.setdefault("pooling", "occurrence_mlp")
+    spectral.setdefault("normalization", "count")
+    spectral.setdefault("normalization_epsilon", 1.0e-8)
     if not isinstance(spectral["peak_mlp_residual"], bool):
         raise ValueError("peak_mlp_residual must be boolean.")
-    if spectral["pool_centering"] not in ("none", "zero_input"):
-        raise ValueError("pool_centering must be none or zero_input.")
+    from dann.model_components.deep_sets import validate_pooling
+    validate_pooling(*(spectral[key] for key in
+                       ("pooling", "normalization", "pool_centering", "normalization_epsilon")))
     positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
                 spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
                 model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144),

@@ -1,14 +1,101 @@
 # Adversarial Latent Fusion
 
 This package fits sparse MALDI-MSI to four IHC targets and exports a shared latent
-representation. MSI stays sparse, either backed or resident in RAM, until Deep Sets mean-pools the
-intensity-weighted learned peak embeddings. Aggregation and the prediction
+representation. MSI stays sparse, either backed or resident in RAM, until the spectral encoder
+pools learned peak responses. Aggregation and the prediction
 heads can independently use MLPs, local spatial CNNs, or residual GATv2 attention.
 
 The four biology targets each use a structural-zero hurdle with three parameters:
 zero probability `pi`, positive logit mean `mu`, and positive logit standard
 deviation `sigma`. A gradient reversal layer trains the shared latent space to
 confuse the batch discriminator while preserving IHC prediction.
+
+## Spectral pooling
+
+`model.spectral_encoder.deep_sets` selects either `pooling: occurrence_mlp`
+with `normalization: count` (the historical default), or
+`pooling: intensity_weighted_dictionary` with `normalization: l1` or `l2`.
+Omitted fields reconstruct occurrence pooling; the checked-in configuration
+retains that selection. Changing pooling, normalization, centering, or the
+normalization floor requires fresh training.
+
+Occurrence pooling applies the peak MLP separately to each intensity-scaled
+embedding, retaining its original dropout, stored-entry counts, and
+`pool_centering: none | zero_input` behavior. Dictionary pooling transforms all
+embeddings once per encoder invocation, then multiplies the sparse transformed
+intensities by that dictionary. `pool_centering: dictionary_mean` subtracts the
+mean transformed peak vector; `none` leaves it uncentered. A dictionary has one
+shared dropout realization across occurrences and internal spectral chunks.
+No persistent dictionary cache survives an invocation or a parameter update.
+
+With transformed intensities `I` (currently `log1p`), dictionary pooling is
+`g = I @ v / d`, where `v[p] = peak_mlp(e[p]) - mean_q peak_mlp(e[q])` when
+centered. L1 uses `d = max(sum(I), epsilon)`; L2 uses
+`d = sqrt(max(sum(I**2), epsilon**2))`, with
+`normalization_epsilon: 1.0e-8`. Duplicate entries are added **after** intensity
+transformation and **before** row norms. Explicit zeros do not change the result;
+empty spectra pool to zero with finite gradients. Sparse multiplication avoids
+an active-occurrences by output-width tensor. There is no abundance channel.
+Both norms remove positive global scaling above the floor; L2 has a different
+row-dependent scale, so absolute latent variance alone is not a quality metric.
+
+Checkpoint architecture version 8 records these semantics. Versions 2–7 keep
+their original occurrence pooling and residual/centering interpretation, with
+unchanged parameter registration and seeded draws. Existing raw-embedding
+visualizations remain raw embeddings; an occurrence encoder does not have a
+single intensity-independent transformed dictionary.
+
+## Matched dictionary comparison
+
+The isolated comparison runner uses `train_model` and optional observational
+hooks. It checks identical seeded parameters, train-only head initialization,
+feature order, targets, and saved splits against
+`he10_biology2_discriminator1_non_centered` before fitting. The root YAML keeps
+occurrence pooling. Explicit L1/L2 configurations, immutable manifest, initial
+snapshots, logs, and per-stage completion records live beneath a new directory:
+
+```bash
+python -m dann.verification.dictionary_comparison --output NEW_DIRECTORY --prepare
+python -m dann.verification.dictionary_comparison --output NEW_DIRECTORY --run
+```
+
+`--run` executes isolated real-data smoke workflows for both norms, sequential
+full fits (300-epoch maximum, existing early stopping, full 224,100-update GRL
+horizon), then the configured downstream workflows and matched diagnostics.
+Rerunning validates completed stages; an interrupted fit resumes its compatible
+`latest.pt`. To retry one stage, use `--arm l1 --stage analysis` (also `l2` and
+`baseline`; stages include `smoke`, `train`, `inference`, `spatial_heatmaps`,
+`latent_variance`, and `diagnostics`). Historical outputs are validated and reused;
+missing diagnostics are written only in the comparison directory.
+
+`report.html` is an offline report with CSV/JSON metrics and PNG/PDF figures.
+All probes use the same at-most-65,536 proportionally slide-stratified training
+rows, train-fitted scaling, and complete validation split. CD8 thresholds and
+stromal quartiles are frozen from training. Patient bootstrap intervals are
+paired across the fitted models and do not estimate variation across training
+seeds. Initial/early observations preserve Python, NumPy, and PyTorch RNG and
+module modes; historical early measurements that were not saved stay unavailable.
+The comparison is specific to the configured PDAC data and baseline. H&E-to-Visium
+transfer is assessed separately.
+
+To extend a completed comparison with peak-vector and family quality diagnostics:
+
+```bash
+python -m dann.verification.peak_comparison --comparison COMPARISON_DIRECTORY
+```
+
+This writes `peak_comparison/report.html`, CSV tables, numerical arrays, and
+PNG/PDF figures. It compares the original raw-embedding families with families
+formed from the effective dictionaries; the historical encoder instead uses
+intensity-conditioned responses at three training-derived intensity levels.
+Family IDs are matched by peak overlap. Held-out within-slide IHC associations
+are reported both directly and after controlling for total transformed intensity
+and positive peak count, with paired patient intervals. Neighbor and family
+association coherence use training-prevalence/intensity-matched permutation
+controls and an unlearned nearest-m/z control. Baseline initialization comparisons
+use a reconstructed common-seed reference, not a saved historical initialization.
+These are descriptive peak-quality checks, not molecular annotations
+or independent validation of the selected models.
 
 ## Raw H&E auxiliary prediction
 
@@ -2623,8 +2710,10 @@ synchronous and asynchronous checkpoints save its resolved horizon, base rates,
 and completed updates. Enabled-warmup resumes reject missing or inconsistent state.
 Existing epoch-only resume restrictions still apply to partial-epoch checkpoints.
 
-New checkpoints use architecture contract version 7. Versions 2–6 reconstruct
-historical MLP and pooling behavior. Changing centering or residual semantics is
+Stabilization settings were introduced in architecture contract version 7;
+new checkpoints use version 8 with explicit spectral pooling and normalization.
+Versions 2–7 reconstruct their historical MLP and pooling behavior. Changing
+pooling, normalization, centering, or residual semantics is
 incompatible with loading those weights as a new architecture; start a fresh fit.
 Inference target order, prediction fields, sparse processing, and frozen target
 transformation contracts are unchanged.

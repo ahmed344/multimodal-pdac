@@ -215,7 +215,7 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     resolve_execution(c)
     path = train_model(c)
     payload = torch.load(path, weights_only=False)
-    assert payload['architecture']['version'] == 7
+    assert payload['architecture']['version'] == 8
     assert payload['software_versions']['torch_geometric']
     c['training'].update(epochs=2, resume_checkpoint=str(Path(c['training']['output_dir'])/'latest.pt'))
     train_model(c)

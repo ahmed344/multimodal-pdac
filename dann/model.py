@@ -29,11 +29,13 @@ class IntensityWeightedPeakEncoder(DeepSetsEncoder):
     def __init__(self, num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
                  aggregation_hidden_dims, latent_dim, activation="gelu", dropout=0.,
                  use_layer_norm=True, inference_peak_chunk_size=262144,
-                 peak_mlp_residual=False, pool_centering="none", aggregation_residual=False):
+                 peak_mlp_residual=False, pool_centering="none", aggregation_residual=False,
+                 pooling="occurrence_mlp", normalization="count", normalization_epsilon=1.0e-8):
         super().__init__(num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
                          activation, dropout, use_layer_norm, inference_peak_chunk_size,
                          initialize_embeddings=False, peak_mlp_residual=peak_mlp_residual,
-                         pool_centering=pool_centering)
+                         pool_centering=pool_centering, pooling=pooling,
+                         normalization=normalization, normalization_epsilon=normalization_epsilon)
         self.aggregation_mlp = MLPAggregation(
             peak_output_dim, aggregation_hidden_dims, latent_dim, activation=activation,
             dropout=dropout, use_layer_norm=use_layer_norm, residual=aggregation_residual)
