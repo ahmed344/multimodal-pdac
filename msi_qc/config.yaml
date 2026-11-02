@@ -1,0 +1,19 @@
+input: data/PDAC/Raw/adata_assembled_tissue.h5ad
+output: data/PDAC/Results/msi_noise_qc
+layer: counts
+block_rows: 8192
+seed: 42
+thresholds: [0, 0.01, 0.025, 0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1, 2, 5]
+retained_signal_min: 0.99
+retained_measurements_min: 0.95
+spatial_pairs: 20000
+shuffles: 20
+min_spatial_detections: 100
+spatial_support_excess: 0.1
+spatial_weak_excess: 0.02
+weak_intensity_screen: 0.5
+weak_fraction_screen: 0.5
+prevalence_screens: [0.001, 0.005, 0.01]
+mad_multiplier: 3
+sample_values_per_slide: 200000
+example_slides: 6
