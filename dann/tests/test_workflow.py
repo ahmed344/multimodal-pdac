@@ -23,6 +23,7 @@ from dann.targets import target_contract
 @pytest.fixture
 def run(tmp_path):
     config = load_config(Path('dann/config.yaml'))
+    config['data'].pop('preprocessing_fingerprint', None)  # Synthetic checkpoint/input contract.
     config['results'].update(root=str(tmp_path / 'requested'), run_name='fit')
     config['model']['aggregation']['type'] = 'mlp'
     for head in config['model']['heads'].values():

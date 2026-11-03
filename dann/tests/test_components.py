@@ -39,6 +39,7 @@ def spatial_config(tmp_path):
     tissue.write_h5ad(tmp_path/'tissue.h5ad')
     tissue[np.arange(0, len(keys), 2)].copy().write_h5ad(tmp_path/'labels.h5ad')
     config = load_config(Path('dann/config.yaml'))
+    config['data'].pop('preprocessing_fingerprint', None)  # This fixture supplies unprocessed synthetic inputs.
     # Keep historical tests independent of editable stabilization defaults.
     config['training']['warmup']['epochs'] = 0
     config['training']['head_initialization']['enabled'] = False

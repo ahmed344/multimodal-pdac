@@ -130,6 +130,9 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
         checkpoint learning rate stays in place.
     """
 
+    if (saved_config.get('data', {}).get('preprocessing_fingerprint')
+            != requested_config.get('data', {}).get('preprocessing_fingerprint')):
+        raise ValueError('Changed MSI preprocessing requires fresh training; cannot resume this checkpoint.')
     saved_components = architecture_contract(saved_config)['components'] if 'model' in saved_config else {}
     requested_components = architecture_contract(requested_config)['components'] if 'model' in requested_config else {}
     for name, group in saved_components.items():

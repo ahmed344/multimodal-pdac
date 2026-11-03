@@ -883,6 +883,8 @@ def _run_inference(
     identity = saved_checkpoint.get("data_identity")
     if identity is not None and list(read_axis_names(input_path, "var").astype(str)) != identity["feature_order"]:
         raise ValueError("Inference feature order differs from frozen checkpoint.")
+    from dann.preprocessing import validate_preprocessing
+    validate_preprocessing(input_path, data_config)
     total_rows = validate_input_schema(
         input_path=input_path,
         training_path=Path(data_config["path"]),

@@ -86,8 +86,11 @@ def row_identity(path: Path, data: Mapping[str, Any]) -> dict[str, Any]:
             key = key.decode()
         frame.index.name = None if key == '_index' else key
         digest = hashlib.sha256(pd.util.hash_pandas_object(frame.astype(str), index=True).values.tobytes()).hexdigest()
-        return {'row_digest': digest, 'rows': len(frame),
-                'feature_order': list(_axis_names(handle['var']))}
+        result = {'row_digest': digest, 'rows': len(frame),
+                  'feature_order': list(_axis_names(handle['var']))}
+        if 'uns/msi_preprocess/fingerprint' in handle:
+            result['preprocessing_fingerprint'] = str(read_elem(handle['uns/msi_preprocess/fingerprint']))
+        return result
 
 
 class SpatialTileDataset(Dataset):

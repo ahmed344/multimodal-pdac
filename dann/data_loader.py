@@ -573,6 +573,8 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
     data_config = config["data"]
     training_config = config["training"]
     path = Path(data_config["path"])
+    from dann.preprocessing import validate_preprocessing
+    preprocessing = validate_preprocessing(path, data_config)
     metadata = load_anndata_metadata(
         path,
         data_config["target_columns"],
@@ -597,6 +599,10 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         from dann.tiles import row_identity
         if row_identity(path, data_config) != saved_identity:
             raise ValueError("Checkpoint row identities or feature order differ from input data.")
+    if preprocessing is not None:
+        validate_preprocessing(path, data_config, training_rows=split_indices["train"])
+        if saved_splits is not None and not np.isin(saved_splits["train"], split_indices["train"]).all():
+            raise ValueError("Saved training rows cross the frozen preprocessing split.")
     if saved_splits is not None:
         split_indices = {key: np.asarray(value, dtype=np.int64).copy()
                          for key, value in saved_splits.items()}

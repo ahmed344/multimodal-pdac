@@ -169,7 +169,7 @@ def training_data_contract(config: Mapping[str, Any], identity=None) -> dict[str
     """Record the labeled-only source and allowed held-out spectral context."""
     from pathlib import Path
     from dann.tiles import row_identity
-    return {
+    contract = {
         'version': 1,
         'spectra_source': 'data.path',
         'context_source': 'data.path',
@@ -178,6 +178,10 @@ def training_data_contract(config: Mapping[str, Any], identity=None) -> dict[str
         'labeled_path': str(Path(config['data']['path']).resolve()),
         'labeled_identity': identity if identity is not None else row_identity(Path(config['data']['path']), config['data']),
     }
+    if config['data'].get('preprocessing_fingerprint'):
+        contract['preprocessing_fingerprint'] = config['data']['preprocessing_fingerprint']
+        contract['preprocessing_context'] = 'whole_tissue_MSI_without_IHC_or_HE_labels'
+    return contract
 
 
 def validate_training_data_contract(checkpoint: Mapping[str, Any], config: Mapping[str, Any]) -> None:

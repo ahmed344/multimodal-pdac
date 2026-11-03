@@ -10,6 +10,15 @@ zero probability `pi`, positive logit mean `mu`, and positive logit standard
 deviation `sigma`. A gradient reversal layer trains the shared latent space to
 confuse the batch discriminator while preserving IHC prediction.
 
+The study configuration uses the linear MSI exports from
+[`msi_preprocess`](../msi_preprocess/README.md), retaining `matrix_key: X` and
+`intensity_transform: log1p`. Preprocessing fits use the uncapped DANN training
+partition; spatial cleaning uses whole-tissue MSI image context before lesion
+extraction. The input fingerprint and fitting split are checked by the loader.
+Changed preprocessing requires fresh training; an older checkpoint cannot be
+resumed with the new fingerprint. The training/inference files share fitted
+parameters, feature order, and exactly matching lesion values.
+
 ## Spectral pooling
 
 `model.spectral_encoder.deep_sets` selects either `pooling: occurrence_mlp`

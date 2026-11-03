@@ -1,0 +1,39 @@
+# Counts already contain acquisition RMS normalization. Thresholds below are
+# operational screens, not estimates of an instrumental noise floor.
+lesion_input: data/PDAC/Raw/adata_assembled.h5ad
+tissue_input: data/PDAC/Raw/adata_assembled_tissue.h5ad
+output: data/PDAC/Processed/msi_preprocess
+dann_config: dann/config.yaml
+patient_column: patient
+stages:
+  selection: true
+  integration: true
+  local: true
+selection:
+  weak_intensity_screen: 0.5
+  weak_fraction_screen: 0.5
+  spatial_weak_excess: 0.02
+  spatial_support_excess: 0.10
+  min_spatial_detections: 100
+  spatial_pairs: 20000
+  shuffles: 20
+  patch_pixels: 4
+integration:
+  prevalence: 0.10
+  slide_fraction: 0.80
+  support_fraction: 0.50
+  min_anchors: 32
+  max_correction: 2.0
+local:
+  weak_boundary: 0.5
+  sensitivity: [0.1, 0.2, 0.3, 0.5, 1.0]
+  draws: 1024
+  envelope: 0.95
+  min_neighbors: 2
+seed: 42
+block_rows: 8192
+feature_block: 32
+application_workers: 4  # Bounded independent feature blocks; numerical results do not change.
+memory_gib: 16
+disk_reserve_gib: 4
+report_peaks: 6

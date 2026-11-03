@@ -9,8 +9,9 @@ latent_variance:
   figure_dpi: 300  # Resolution of the explained-variance PNG.
 
 data:
-  path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled.h5ad  # Sole source of supervised spectra, neighborhoods, labels, and split masks.
-  context_path: /workspaces/multimodal-pdac/data/PDAC/Raw/adata_assembled_tissue.h5ad  # Inference-only input; never used by supervised training, validation, or test.
+  preprocessing_fingerprint: 4e61e0e4b5679a0af0446486134dfd1dbeffe3ccc3bb25d568347690a613bd41  # Changed inputs require fresh training.
+  path: "/workspaces/multimodal-pdac/data/PDAC/Processed/msi_preprocess/lesion.h5ad"  # Cleaned lesion spectra; preprocessing used whole-tissue MSI image context.
+  context_path: "/workspaces/multimodal-pdac/data/PDAC/Processed/msi_preprocess/tissue.h5ad"  # Matching cleaned whole tissue for inference; fitted parameters are frozen.
   he_features_key: hes_features  # Raw ordered UNI2-h targets in obsm.
   matrix_key: X  # CSR source: X or layers/<layer_name>; feature order must match across files.
   batch_column: batch  # Slide identity for splitting, grid alignment, and adversarial labels; never a model input.
@@ -31,8 +32,8 @@ data:
   max_test_samples: null  # Optional stratified cap on test labels.
 
 model:
-  num_peaks: 5808  # Number of aligned m/z bins in both MSI files.
-  latent_dim: 256  # Aggregation output width; this is the exported latent before either head.
+  num_peaks: 4964  # Number of aligned m/z bins in both MSI files.
+  latent_dim: 512  # Aggregation output width; this is the exported latent before either head.
 
   # 1. Per-pixel spectral processing: learned embeddings -> intensity weighting
   #    -> per-peak MLP -> mean pooling over active peaks. Empty spectra pool to zero.
@@ -44,16 +45,16 @@ model:
       normalization_epsilon: 1.0e-8  # Positive row-norm floor for dictionary pooling.
       peak_mlp_residual: true  # Normalized skips around equal-width hidden blocks.
       pool_centering: zero_input  # occurrence: none/zero_input; dictionary: none/dictionary_mean.
-      embedding_dim: 128  # Width of each learned peak embedding.
-      peak_hidden_dims: [256, 256]  # Hidden widths of the original per-peak MLP.
-      peak_output_dim: 256  # Pooled pixel width passed to the aggregation component.
+      embedding_dim: 256  # Width of each learned peak embedding.
+      peak_hidden_dims: [512, 512]  # Hidden widths of the original per-peak MLP.
+      peak_output_dim: 512  # Pooled pixel width passed to the aggregation component.
 
   # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
     type: mlp  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
       residual: true
-      hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
+      hidden_dims: [512, 512]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
       channels: 128  # Pointwise input projection and hidden convolution width.
       depth: 3  # Number of 3x3, stride-one convolutions; spatial radius equals depth.
@@ -324,7 +325,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: he10_biology2_discriminator1_non_centered  # Fresh full fit, separate from the baseline and pilot.
+  run_name: he10_biology2_discriminator1_512_occurrence_mlp_count_zero_input  # 512-wide occurrence-MLP fit; dictionary arms use separate configs.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.

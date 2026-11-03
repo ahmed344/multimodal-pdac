@@ -174,6 +174,10 @@ def load_config(path: Path) -> dict[str, Any]:
         raise ValueError(f"Data split fractions must sum to one, observed {fractions}.")
     if any(value < 0.0 for value in fractions):
         raise ValueError("Data split fractions cannot be negative.")
+    fingerprint = config['data'].get('preprocessing_fingerprint')
+    if fingerprint is not None and (not isinstance(fingerprint, str) or len(fingerprint) != 64
+                                    or any(c not in '0123456789abcdef' for c in fingerprint)):
+        raise ValueError('data.preprocessing_fingerprint must be a SHA-256 hex string or null.')
     max_samples = config["analysis"].get("max_samples")
     if max_samples is not None and (
         isinstance(max_samples, bool)

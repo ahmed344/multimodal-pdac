@@ -365,6 +365,7 @@ def test_normal_checkpoint_round_trip(tmp_path: Path, tiny_h5ad: Path) -> None:
     config["training"]["warmup"]["epochs"] = 0  # Historical fixed-LR checkpoint contract.
     config["training"]["head_initialization"]["enabled"] = False
     config["data"]["path"] = str(tiny_h5ad)
+    config["data"].pop("preprocessing_fingerprint", None)
     config["training"].update(num_workers=0, batch_size=2, validation_batch_size=2)
     for key in ("spectral_encoder", "aggregation", "heads"):
         config["model"].pop(key)
@@ -534,6 +535,7 @@ def test_resume_optimizer_keeps_saved_learning_rate(tmp_path: Path, tiny_h5ad: P
     config["training"]["warmup"]["epochs"] = 0  # Historical fixed-LR checkpoint contract.
     config["training"]["head_initialization"]["enabled"] = False
     config["data"]["path"] = str(tiny_h5ad)
+    config["data"].pop("preprocessing_fingerprint", None)
     config["training"].update(num_workers=0, batch_size=2, validation_batch_size=2, learning_rate=0.01)
     for key in ("spectral_encoder", "aggregation", "heads"):
         config["model"].pop(key)
