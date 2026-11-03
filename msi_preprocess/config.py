@@ -19,20 +19,34 @@ def validate_config(config: dict[str, Any]) -> None:
     """Validate numerical settings before opening inputs or creating artifacts."""
     if not isinstance(config, dict):
         raise ValueError("Preprocessing settings must be a mapping.")
+    exclusions = config.setdefault("exclude_slides", {})
+    if not isinstance(exclusions, dict) or any(
+            not isinstance(key, str) or not key or not isinstance(reason, str) or not reason.strip()
+            for key, reason in exclusions.items()):
+        raise ValueError("exclude_slides must map slide IDs to nonempty manual QC reasons.")
     for key in ("lesion_input", "tissue_input", "output", "dann_config", "patient_column"):
         if not isinstance(config.get(key), str) or not config[key]:
             raise ValueError(f"{key} must be a nonempty string.")
-    for group in ("stages", "selection", "integration", "local"):
+    for group in ("stages", "selection", "integration", "local", "coordinate_columns", "report"):
         if not isinstance(config.get(group), dict):
             raise ValueError(f"Missing settings: {group}")
     for key in ("selection", "integration", "local"):
         if type(config["stages"].get(key)) is not bool:
             raise ValueError(f"stages.{key} must be boolean.")
+    for key in ("batch_column", "x_column", "y_column"):
+        if not isinstance(config["coordinate_columns"].get(key), str) or not config["coordinate_columns"][key]:
+            raise ValueError(f"coordinate_columns.{key} must be a nonempty string.")
+    percentile = config["report"].get("upper_percentile", 99.5)
+    if not np.isfinite(percentile) or not 0 < percentile <= 100:
+        raise ValueError("report.upper_percentile must be in (0, 100].")
+    max_peaks = config["report"].get("max_peaks", 500)
+    if type(max_peaks) is not int or max_peaks < 1:
+        raise ValueError("report.max_peaks must be a positive integer.")
     workers = config.get("application_workers", 4)
     if type(workers) is not int or workers < 1:
         raise ValueError("application_workers must be a positive integer.")
     integers = [(config, k, 1) for k in ("block_rows", "feature_block", "report_peaks")]
-    integers += [(config, "seed", 0)]
+    integers += [(config, "seed", 0), (config["report"], "pixels_per_slide", 1)]
     integers += [(config["selection"], k, 1) for k in
                  ("min_spatial_detections", "spatial_pairs", "shuffles")]
     integers += [(config["selection"], "patch_pixels", 4),
@@ -46,7 +60,7 @@ def validate_config(config: dict[str, Any]) -> None:
     positive = [(config, k) for k in ("memory_gib", "disk_reserve_gib")]
     positive += [(config["selection"], k) for k in
                  ("weak_intensity_screen", "spatial_weak_excess", "spatial_support_excess")]
-    positive += [(config["local"], "weak_boundary"), (config["integration"], "max_correction")]
+    positive += [(config["local"], "weak_boundary"), (config["integration"], "multiplier_min"), (config["integration"], "multiplier_max")]
     for group, key in positive:
         if not np.isfinite(group.get(key, np.nan)) or group[key] <= 0:
             raise ValueError(f"{key} must be positive and finite.")
@@ -58,8 +72,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"{key} must be in (0, 1].")
     if config["selection"]["spatial_weak_excess"] >= config["selection"]["spatial_support_excess"]:
         raise ValueError("Weak excess must be smaller than supported excess.")
-    if config["integration"]["max_correction"] < 1:
-        raise ValueError("max_correction must be >= 1.")
+    if not config["integration"]["multiplier_min"] <= 1 <= config["integration"]["multiplier_max"]:
+        raise ValueError("Multiplier bounds must contain 1.")
     cuts = np.asarray(config["local"].get("sensitivity"), dtype=float)
     if (cuts.ndim != 1 or len(cuts) == 0 or not np.isfinite(cuts).all()
             or np.any(cuts <= 0) or np.any(np.diff(cuts) <= 0)):

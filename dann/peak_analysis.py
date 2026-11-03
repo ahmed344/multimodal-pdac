@@ -358,6 +358,8 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
         output.mkdir(parents=True, exist_ok=True)
         destination = output/'peaks'
         source = Path(data['path'])
+        from dann.preprocessing import artifact_preprocessing
+        preprocessing = artifact_preprocessing(source, data)
         sources = {'labeled': source_identity(source)}
         progress.set_phase('metadata and checkpoint validation')
         frame, features = read_peak_metadata(source, data, settings['lesion_column'])
@@ -378,7 +380,7 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
         del checkpoint
         cache = StageCache(output/'.analysis-cache', execution['cache_policy'], progress)
         versions = {name: importlib.metadata.version(name) for name in ('numpy', 'scipy', 'umap-learn', 'numba', 'pynndescent')}
-        common = dict(version=1, checkpoint=digest, sources=sources.copy(), identity=identity,
+        common = dict(version=1, checkpoint=digest, sources=sources.copy(), identity=identity, cohort=preprocessing,
                       versions=versions, matrix=data['matrix_key'])
         progress.details.update(settings=settings, execution=execution, checkpoint=str(checkpoint_path),
                                 source_identity=common, cache_hits=[], correlation_split=correlation_split,
@@ -387,7 +389,7 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
                                 preprocessing={key: data[key] for key in
                                     ('matrix_key', 'nonzero_threshold', 'intensity_transform', 'intensity_clip_max')})
         check_host_budget(performance, 64*len(weights)**2)
-        family_key = dict(version=1, checkpoint=digest, count=analysis['family_count'], linkage='average', versions=versions)
+        family_key = dict(version=1, checkpoint=digest, count=analysis['family_count'], linkage='average', versions=versions, cohort=preprocessing)
         progress.set_phase('embedding hierarchy')
         tree = _cached(cache, 'peak-hierarchy', family_key, lambda: family_hierarchy(weights, analysis['family_count']))
         families, order = tree['families'], tree['order']
@@ -495,6 +497,7 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
                                    stats['slides'], analysis, target_contract(config))
             if settings['spatial']:
                 tissue_path = Path(spatial_input or data['context_path'])
+                artifact_preprocessing(tissue_path, data)
                 sources['tissue'] = source_identity(tissue_path)
                 progress.set_phase('tissue metadata')
                 tissue, tissue_features = read_peak_metadata(tissue_path, data, settings['lesion_column'], spatial=True)
@@ -519,7 +522,7 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
                 spatial_metadata = dict(family_ids=unique.tolist(), signal_vmin=0., signal_vmax=limits.tolist(),
                     detection_limits=[0., 100.], signal_percentile=settings['signal_percentile'], signal_cmap=settings['sequential_cmap'],
                     detection_cmap=settings['detection_cmap'], sources=sources,
-                    preprocessing=spatial_key['preprocessing'], family_key=family_key)
+                    preprocessing=spatial_key['preprocessing'], cohort=preprocessing, family_key=family_key)
                 (staged/'family_spatial_settings.json').write_text(json.dumps(spatial_metadata, indent=2))
                 progress.set_phase('spatial parquet and geometry', len(tissue))
                 _write_spatial_table(staged/'family_spatial_activity.parquet', tissue, scores, unique, data,
@@ -535,6 +538,7 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
                     target_label('Density_CD8', target_contract(config)), scores, limits, unique, analysis, settings)
                 del transformed, mask
             progress.details.update(requested_family_count=analysis['family_count'], actual_family_count=len(unique),
+                preprocessing=preprocessing,
                 embedding_shape=list(weights.shape), sources=sources, excluded_from_log_plots=int(np.sum(~np.isfinite(mean) | (mean <= 0))),
                 family_colors=plots.family_colors(len(unique)), effective_render_workers=execution['render_workers'])
             # Plotting uses only immutable mmap arrays; all numerical pools are finished.

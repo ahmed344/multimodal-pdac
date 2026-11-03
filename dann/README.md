@@ -2771,3 +2771,10 @@ recomputation preserves RNG with dropout enabled. The width-1024 comparisons use
 this path with a 262144-peak budget in both learning-rate arms because the direct
 path exhausted the RTX 5090 during gradient monitoring. The failed attempt is
 retained separately and excluded from comparison tables.
+
+Schema 3 MSI preprocessing declares the retained study cohort and exact source
+row mappings. DANN validates that cohort, removes unused slide categories before
+encoding domains, and rejects mismatched checkpoints and downstream artifacts by
+preprocessing fingerprint. The `_qc40` run uses fresh training on 40 retained
+slides with the existing seeded 90%/10% within-slide split. See
+[preprocessing workflow](../msi_preprocess/README.md) for exclusions and rollout checks.

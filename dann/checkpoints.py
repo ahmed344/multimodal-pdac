@@ -108,6 +108,8 @@ def legacy_parameter_conversion(state: Mapping[str, Any]) -> dict[str, Any]:
 def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any],
                         model=None, optimizer: bool = False) -> None:
     """Reject architecture or optimizer registration changes before loading state."""
+    if checkpoint['config']['data'].get('preprocessing_fingerprint') != config['data'].get('preprocessing_fingerprint'):
+        raise ValueError('Changed MSI preprocessing requires fresh training; incompatible checkpoint.')
     saved = architecture_contract(checkpoint_config(checkpoint))
     requested = architecture_contract(config)
     if saved != requested:

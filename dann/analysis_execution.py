@@ -593,6 +593,8 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
                                 feature_cache_active=settings['feature_cache'] and fast)
         data = config['data']
         source = Path(data['path'])
+        from dann.preprocessing import artifact_preprocessing
+        preprocessing = artifact_preprocessing(source, data)
         stat = source.stat()
         identity = row_identity(source, data)
         if checkpoint.get('data_identity') is not None and checkpoint['data_identity'] != identity:
@@ -615,7 +617,7 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
                      'numba', 'pynndescent', 'llvmlite')}
         common = dict(version=1, checkpoint=checkpoint_digest, source=(str(source.resolve()),
                       stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns), identity=identity,
-                      versions=versions)
+                      versions=versions, preprocessing=preprocessing)
         progress.details.update(source_identity=common, checkpoint=str(checkpoint_path),
                                 checkpoint_epoch=int(checkpoint['epoch'])+1)
         cache = StageCache(output / '.analysis-cache', settings['cache_policy'], progress)
@@ -635,7 +637,7 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
             if hit is not None:
                 extracted_by_split[split] = hit[0]
         missing = [split for split in splits if split not in extracted_by_split]
-        peptide_key = dict(checkpoint=common['checkpoint'], versions=versions, version=1,
+        peptide_key = dict(checkpoint=common['checkpoint'], versions=versions, version=1, preprocessing=preprocessing,
                            family_count=config['analysis']['family_count'],
                            linkage=config['analysis']['clustering_linkage'])
         peptide_hit = cache.get('peptides', peptide_key)
@@ -703,7 +705,7 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
         for split in splits:
             extracted = extracted_by_split[split]
             sample_key = dict(version=1, parameters=[fingerprint(extracted[name]) for name in ('pi', 'mu', 'sigma')],
-                              samples=samples, rng_state=copy.deepcopy(rng.bit_generator.state), numpy=versions['numpy'])
+                              samples=samples, rng_state=copy.deepcopy(rng.bit_generator.state), numpy=versions['numpy'], preprocessing=preprocessing)
             hit = cache.get(f'density-{split}', sample_key)
             progress.set_phase(f'{split} density sampling', extracted['pi'].size, 'parameters')
             if hit is None:
@@ -719,7 +721,7 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
             extracted['target_transform'] = target_contract(config)
 
         extracted = extracted_by_split[splits[0]]
-        umap_key = dict(version=1, latent=fingerprint(extracted['latent']), versions=versions,
+        umap_key = dict(version=1, latent=fingerprint(extracted['latent']), versions=versions, preprocessing=preprocessing,
             settings={key: config['analysis'][key] for key in
                       ('umap_neighbors', 'umap_min_dist', 'umap_metric', 'umap_random_state')})
         progress.details['umap_settings'] = umap_key['settings']
@@ -740,7 +742,7 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
             cache.put('peptides', peptide_key, peptides)
         else:
             peptides = peptide_hit[0]
-        activity_key = dict(source=common['source'], matrix=data['matrix_key'],
+        activity_key = dict(source=common['source'], matrix=data['matrix_key'], preprocessing=preprocessing,
             features=identity, chunk=config['analysis']['activity_chunk_size'],
             cap=config['analysis'].get('activity_max_nonzeros'), version=1, numpy=versions['numpy'])
         hit = cache.get('activity', activity_key)
@@ -762,6 +764,8 @@ def run_optimized_analysis(config: Mapping[str, Any], checkpoint_override: Path 
                 extracted, extracted_by_split[config['analysis']['ziln_scatter_split']], coordinates,
                 peptides, activity, staged, queue.submit, checkpoint=checkpoint, table_writer=queue.table)
             queue.run(settings['render_workers'], performance, progress)
+            from dann.preprocessing import analysis_provenance
+            analysis_provenance(staged, data, write=True)
             progress.set_phase('output validation')
             final_stat = source.stat()
             if any(getattr(stat, key) != getattr(final_stat, key) for key in ('st_size', 'st_mtime_ns', 'st_ctime_ns')):

@@ -40,7 +40,7 @@ def test_metadata_reads_only_required_fields(spatial_config, monkeypatch, encodi
         write_elem(handle['obs'], 'batch', values)
     backed = open_backed_anndata(path)
     expected = backed.obs[data['target_columns']].to_numpy(copy=True)
-    batches = backed.obs[data['batch_column']].astype('category')
+    batches = backed.obs[data['batch_column']].astype('category').cat.remove_unused_categories()
     backed.file.close()
     original = h5py.Group.__getitem__
     def selective(group, name):

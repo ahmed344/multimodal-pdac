@@ -17,14 +17,16 @@ import yaml
 
 from msi_preprocess.apply import apply, clean_slide, update_dann_config
 from msi_preprocess.config import load_config, validate_config
-from msi_preprocess.fit import fit, integration_parameters, load_fit, selection_decisions, training_split
+from msi_preprocess.fit import fit, integration_parameters, load_fit, selection_decisions
 from msi_preprocess.io import axes, check_disk, match_rows
 from msi_preprocess.spatial import neighborhoods, reference_envelopes, removal_mask, supported_patches
 from msi_preprocess.verify import verify
 
 
 def defaults() -> dict:
-    return load_config(Path(__file__).parents[1] / "config.yaml")
+    config = load_config(Path(__file__).parents[1] / "config.yaml")
+    config["exclude_slides"] = {}
+    return config
 
 
 def fixture(tmp_path: Path, *, interleaved=True) -> tuple[dict, dict]:
@@ -191,7 +193,7 @@ def test_all_stage_combinations_exports_linear_and_exact(tmp_path, flags):
     updated = yaml.safe_load(Path(config["dann_config"]).read_text())
     for group in dann:
         for key in dann[group]:
-            if (group, key) not in {( "data", "path"), ("data", "context_path"), ("model", "num_peaks")}:
+            if (group, key) not in {( "data", "path"), ("data", "context_path"), ("model", "num_peaks"), ("results", "run_name")}:
                 assert updated[group][key] == dann[group][key]
     assert updated["data"]["preprocessing_fingerprint"] == manifest["fingerprint"]
     from dann.config import resolve_execution
@@ -260,23 +262,39 @@ def test_local_feature_workers_are_exactly_equivalent():
                                       right.toarray() if sparse.issparse(right) else right)
 
 
-def test_fitting_never_uses_validation_or_labels(tmp_path):
+def test_full_lesion_fitting_is_split_independent_and_label_free(tmp_path):
     config, dann = fixture(tmp_path)
     fitted = fit(config)
     first, a = load_fit(fitted)
     lesion = ad.read_h5ad(config["lesion_input"])
-    train, _ = training_split(lesion.obs, dann)
-    validation = np.setdiff1d(np.arange(lesion.n_obs), train)
-    counts = lesion.layers["counts"].toarray()
-    counts[validation] = 777
-    lesion.layers["counts"] = sparse.csr_matrix(counts)
-    lesion.obs["Density_CD8"] = 999
-    lesion.obsm["hes_features"][:] = -999
-    lesion.write_h5ad(config["lesion_input"])
-    config["output"] = str(tmp_path / "changed_validation")
+    assert first["fitting"]["scope"] == "retained_lesion"
+    np.testing.assert_array_equal(a["fitting_rows"], np.arange(lesion.n_obs))
+    # Model split settings and smoke caps cannot affect any fitted parameter.
+    dann["data"].update(train_fraction=.5, validation_fraction=.5)
+    dann["training"]["seed"] = 999
+    Path(config["dann_config"]).write_text(yaml.safe_dump(dann))
+    config["output"] = str(tmp_path / "split_changed")
     _, b = load_fit(fit(config))
     for key in a:
         np.testing.assert_array_equal(a[key], b[key])
+    lesion.obs["Density_CD8"] = 999
+    lesion.obsm["hes_features"][:] = -999
+    lesion.write_h5ad(config["lesion_input"])
+    config["output"] = str(tmp_path / "labels_changed")
+    _, b = load_fit(fit(config))
+    for key in a:
+        np.testing.assert_array_equal(a[key], b[key])
+    # Previously held-out rows now contribute to the fit.
+    from dann.data_loader import stratified_split_indices
+    rows = stratified_split_indices(lesion.obs.batch.cat.codes.to_numpy(),
+                train_fraction=.9, validation_fraction=.1, test_fraction=0, seed=57)["validation"]
+    counts = lesion.layers["counts"].toarray()
+    counts[rows] = 777
+    lesion.layers["counts"] = sparse.csr_matrix(counts)
+    lesion.write_h5ad(config["lesion_input"])
+    config["output"] = str(tmp_path / "counts_changed")
+    _, b = load_fit(fit(config))
+    assert not np.array_equal(a["prevalence"], b["prevalence"])
     with pytest.raises(ValueError, match="changed since fitting"):
         apply(fitted)
 
@@ -299,8 +317,7 @@ def test_fingerprint_split_and_resume_guards(tmp_path):
     bad["intensity_transform"] = "none"
     with pytest.raises(ValueError, match="exactly one"):
         validate_preprocessing(path, bad)
-    with pytest.raises(ValueError, match="split differs"):
-        validate_preprocessing(path, updated["data"], training_rows=np.arange(3))
+    assert validate_preprocessing(path, updated["data"], training_rows=np.arange(3))["fitting"]["scope"] == "retained_lesion"
     text = Path(fitted).read_text()
     changed = json.loads(text)
     changed["config"]["local"]["weak_boundary"] = 1.0
@@ -316,7 +333,9 @@ def test_fingerprint_split_and_resume_guards(tmp_path):
 
 @pytest.mark.parametrize("group,key,value", [("stages", "local", "true"), ("local", "draws", 0),
         ("local", "sensitivity", [.5, .1]), ("integration", "prevalence", 2),
-        ("selection", "spatial_weak_excess", .2), ("selection", "patch_pixels", 3)])
+        ("selection", "spatial_weak_excess", .2), ("selection", "patch_pixels", 3),
+        ("report", "max_peaks", 0), ("report", "max_peaks", True),
+        ("report", "max_peaks", 2.5)])
 def test_invalid_settings(group, key, value):
     cfg = defaults()
     cfg[group][key] = value

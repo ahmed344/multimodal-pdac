@@ -5,6 +5,15 @@ tissue_input: data/PDAC/Raw/adata_assembled_tissue.h5ad
 output: data/PDAC/Processed/msi_preprocess
 dann_config: dann/config.yaml
 patient_column: patient
+# Manual QC from signal summaries and heatmaps; technical cause is unconfirmed.
+exclude_slides:
+  549857-19: Severely depleted lesion spectra (manual QC).
+  549857-22: Severely depleted lesion spectra (manual QC).
+  546332-17: Spatial striping (manual QC; previously referenced as 549332-17).
+coordinate_columns:
+  batch_column: batch
+  x_column: x
+  y_column: y
 stages:
   selection: true
   integration: true
@@ -23,7 +32,8 @@ integration:
   slide_fraction: 0.80
   support_fraction: 0.50
   min_anchors: 32
-  max_correction: 2.0
+  multiplier_min: 0.5
+  multiplier_max: 2.5
 local:
   weak_boundary: 0.5
   sensitivity: [0.1, 0.2, 0.3, 0.5, 1.0]
@@ -37,3 +47,7 @@ application_workers: 4  # Bounded independent feature blocks; numerical results 
 memory_gib: 16
 disk_reserve_gib: 4
 report_peaks: 6
+report:
+  pixels_per_slide: 100
+  max_peaks: 500  # Display only: retained peaks ranked by sampled log1p-count variance.
+  upper_percentile: 99.5

@@ -91,6 +91,8 @@ def load_plot_data(
 
     schema = pq.read_schema(predictions_path)
     metadata = schema.metadata or {}
+    from dann.preprocessing import validate_artifact_preprocessing
+    validate_artifact_preprocessing(input_path, metadata)
     contract = json.loads(metadata[b"dann_target_transform"]) if b"dann_target_transform" in metadata else None
     if contract and contract.get("version") != 1:
         raise ValueError("Unsupported spatial target transformation version.")
@@ -377,6 +379,8 @@ def run_heatmaps(
     if not 0 < epsilon < .5 or isinstance(dpi, bool) or not isinstance(dpi, int) or dpi <= 0:
         raise ValueError("Require 0 < logit_epsilon < 0.5 and a positive integer DPI.")
     identities = {"input": source_identity(input_path), "predictions": source_identity(predictions_path)}
+    from dann.preprocessing import validate_artifact_preprocessing
+    preprocessing = validate_artifact_preprocessing(input_path, pq.read_schema(predictions_path).metadata)
     progress = Progress()
     progress.start()
     results = []
@@ -454,6 +458,7 @@ def run_heatmaps(
                 result["path"] = str(destination)
         progress.close()
         report = dict(settings=settings, effective_workers=workers, memory_estimates=memory,
+                      preprocessing=preprocessing,
                       sources=identities, densities=list(densities), dpi=dpi, logit_epsilon=epsilon,
                       phase_seconds=progress.durations, total_seconds=time.perf_counter() - progress.started,
                       peak_parent_worker_rss_gib=progress.peak_rss / GIB,

@@ -63,6 +63,7 @@ class HEWriter:
         import pyarrow as pa
         import pyarrow.parquet as pq
         from dann.tiles import _axis_names
+        from dann.preprocessing import artifact_preprocessing, parquet_preprocessing
         self.output, self.width = Path(output), width
         self.expected = np.asarray(expected_rows, dtype=np.int64)
         if len(np.unique(self.expected)) != len(self.expected):
@@ -77,7 +78,8 @@ class HEWriter:
         self.schema = pa.schema([('row_position', pa.int64()), ('obs_name', pa.string()),
                                  ('he_prediction', pa.list_(pa.float32(), width))],
                                 metadata={b'target_convention': b'raw_stored_values',
-                                          b'feature_order': b'stored_obsm_column_order'})
+                                          b'feature_order': b'stored_obsm_column_order',
+                                          **parquet_preprocessing(artifact_preprocessing(source))})
         self.writer = pq.ParquetWriter(self.temporary, self.schema, compression='zstd')
 
     def write(self, rows: np.ndarray, prediction: np.ndarray) -> None:

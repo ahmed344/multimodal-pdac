@@ -17,6 +17,7 @@ from scipy import sparse
 import yaml
 
 from .fit import load_fit, log
+from .cohort import source_rows
 from .io import (CSRWriter, axes, check_disk, check_memory, copy_metadata, identity,
                  json_write, match_rows, read_rows)
 from .report import Diagnostics
@@ -24,7 +25,8 @@ from .spatial import neighborhoods, spatial_support
 
 
 def clean_slide(counts: sparse.csr_matrix, retained: np.ndarray, multiplier: float,
-                graphs: tuple, envelopes: np.ndarray, config: dict) -> tuple:
+                graphs: tuple, envelopes: np.ndarray, config: dict,
+                lesion_positions: np.ndarray | None = None) -> tuple:
     """Select, scale and mask. Neither averaging nor imputation changes a retained cell."""
     selected = counts[:, retained].tocsr()
     integrated = selected.copy()
@@ -32,6 +34,7 @@ def clean_slide(counts: sparse.csr_matrix, retained: np.ndarray, multiplier: flo
     cleaned = integrated.tocsc()
     cuts = np.asarray(config["local"]["sensitivity"])
     sensitivity = np.zeros((len(cuts), 2))
+    lesion_sensitivity = np.zeros_like(sensitivity)
     removed = np.zeros(len(retained), dtype=np.int64)
     removed_rows = np.zeros(counts.shape[0], dtype=np.int64)
     if config["stages"]["local"]:
@@ -41,29 +44,34 @@ def clean_slide(counts: sparse.csr_matrix, retained: np.ndarray, multiplier: flo
             supported, assessed = spatial_support(values, graphs, envelopes[:, :, start:end], config["local"]["min_neighbors"])
             unsupported = (values > 0) & assessed & ~supported
             losses = np.zeros((len(cuts), 2))
+            lesion_losses = np.zeros_like(losses)
             for k, cut in enumerate(cuts):
                 mask = unsupported & (values <= cut)
                 losses[k] = [mask.sum(), values[mask].sum()]
+                if lesion_positions is not None:
+                    local_mask = mask[lesion_positions]
+                    lesion_losses[k] = [local_mask.sum(), values[lesion_positions][local_mask].sum()]
             remove = unsupported & (values <= config["local"]["weak_boundary"])
             lo = cleaned.indptr[start]
             entry_mask = np.zeros(cleaned.indptr[end] - lo, dtype=bool)
             for j in range(start, end):
                 a, b = cleaned.indptr[j:j+2]
                 entry_mask[a-lo:b-lo] = remove[cleaned.indices[a:b], j-start]
-            return start, end, entry_mask, losses, remove.sum(axis=0), remove.sum(axis=1)
+            return start, end, entry_mask, losses, remove.sum(axis=0), remove.sum(axis=1), lesion_losses
 
         starts = range(0, len(retained), config["feature_block"])
         # Blocks are independent features, and only the caller writes results.
         # Completed blocks never supply neighborhood context for another block.
         with ThreadPoolExecutor(max_workers=config.get("application_workers", 4)) as executor:
-            for start, end, entry_mask, losses, peak_losses, row_losses in executor.map(assess_block, starts):
+            for start, end, entry_mask, losses, peak_losses, row_losses, lesion_losses in executor.map(assess_block, starts):
                 lo, hi = cleaned.indptr[start], cleaned.indptr[end]
                 cleaned.data[lo:hi][entry_mask] = 0
                 sensitivity += losses
+                lesion_sensitivity += lesion_losses
                 removed[start:end] = peak_losses
                 removed_rows += row_losses
         cleaned.eliminate_zeros()
-    return selected, integrated, cleaned.tocsr(), sensitivity, removed, removed_rows
+    return selected, integrated, cleaned.tocsr(), sensitivity, removed, removed_rows, lesion_sensitivity
 
 
 def update_dann_config(path: str | Path, output: Path, manifest: dict) -> None:
@@ -79,6 +87,8 @@ def update_dann_config(path: str | Path, output: Path, manifest: dict) -> None:
                     ("data", "context_path"): str((output / "tissue.h5ad").resolve()),
                     ("data", "preprocessing_fingerprint"): manifest["fingerprint"],
                     ("model", "num_peaks"): manifest["retained_features"]}
+    if manifest["schema"] >= 3 and not parsed["results"]["run_name"].endswith("_qc40"):
+        replacements[("results", "run_name")] = parsed["results"]["run_name"] + "_qc40"
     lines = text.splitlines(keepends=True)
     section = None
     seen = set()
@@ -130,6 +140,9 @@ def apply(fitted: str | Path, *, update_dann: bool = False) -> Path:
             raise ValueError(f"{key} changed since fitting; frozen source identity mismatch.")
     lesion, features = axes(config["lesion_input"], data, config["patient_column"])
     tissue, tissue_features = axes(config["tissue_input"], data, config["patient_column"])
+    lesion_rows = source_rows(manifest, state, "lesion", len(lesion))
+    tissue_rows = source_rows(manifest, state, "tissue", len(tissue))
+    lesion, tissue = lesion.iloc[lesion_rows].reset_index(drop=True), tissue.iloc[tissue_rows].reset_index(drop=True)
     if not np.array_equal(features, state["features"]) or not np.array_equal(features, tissue_features):
         raise ValueError("Input feature order differs from the fitted feature order.")
     mapping = match_rows(lesion, tissue, data)
@@ -156,6 +169,7 @@ def apply(fitted: str | Path, *, update_dann: bool = False) -> Path:
     log(f"Disk preflight: upper bound {disk['required_bytes']/2**30:.1f} GiB; free {disk['available_bytes']/2**30:.1f} GiB")
     retained = state["retained"]
     provenance = dict(fingerprint=manifest["fingerprint"], schema=manifest["schema"],
+                      fit_scope=manifest.get("fitting", {}).get("scope", "dann_training"),
                       intensity_scale="linear", original_counts="already_RMS_normalized",
                       application_context="whole_tissue_MSI_without_IHC_or_HE_labels",
                       fresh_training_required=True, input_features=len(features), retained_features=len(retained),
@@ -163,8 +177,8 @@ def apply(fitted: str | Path, *, update_dann: bool = False) -> Path:
                       slides=state["slides"], multipliers=state["multipliers"], envelopes=state["envelopes"],
                       retained_original_indices=retained)
     train_mask = np.zeros(len(lesion), bool)
-    train_mask[state["training_rows"]] = True
-    diagnostics = Diagnostics(output, features, retained, config["report_peaks"], state)
+    train_mask[:] = np.isin(lesion_rows, state.get("fitting_rows", state.get("training_rows")))
+    diagnostics = Diagnostics(output, features, retained, config["report_peaks"], state, manifest)
     sensitivity_rows, removal_rows = [], []
     per_row_removed = np.zeros(len(tissue), dtype=np.int32)
     scratch = output / "apply_work"
@@ -174,7 +188,7 @@ def apply(fitted: str | Path, *, update_dann: bool = False) -> Path:
             th = stack.enter_context(h5py.File(config["tissue_input"], "r"))
             lh = stack.enter_context(h5py.File(config["lesion_input"], "r"))
             out = stack.enter_context(h5py.File(partials[0], "w"))
-            copy_metadata(th, out, retained, provenance)
+            copy_metadata(th, out, retained, dict(provenance, dataset_kind="tissue"), tissue_rows, config["block_rows"])
             shape = (len(tissue), len(retained))
             dtype = th["layers/counts/data"].dtype
             dtype = np.result_type(dtype, np.float32)
@@ -183,27 +197,29 @@ def apply(fitted: str | Path, *, update_dann: bool = False) -> Path:
             for slide in slides:
                 i = list(state["slides"]).index(slide)
                 rows = np.flatnonzero(batch == slide)
-                check_memory(th["layers/counts"], rows, config)
-                counts = read_rows(th["layers/counts"], rows, config["block_rows"])
+                check_memory(th["layers/counts"], tissue_rows[rows], config)
+                counts = read_rows(th["layers/counts"], tissue_rows[rows], config["block_rows"])
                 lrows = np.flatnonzero(lesion[data["batch_column"]].astype(str).to_numpy() == slide)
                 local = np.searchsorted(rows, mapping[lrows])
-                lesion_counts = read_rows(lh["layers/counts"], lrows, config["block_rows"])
+                lesion_counts = read_rows(lh["layers/counts"], lesion_rows[lrows], config["block_rows"])
                 if (lesion_counts != counts[local]).nnz:
                     raise ValueError(f"Matched counts differ between lesion and tissue on slide {slide}.")
                 del lesion_counts
                 frame = tissue.iloc[rows]
                 coordinates = frame[[data["x_column"], data["y_column"]]].to_numpy()
                 graphs = neighborhoods(coordinates[:, 0], coordinates[:, 1]) if config["stages"]["local"] else ()
-                selected, integrated, cleaned, sensitivity, removed, pixel_removed = clean_slide(
-                        counts, retained, float(state["multipliers"][i]), graphs, state["envelopes"][i], config)
+                selected, integrated, cleaned, sensitivity, removed, pixel_removed, lesion_sensitivity = clean_slide(
+                        counts, retained, float(state["multipliers"][i]), graphs, state["envelopes"][i], config, local)
                 per_row_removed[rows] = pixel_removed
-                for cut, (number, intensity) in zip(config["local"]["sensitivity"], sensitivity):
-                    sensitivity_rows.append(dict(slide=slide, boundary=cut, measurements_removed=int(number),
-                                                  intensity_removed=float(intensity), local_enabled=config["stages"]["local"]))
+                for region, losses in (("whole_tissue", sensitivity), ("lesion", lesion_sensitivity)):
+                    for cut, (number, intensity) in zip(config["local"]["sensitivity"], losses):
+                        sensitivity_rows.append(dict(region=region, slide=slide, boundary=cut,
+                            measurements_removed=int(number), intensity_removed=float(intensity),
+                            local_enabled=config["stages"]["local"]))
                 removal_rows.extend(dict(slide=slide, feature=features[j], measurements_removed=int(n)) for j, n in zip(retained, removed))
-                old = read_rows(th["X"], rows, config["block_rows"])
+                old = read_rows(th["X"], tissue_rows[rows], config["block_rows"])
                 label_names = [name for name in ("Density_CD8", "Density_Stroma") if name in lh["obs"]]
-                labels = pd.DataFrame({name: np.asarray(read_elem(lh["obs"][name]))[lrows] for name in label_names})
+                labels = pd.DataFrame({name: np.asarray(read_elem(lh["obs"][name]))[lesion_rows[lrows]] for name in label_names})
                 diagnostics.add(slide, coordinates, dict(counts=counts, old_X=old, selected=selected,
                                                        integrated=integrated, cleaned=cleaned), local, labels, train_mask[lrows])
                 if contiguous:
@@ -244,7 +260,7 @@ def apply(fitted: str | Path, *, update_dann: bool = False) -> Path:
         # Derive lesion X and counts from the exact written tissue result, with
         # arbitrary lesion ordering supported and no second spatial cleaning pass.
         with h5py.File(partials[0], "r") as th, h5py.File(config["lesion_input"], "r") as lh, h5py.File(partials[1], "w") as out:
-            copy_metadata(lh, out, retained, provenance)
+            copy_metadata(lh, out, retained, dict(provenance, dataset_kind="lesion"), lesion_rows, config["block_rows"])
             shape = (len(lesion), len(retained))
             cw, xw = CSRWriter(out["layers"], "counts", shape, dtype), CSRWriter(out, "X", shape, dtype)
             for start in range(0, len(lesion), config["block_rows"]):

@@ -52,8 +52,8 @@ def plot_maps(path: Path, slide: str, coordinates: np.ndarray, names: np.ndarray
     fig, axes = plt.subplots(len(names), len(matrices), squeeze=False,
                              figsize=(3 * len(matrices), 2.7 * len(names)), constrained_layout=True)
     for row, (feature, reason) in enumerate(zip(names, reasons)):
-        positives = [v[:, row][v[:, row] > 0] for stage, v in matrices.items() if stage != "old_X"]
-        values = np.concatenate(positives)
+        values = matrices["counts"][:, row]
+        values = values[values > 0]
         vmax = max(float(np.quantile(values, .99)) if len(values) else 1., 1e-12)
         for col, (stage, values) in enumerate(matrices.items()):
             values = values[:, row]
@@ -66,7 +66,8 @@ def plot_maps(path: Path, slide: str, coordinates: np.ndarray, names: np.ndarray
             else:
                 artist = ax.scatter(xy[:, 0], xy[:, 1], c=values, s=.25, cmap="viridis", vmin=0, vmax=limit, rasterized=True)
                 ax.invert_yaxis()
-            ax.set_title(f"{stage}: {feature}\n{reason}", fontsize=8)
+            status = " (peak removed)" if np.isnan(values).all() else ""
+            ax.set_title(f"{stage}: {feature}{status}\n{reason}", fontsize=8)
             ax.set_aspect("equal")
             ax.set_xticks([])
             ax.set_yticks([])
@@ -79,18 +80,27 @@ def plot_maps(path: Path, slide: str, coordinates: np.ndarray, names: np.ndarray
 class Diagnostics:
     """Accumulate exact distributions and slide variance with bounded slide memory."""
 
-    def __init__(self, output: Path, features: np.ndarray, retained: np.ndarray, peaks: int, state: dict):
+    def __init__(self, output: Path, features: np.ndarray, retained: np.ndarray, peaks: int, state: dict, manifest: dict | None = None):
         self.output, self.features, self.retained = output, features, retained
         self.state, self.peaks = state, peaks
+        self.manifest = manifest
+        self.scope = (manifest or {}).get("fitting", {}).get("scope", "dann_training")
+        from .comparison import RegionDiagnostics
+        self.regional = RegionDiagnostics(output, features, retained,
+                         (manifest or {}).get("config", {}).get("local", {}).get("sensitivity", [.1, .2, .3, .5, 1.]))
         self.rows, self.histograms = [], []
         self.biology_header = True
         self.moments: dict[str, list] = {}
-        self.bins = np.r_[0, np.geomspace(.001, 1000, 80), np.inf]
+        self.bins = self.regional.bins
         (output / "figures").mkdir(exist_ok=True)
 
     def add(self, slide: str, coordinates: np.ndarray, matrices: dict[str, sparse.csr_matrix],
             lesion_positions: np.ndarray, labels: pd.DataFrame, fit_mask: np.ndarray) -> None:
         """Compare identical tissue positions, plus held-out biological associations."""
+        histogram_start = len(self.regional.histograms)
+        self.regional.add(slide, matrices, lesion_positions)
+        self.histograms.extend({k: v for k, v in row.items() if k != "region"}
+            for row in self.regional.histograms[histogram_start:] if row["region"] == "whole_tissue")
         biology = []
         for stage, matrix in matrices.items():
             n, p = matrix.shape
@@ -102,16 +112,9 @@ class Diagnostics:
                                   zero_fraction=1-matrix.nnz/max(n*p, 1), intensity_sum=float(positive.sum()),
                                   positive_mean=float(positive.mean()) if len(positive) else 0,
                                   maximum=float(positive.max()) if len(positive) else 0))
-            hist = np.zeros(len(self.bins)-1, dtype=np.int64)
-            # Bounded bin lookup avoids repeatedly sorting millions of values
-            # for the unequal-width intensity bins used by np.histogram.
-            for start in range(0, len(positive), 1_000_000):
-                bins = np.searchsorted(self.bins, positive[start:start+1_000_000], side="right") - 1
-                hist += np.bincount(bins, minlength=len(hist))
-            self.histograms.extend(dict(slide=slide, stage=stage, lower=float(lo), upper=float(hi), count=int(v))
-                                   for lo, hi, v in zip(self.bins[:-1], self.bins[1:], hist))
             feature_ids = np.arange(len(self.features)) if p == len(self.features) else self.retained
-            for name, mask in (("train", fit_mask), ("validation", ~fit_mask)):
+            scopes = ((self.scope, np.ones(len(fit_mask), bool)),) if self.scope in ("all_lesion", "retained_lesion") else (("train", fit_mask), ("validation", ~fit_mask))
+            for name, mask in scopes:
                 if mask.sum() < 3:
                     continue
                 spectra = matrix[lesion_positions[mask]]
@@ -144,13 +147,14 @@ class Diagnostics:
                 elif feature in self.retained:
                     columns.append(matrix[:, np.searchsorted(self.retained, feature)].toarray().ravel())
                 else:
-                    columns.append(np.zeros(matrix.shape[0]))
+                    columns.append(np.full(matrix.shape[0], np.nan))
             plotted[stage] = np.column_stack(columns)
         plot_maps(self.output / "figures" / f"slide_{len(self.moments['counts']):03d}.png", slide,
                   coordinates, self.features[examples], reasons, plotted)
 
     def finish(self) -> None:
         """Write stage distributions, associations and descriptive slide eta-squared."""
+        self.regional.finish()
         pd.DataFrame(self.rows).to_csv(self.output / "stage_summaries.csv", index=False)
         hist = pd.DataFrame(self.histograms)
         hist.to_csv(self.output / "intensity_histograms.csv", index=False)
@@ -179,10 +183,10 @@ X contains linear reference-adjusted intensities; DANN applies log1p once.</p>
 <p>Thresholds and 95% random-location envelopes are operational, descriptive filters,
 not an instrumental noise floor or calibrated hypothesis tests. Missing information
 from RMS normalization and alignment cannot be recovered.</p>
-<p>Fits use only DANN training rows. Application uses whole-tissue MSI neighborhoods,
+<p>New fits use every lesion row, independently of model splits. Application uses whole-tissue MSI neighborhoods,
 including held-out and non-lesion image context; labels are never used for cleaning.
 Biological-association tables use annotations only after preprocessing, with the
-original train/validation partition. Correlation preservation is a diagnostic,
+fitting scope recorded in the manifest. Correlation preservation is a diagnostic,
 not proof of biological preservation. Slide variation confounds biology and acquisition.</p>
 <p>See peak_decisions.csv, slide_multipliers.csv, stage_summaries.csv,
 intensity_histograms.csv, local_sensitivity.csv, local_removal.csv,
@@ -196,11 +200,12 @@ def render_maps(fitted: str | Path) -> None:
     """Regenerate informative matched maps from completed exports, without refitting."""
     from .fit import load_fit, log
     from .io import axes, read_rows
+    from .cohort import aligned_export_rows
     manifest, state = load_fit(fitted)
     config = manifest["config"]
     output = Path(fitted).resolve().parent
     data = manifest["coordinate_columns"]
-    obs, _ = axes(output / "tissue.h5ad", data, config["patient_column"])
+    obs, original_rows = aligned_export_rows(output / "tissue.h5ad", manifest, state, "tissue")
     batch = np.asarray(obs[data["batch_column"]], dtype=str)
     decisions = []
     with h5py.File(config["tissue_input"], "r") as source, h5py.File(output / "tissue.h5ad", "r") as result:
@@ -210,12 +215,12 @@ def render_maps(fitted: str | Path) -> None:
             examples, reasons = example_peaks(state, slide, config["report_peaks"])
             matrices = {}
             for stage, key in (("counts", "layers/counts"), ("old_X", "X")):
-                matrices[stage] = read_rows(source[key], rows, config["block_rows"])[:, examples].toarray()
+                matrices[stage] = read_rows(source[key], original_rows[rows], config["block_rows"])[:, examples].toarray()
             retained = np.isin(examples, state["retained"])
             matrices["selected"] = matrices["counts"].copy()
-            matrices["selected"][:, ~retained] = 0
+            matrices["selected"][:, ~retained] = np.nan
             matrices["integrated"] = matrices["selected"] / state["multipliers"][i]
-            matrices["cleaned"] = np.zeros_like(matrices["integrated"])
+            matrices["cleaned"] = np.full_like(matrices["integrated"], np.nan)
             columns = np.searchsorted(state["retained"], examples[retained])
             matrices["cleaned"][:, retained] = read_rows(result["X"], rows, config["block_rows"])[:, columns].toarray()
             coordinates = obs.iloc[rows][[data["x_column"], data["y_column"]]].to_numpy()
@@ -226,6 +231,15 @@ def render_maps(fitted: str | Path) -> None:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Regenerate matched spatial maps from completed preprocessing exports.")
+    parser = argparse.ArgumentParser(description="Regenerate complete comparisons from completed preprocessing exports.")
     parser.add_argument("--fit", default="data/PDAC/Processed/msi_preprocess/fit.json")
-    render_maps(parser.parse_args().fit)
+    parser.add_argument("--maps", action="store_true", help="Also regenerate all native-grid spatial maps.")
+    parser.add_argument("--tic", action="store_true", help="Also generate whole-tissue counts and cleaned TIC grids for all slides.")
+    args = parser.parse_args()
+    if args.maps:
+        render_maps(args.fit)
+    if args.tic:
+        from .tic import render_tic_maps
+        render_tic_maps(args.fit)
+    from .comparison import render_report
+    render_report(args.fit)

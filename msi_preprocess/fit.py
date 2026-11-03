@@ -1,4 +1,4 @@
-"""Fit peak decisions and spatial references using only DANN training spectra."""
+"""Fit peak decisions and spatial references using all lesion spectra, independently of model splits."""
 from __future__ import annotations
 
 import argparse
@@ -10,10 +10,10 @@ import time
 import h5py
 import numpy as np
 import pandas as pd
-import yaml
 
 from . import SCHEMA_VERSION
 from .config import load_config, validate_config
+from .cohort import decide_cohort
 from .io import axes, check_memory, digest, identity, json_write, read_rows
 from .qc import adjacent_pairs, spatial_diagnostics
 from .spatial import neighborhoods, reference_envelopes, supported_patches
@@ -22,18 +22,6 @@ from .spatial import neighborhoods, reference_envelopes, supported_patches
 def log(message: str) -> None:
     """Report progress during a long fit or export."""
     print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
-
-
-def training_split(obs: pd.DataFrame, dann: dict) -> tuple[np.ndarray, dict]:
-    """Use DANN's exact uncapped seeded split and stored categorical ordering."""
-    from dann.data_loader import stratified_split_indices
-    data = dann["data"]
-    settings = {key: float(data[key]) for key in ("train_fraction", "validation_fraction", "test_fraction")}
-    settings["seed"] = int(dann["training"]["seed"])
-    codes = obs[data["batch_column"]].astype("category").cat.codes.to_numpy()
-    rows = stratified_split_indices(codes, **settings)["train"]
-    settings["training_rows_sha256"] = hashlib.sha256(np.sort(rows).astype("<i8").tobytes()).hexdigest()
-    return rows, settings
 
 
 def selection_decisions(tested: np.ndarray, weak: np.ndarray, supported: np.ndarray,
@@ -79,10 +67,10 @@ def integration_parameters(medians: np.ndarray, prevalence: np.ndarray,
                 raise ValueError(f"Fitting slide {i}: only {len(usable)} usable anchors; "
                                  f"need {settings['min_anchors']}. Integration cannot be fitted.")
             raw[i] = np.median(medians[i, usable] / reference[usable])
-    limit = settings["max_correction"]
+    lower, upper = settings["multiplier_min"], settings["multiplier_max"]
     return dict(anchors=anchors, reference=reference, usable_anchors=usable_counts,
-                raw_multipliers=raw, multipliers=np.clip(raw, 1 / limit, limit),
-                correction_limited=(raw <= 1 / limit) | (raw >= limit))
+                raw_multipliers=raw, multipliers=np.clip(raw, lower, upper),
+                correction_limited=(raw < lower) | (raw > upper))
 
 
 def _save_npz(path: Path, **arrays) -> None:
@@ -93,8 +81,11 @@ def _save_npz(path: Path, **arrays) -> None:
 
 def _fingerprint(manifest: dict, arrays: dict) -> str:
     """Bind frozen settings, source identities and every fitted parameter array."""
+    scope_key = "split" if manifest["schema"] == 1 else "fitting"
     inputs = {key: manifest[key] for key in
-              ("schema", "config", "split", "coordinate_columns", "source", "tissue_source")}
+              ("schema", "config", scope_key, "coordinate_columns", "source", "tissue_source")}
+    if manifest["schema"] >= 3:
+        inputs["cohort"] = manifest["cohort"]
     result = hashlib.sha256(digest(inputs).encode())
     for key in sorted(arrays):
         result.update(key.encode())
@@ -102,27 +93,35 @@ def _fingerprint(manifest: dict, arrays: dict) -> str:
     return result.hexdigest()
 
 
-def fit(config: dict) -> Path:
+def fit(config: dict, *, output_dir: str | Path | None = None) -> Path:
     """Fit a reusable state. Incomplete fits resume only with identical inputs/settings."""
     validate_config(config)
-    dann = yaml.safe_load(Path(config["dann_config"]).read_text())
-    data = dann["data"]
+    data = config["coordinate_columns"]
     obs, features = axes(config["lesion_input"], data, config["patient_column"])
-    train, split = training_split(obs, dann)
+    tissue, tissue_features = axes(config["tissue_input"], data, config["patient_column"])
+    if not np.array_equal(features, tissue_features):
+        raise ValueError("Lesion and tissue feature order differs.")
+    cohort, mappings = decide_cohort(obs, tissue, config)
+    fitting_rows = mappings["lesion"]
     fitting = np.zeros(len(obs), bool)
-    fitting[train] = True
+    fitting[fitting_rows] = True
+    keys = obs.iloc[fitting_rows][[data[k] for k in ("batch_column", "x_column", "y_column")]]
+    scope = dict(scope="retained_lesion", row_count=len(fitting_rows),
+                 rows_sha256=hashlib.sha256(fitting_rows.astype("<i8").tobytes()).hexdigest(),
+                 keys_sha256=hashlib.sha256(pd.util.hash_pandas_object(
+                     keys, index=False).to_numpy(dtype="<u8").tobytes()).hexdigest())
     batch = np.asarray(obs[data["batch_column"]], dtype=str)
-    slides = np.unique(batch)
+    slides = np.unique(batch[fitting])
     if any(not np.any(fitting & (batch == slide)) for slide in slides):
         raise ValueError("Every slide must have fitting rows; unseen slides cannot receive frozen multipliers.")
     patients = np.array([str(obs.loc[batch == slide, config["patient_column"]].iloc[0]) for slide in slides])
-    output = Path(config["output"])
+    output = Path(output_dir if output_dir is not None else config["output"])
     output.mkdir(parents=True, exist_ok=True)
     if (output / "fit.json").exists():
         raise FileExistsError("Fitted state already exists; apply it or choose a new output directory.")
     work = output / "fit_work"
     work.mkdir(exist_ok=True)
-    manifest = dict(schema=SCHEMA_VERSION, config=config, split=split,
+    manifest = dict(schema=SCHEMA_VERSION, config=config, fitting=scope, cohort=cohort,
                     coordinate_columns={k: data[k] for k in ("batch_column", "x_column", "y_column")},
                     source=identity(config["lesion_input"]), tissue_source=identity(config["tissue_input"]))
     token = digest(manifest)
@@ -130,6 +129,7 @@ def fit(config: dict) -> Path:
     if cache_identity.exists() and json.loads(cache_identity.read_text()) != token:
         raise ValueError("Incomplete fit belongs to different inputs or settings; choose a new output directory.")
     json_write(cache_identity, token)
+    pd.DataFrame(cohort["decisions"]).to_csv(output / "cohort.csv", index=False)
     summaries = []
     p = len(features)
     with h5py.File(config["lesion_input"], "r") as h:
@@ -178,7 +178,7 @@ def fit(config: dict) -> Path:
                               & (result["normalized_excess"] <= config["selection"]["spatial_weak_excess"]))
             _save_npz(cache, **result)
             summaries.append(result)
-            log(f"Fitted QC {i+1}/{len(slides)}: {slide}; {len(rows):,} training rows")
+            log(f"Fitted QC {i+1}/{len(slides)}: {slide}; {len(rows):,} lesion fitting rows")
             del matrix, csc, graphs
     arrays = {key: np.stack([r[key] for r in summaries]) for key in summaries[0]}
     retained, reasons = selection_decisions(arrays["tested"], arrays["weak"], arrays["supported"],
@@ -201,7 +201,8 @@ def fit(config: dict) -> Path:
                             config["local"]["draws"], config["local"]["envelope"], config["seed"] + i)
                 log(f"Frozen local envelopes {i+1}/{len(slides)}: {slide}")
     arrays.update(integration, envelopes=envelopes, retained=retained, features=features,
-                  slides=slides, patients=patients, training_rows=np.sort(train))
+                  slides=slides, patients=patients, fitting_rows=fitting_rows,
+                  lesion_source_rows=mappings["lesion"], tissue_source_rows=mappings["tissue"])
     manifest["fingerprint"] = _fingerprint(manifest, arrays)
     manifest["retained_features"] = len(retained)
     manifest["input_features"] = p
@@ -226,7 +227,7 @@ def load_fit(path: str | Path) -> tuple[dict, dict]:
     """Load and verify a frozen state; application never refits missing parameters."""
     path = Path(path)
     manifest = json.loads(path.read_text())
-    if manifest["schema"] != SCHEMA_VERSION:
+    if manifest["schema"] not in (1, 2, SCHEMA_VERSION):
         raise ValueError("Unsupported preprocessing state version.")
     state_path = path.with_name("fit.npz")
     if hashlib.sha256(state_path.read_bytes()).hexdigest() != manifest["state_sha256"]:

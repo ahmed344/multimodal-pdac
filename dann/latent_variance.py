@@ -127,6 +127,8 @@ def compute_latent_variance(
                 "its latent Parquet and matching AnnData."
             )
     parquet = pq.ParquetFile(latent_path)
+    from .preprocessing import validate_artifact_preprocessing
+    preprocessing = validate_artifact_preprocessing(input_path, parquet.schema_arrow.metadata)
     columns = latent_columns(parquet.schema_arrow)
     n_rows = parquet.metadata.num_rows
     if n_rows < 2:
@@ -185,6 +187,7 @@ def compute_latent_variance(
             print(f"Processed {count:,}/{n_rows:,} latent rows.", flush=True)
     summary, spectrum = summarize_variance(scatter, count, mean, slide_counts, slide_means)
     summary.update(
+        preprocessing_fingerprint=preprocessing.get("preprocessing_fingerprint"),
         source_latents=str(Path(latent_path).resolve()),
         source_anndata=str(Path(input_path).resolve()),
         slide_column=slide_column,

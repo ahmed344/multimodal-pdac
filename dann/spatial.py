@@ -885,6 +885,8 @@ def _run_inference(
         raise ValueError("Inference feature order differs from frozen checkpoint.")
     from dann.preprocessing import validate_preprocessing
     validate_preprocessing(input_path, data_config)
+    from dann.preprocessing import artifact_preprocessing, parquet_preprocessing
+    preprocessing = artifact_preprocessing(input_path, data_config)
     total_rows = validate_input_schema(
         input_path=input_path,
         training_path=Path(data_config["path"]),
@@ -982,7 +984,8 @@ def _run_inference(
         prediction_writer = pq.ParquetWriter(
             temporary_path,
             output_schema(target_columns).with_metadata({
-                b"dann_target_transform": json.dumps(target_contract(config)).encode()
+                b"dann_target_transform": json.dumps(target_contract(config)).encode(),
+                **parquet_preprocessing(preprocessing),
             }),
             compression="zstd",
             use_dictionary=["obs_name"],
@@ -990,7 +993,7 @@ def _run_inference(
         latent_dim = int(config["model"]["latent_dim"])
         latent_writer = pq.ParquetWriter(
             latent_temporary_path,
-            latent_output_schema(latent_dim),
+            latent_output_schema(latent_dim).with_metadata(parquet_preprocessing(preprocessing)),
             compression="zstd",
             use_dictionary=["obs_name"],
         )
@@ -1107,6 +1110,7 @@ def _run_inference(
                           **_report.snapshot(device)},
             "density_mc_samples": mc_samples, "density_mc_seed": mc_seed,
             "source_identity": _file_identity(input_path),
+            "preprocessing": preprocessing,
             "checkpoint_identity": _file_identity(checkpoint_path),
             # Renaming keeps the stat identity; bind each export to this invocation.
             "prediction_identity": {**_file_identity(temporary_path), "path": str(output_path.resolve())},
@@ -1216,6 +1220,8 @@ def validate_output(
 
     parquet = pq.ParquetFile(output_path)
     expected_schema = output_schema(target_columns)
+    from dann.preprocessing import validate_artifact_preprocessing
+    validate_artifact_preprocessing(input_path, parquet.schema_arrow.metadata)
     if not parquet.schema_arrow.equals(expected_schema):
         raise TypeError(
             f"Unexpected Parquet schema:\n{parquet.schema_arrow}\n"
@@ -1310,6 +1316,8 @@ def validate_latent_output(
 
     parquet = pq.ParquetFile(output_path)
     expected_schema = latent_output_schema(latent_dim)
+    from dann.preprocessing import validate_artifact_preprocessing
+    validate_artifact_preprocessing(input_path, parquet.schema_arrow.metadata)
     if not parquet.schema_arrow.equals(expected_schema):
         raise TypeError(
             f"Unexpected latent Parquet schema:\n{parquet.schema_arrow}\n"

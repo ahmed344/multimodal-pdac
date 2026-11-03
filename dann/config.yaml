@@ -9,7 +9,7 @@ latent_variance:
   figure_dpi: 300  # Resolution of the explained-variance PNG.
 
 data:
-  preprocessing_fingerprint: 4e61e0e4b5679a0af0446486134dfd1dbeffe3ccc3bb25d568347690a613bd41  # Changed inputs require fresh training.
+  preprocessing_fingerprint: "5afeec26a84e55ddace6f44fadd8dc3a1f344b1bed1d327c8bc531cf513c3f03"  # Changed inputs require fresh training.
   path: "/workspaces/multimodal-pdac/data/PDAC/Processed/msi_preprocess/lesion.h5ad"  # Cleaned lesion spectra; preprocessing used whole-tissue MSI image context.
   context_path: "/workspaces/multimodal-pdac/data/PDAC/Processed/msi_preprocess/tissue.h5ad"  # Matching cleaned whole tissue for inference; fitted parameters are frozen.
   he_features_key: hes_features  # Raw ordered UNI2-h targets in obsm.
@@ -32,7 +32,7 @@ data:
   max_test_samples: null  # Optional stratified cap on test labels.
 
 model:
-  num_peaks: 4964  # Number of aligned m/z bins in both MSI files.
+  num_peaks: 5023  # Number of aligned m/z bins in both MSI files.
   latent_dim: 512  # Aggregation output width; this is the exported latent before either head.
 
   # 1. Per-pixel spectral processing: learned embeddings -> intensity weighting
@@ -211,9 +211,7 @@ training:
   grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
   grl_horizon_updates: null  # Full-fit epoch-based schedule derived from actual logical updates; the pilot's 500-update horizon is not used.
   early_stopping_enabled: true  # Disable only for bounded diagnostic comparisons.
-  # S = supervised_objective + grl_max_lambda * batch_weight * max(0, ln(K) - batch_loss).
-  # K is the discriminator output width. Selection starts at the first validation epoch.
-  early_stopping_metric: batch_aware_objective  # Also supports supervised_objective and cd8_loss; omission retains legacy CD8 selection.
+  early_stopping_metric: supervised_objective  # Also supports supervised_objective and cd8_loss; omission retains legacy CD8 selection.
   early_stopping_patience: 20  # Epochs without improvement in the validation selection metric.
   early_stopping_min_delta: 0.001  # Minimum improvement in the selected score's units.
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
@@ -325,7 +323,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: he10_biology2_discriminator1_512_occurrence_mlp_count_zero_input  # 512-wide occurrence-MLP fit; dictionary arms use separate configs.
+  run_name: "he10_biology2_discriminator1_512_occurrence_mlp_count_zero_input_cleaned_qc40"  # 512-wide occurrence-MLP fit; dictionary arms use separate configs.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.

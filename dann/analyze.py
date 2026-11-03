@@ -544,7 +544,7 @@ def plot_latent_umap_batch(
             rasterized=True,
         )
         handles.append(handle)
-    _style_umap_axis(axis, f"Latent UMAP by batch ({num_batches} batches)")
+    _style_umap_axis(axis, f"Latent UMAP by batch ({len(np.unique(batches))} batches)")
     axis.legend(
         handles=handles,
         loc="center left",
@@ -1354,6 +1354,8 @@ def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | 
         write_density_diagnostics(scatter_data, config, output_dir, scatter_split)
     for dataset in bundle.datasets.values():
         dataset.close()
+    from dann.preprocessing import analysis_provenance
+    analysis_provenance(output_dir, config['data'], write=True)
     return output_dir
 
 

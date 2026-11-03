@@ -223,6 +223,8 @@ def align_exports(latent, frame):
 def run_latent_analysis(config, output_override=None):
     """Regenerate validated offline views without changing existing numerical exports."""
     root=Path(output_override or config['analysis']['output_dir']); root.mkdir(parents=True,exist_ok=True)
+    from dann.preprocessing import analysis_provenance
+    preprocessing = analysis_provenance(root, config['data'])
     source_paths=[analysis_file(root,p) for p in ('latent_embeddings.csv','umap/latent_umap.csv','ziln_density_scatter.csv')]
     with InferenceProgress('Latent viewers') as progress:
         progress.set_phase('saved latent exports')
@@ -244,7 +246,7 @@ def run_latent_analysis(config, output_override=None):
         y=frame[targets].to_numpy(dtype=float,copy=True)
         for t,target in enumerate(targets):
             y[~frame['valid_'+target].to_numpy(dtype=bool),t]=np.nan
-        numerical_key=dict(version=1,sources=[digest_file(p) for p in source_paths[:2]],lesion=fingerprint(selected),minimum=settings['min_observations'])
+        numerical_key=dict(version=1,sources=[digest_file(p) for p in source_paths[:2]],lesion=fingerprint(selected),minimum=settings['min_observations'],preprocessing=preprocessing)
         cache=StageCache(root/'.analysis-cache',config['analysis'].get('execution',{}).get('cache_policy','reuse'),progress)
         progress.set_phase('within-slide feature correlations')
         hit=cache.get('latent-feature-associations',numerical_key)
@@ -253,7 +255,7 @@ def run_latent_analysis(config, output_override=None):
             cache.put('latent-feature-associations',numerical_key,numerical)
         else:
             numerical=hit[0]
-        layout_key=dict(version=1,correlation=fingerprint(numerical['correlation']),settings={k:settings[k] for k in ('umap_neighbors','umap_min_dist','umap_random_state')})
+        layout_key=dict(version=1,correlation=fingerprint(numerical['correlation']),settings={k:settings[k] for k in ('umap_neighbors','umap_min_dist','umap_random_state')},preprocessing=preprocessing)
         hit=cache.get('latent-feature-umap',layout_key)
         if hit is None:
             layout=feature_layout(numerical['correlation'],settings);cache.put('latent-feature-umap',layout_key,layout)

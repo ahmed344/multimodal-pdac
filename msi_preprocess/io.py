@@ -153,14 +153,62 @@ class CSRWriter:
 
 
 def copy_metadata(source: h5py.File, destination: h5py.File, retained: np.ndarray,
-                  provenance: dict) -> None:
-    """Copy observation metadata unchanged and subset feature metadata in order."""
+                  provenance: dict, rows: np.ndarray | None = None, block_rows: int = 8192) -> None:
+    """Subset both observation axes; copy large dense embeddings in bounded blocks."""
+    rows = np.arange(source["layers/counts"].attrs["shape"][0]) if rows is None else rows
     destination.attrs.update(source.attrs)
     for key in source:
-        if key not in {"X", "layers", "var", "varm", "varp", "raw"}:
+        if key not in {"X", "layers", "var", "varm", "varp", "raw", "obs", "obsm", "obsp"}:
             source.copy(key, destination)
     if "raw" in source or any(key != "counts" for key in source["layers"]):
         raise ValueError("Unexpected raw/extra layers: define their feature-subsetting semantics before export.")
+    obs = read_elem(source["obs"]).iloc[rows].copy()
+    for column in obs:
+        if isinstance(obs[column].dtype, pd.CategoricalDtype):
+            obs[column] = obs[column].cat.remove_unused_categories()
+    if provenance["schema"] >= 3:
+        obs["msi_source_row"] = np.asarray(rows, dtype=np.int64)
+    write_elem(destination, "obs", obs)
+    for key in ("obsm", "obsp"):
+        write_elem(destination, key, {})
+        if key not in source:
+            continue
+        for name, item in source[key].items():
+            if isinstance(item, h5py.Dataset):
+                shape = (len(rows), len(rows)) if key == "obsp" else (len(rows), *item.shape[1:])
+                target = destination[key].create_dataset(name, shape=shape, dtype=item.dtype, chunks=True)
+                target.attrs.update(item.attrs)
+                step = min(block_rows, 1024) if key == "obsp" else block_rows
+                for start in range(0, len(rows), step):
+                    selected = rows[start:start + step]
+                    if key == "obsp":
+                        column = 0
+                        while column < len(rows):
+                            end = int(np.searchsorted(rows, rows[column] + step))
+                            lo, hi = int(rows[column]), int(rows[end - 1]) + 1
+                            target[start:start + len(selected), column:end] = item[selected, lo:hi][:, rows[column:end] - lo]
+                            column = end
+                    else:
+                        target[start:start + len(selected)] = item[selected]
+            elif item.attrs.get("encoding-type") in ("csr_matrix", "csc_matrix"):
+                from anndata.io import sparse_dataset
+                matrix = sparse_dataset(item)
+                shape = (len(rows), len(rows) if key == "obsp" else matrix.shape[1])
+                writer = CSRWriter(destination[key], name, shape, matrix.dtype)
+                for start in range(0, len(rows), block_rows):
+                    block = matrix[rows[start:start + block_rows]]
+                    writer.append((block[:, rows] if key == "obsp" else block).tocsr())
+            else:
+                value = read_elem(item)
+                if not isinstance(value, pd.DataFrame):
+                    raise ValueError(f"Unsupported observation metadata encoding: {key}/{name}")
+                value = value.iloc[rows]
+                write_elem(destination[key], name, value.iloc[:, rows] if key == "obsp" else value)
+    if "uns/spatial" in destination:
+        manifest = json.loads(provenance["manifest_json"])
+        for decision in manifest.get("cohort", {}).get("decisions", []):
+            if not decision["included"] and decision["slide"] in destination["uns/spatial"]:
+                del destination["uns/spatial"][decision["slide"]]
     var = read_elem(source["var"]).iloc[retained].copy()
     var["msi_original_feature_index"] = retained
     write_elem(destination, "var", var)

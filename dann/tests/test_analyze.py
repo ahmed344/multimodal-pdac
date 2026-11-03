@@ -88,6 +88,20 @@ def test_batch_umap_uses_one_column_larger_legend(
     original_close(figure)
 
 
+def test_batch_umap_labels_only_observed_slides(tmp_path, monkeypatch):
+    captured = []
+    original_close = plt.close
+    monkeypatch.setattr(plt, "close", captured.append)
+    plot_latent_umap_batch(np.arange(8).reshape(4, 2), np.array([1, 3, 1, 3]),
+                          ["excluded-first", "retained-b", "excluded-middle", "retained-d", "excluded-last"],
+                          tmp_path / "observed.png", _plot_config())
+    figure = next(value for value in captured if isinstance(value, plt.Figure))
+    axis = figure.axes[0]
+    assert [item.get_text() for item in axis.get_legend().get_texts()] == ["retained-b", "retained-d"]
+    assert axis.get_title() == "Latent UMAP by batch (2 batches)"
+    original_close(figure)
+
+
 def test_ziln_umap_has_normal_and_batch_panels_without_legend(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

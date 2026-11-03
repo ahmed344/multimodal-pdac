@@ -92,7 +92,7 @@ def load_anndata_metadata(
     targets, target_valid_mask, exclusion_reasons = prepare_targets(
         raw_targets, target_columns, cd8_normalization
     )
-    batch_series = obs[batch_column].astype("category")
+    batch_series = obs[batch_column].astype("category").cat.remove_unused_categories()
     if batch_series.isna().any():
         raise ValueError(f"Batch column {batch_column!r} contains missing values.")
     batch_codes = batch_series.cat.codes.to_numpy(dtype=np.int64, copy=True)
@@ -601,9 +601,12 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
             raise ValueError("Checkpoint row identities or feature order differ from input data.")
     if preprocessing is not None:
         validate_preprocessing(path, data_config, training_rows=split_indices["train"])
-        if saved_splits is not None and not np.isin(saved_splits["train"], split_indices["train"]).all():
+        if (preprocessing.get("schema", 1) == 1 and saved_splits is not None
+                and not np.isin(saved_splits["train"], split_indices["train"]).all()):
             raise ValueError("Saved training rows cross the frozen preprocessing split.")
     if saved_splits is not None:
+        if preprocessing is not None and preprocessing.get("schema", 1) >= 3 and saved_identity is None:
+            raise ValueError("Saved splits require a matching preprocessing row identity.")
         split_indices = {key: np.asarray(value, dtype=np.int64).copy()
                          for key, value in saved_splits.items()}
         combined = np.concatenate(list(split_indices.values()))

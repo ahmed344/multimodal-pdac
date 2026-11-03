@@ -1,4 +1,4 @@
-"""Streaming linear-value verification and sampled lesion/DANN-loader checks."""
+"""Streaming verification of every linear tissue value and every matched lesion row."""
 from __future__ import annotations
 
 import argparse
@@ -12,6 +12,7 @@ import yaml
 from .fit import load_fit
 from .io import axes, json_write, match_rows, read_rows
 from .qc import read_csr_range
+from .cohort import aligned_export_rows
 
 
 def verify_linear_values(handle: h5py.File, batch: np.ndarray, state: dict, config: dict) -> int:
@@ -40,11 +41,10 @@ def verify_linear_values(handle: h5py.File, batch: np.ndarray, state: dict, conf
 
 
 def verify(fitted: str | Path, rows_per_slide: int = 128) -> dict:
-    """Verify all tissue linear values and reproducible lesion/tissue samples.
+    """Verify all tissue linear values, all lesion matches, and sampled DANN loading.
 
-    All matched original counts were checked during application. This separate
-    read-back check reports full linear-value coverage separately from sampled
-    lesion/tissue agreement, rather than claiming a second exhaustive row match.
+    Application checks every original matched count. This independent read-back
+    checks every exported lesion row against tissue, plus sampled loader values.
     """
     if rows_per_slide < 1:
         raise ValueError("rows_per_slide must be positive.")
@@ -54,6 +54,9 @@ def verify(fitted: str | Path, rows_per_slide: int = 128) -> dict:
     data = manifest["coordinate_columns"]
     tissue_obs, tissue_features = axes(output / "tissue.h5ad", data, config["patient_column"])
     lesion_obs, lesion_features = axes(output / "lesion.h5ad", data, config["patient_column"])
+    original_rows = {}
+    for kind in ("lesion", "tissue"):
+        _, original_rows[kind] = aligned_export_rows(output / f"{kind}.h5ad", manifest, state, kind)
     expected_features = state["features"][state["retained"]]
     np.testing.assert_array_equal(tissue_features, expected_features)
     np.testing.assert_array_equal(lesion_features, expected_features)
@@ -80,8 +83,15 @@ def verify(fitted: str | Path, rows_per_slide: int = 128) -> dict:
             if str(read_elem(handle["uns/msi_preprocess/intensity_scale"])) != "linear":
                 raise ValueError("Exported values must remain linear.")
         linear_values = verify_linear_values(tissue, batch, state, config)
-        for start in range(0, len(lesion_samples), rows_per_slide):
-            rows = lesion_samples[start:start+rows_per_slide]
+        for kind, exported in (("tissue", tissue), ("lesion", lesion)):
+            with h5py.File(config[f"{kind}_input"], "r") as source:
+                for start in range(0, len(original_rows[kind]), config["block_rows"]):
+                    stop = min(start + config["block_rows"], len(original_rows[kind]))
+                    counts = read_rows(source["layers/counts"], original_rows[kind][start:stop], config["block_rows"])[:, state["retained"]]
+                    if (counts != read_csr_range(exported["layers/counts"], start, stop)).nnz:
+                        raise ValueError("Exported retained counts disagree with original source rows.")
+        for start in range(0, len(lesion_obs), config["block_rows"]):
+            rows = np.arange(start, min(start + config["block_rows"], len(lesion_obs)))
             for key in ("X", "layers/counts"):
                 left = read_rows(lesion[key], rows, config["block_rows"])
                 right = read_rows(tissue[key], mapping[rows], config["block_rows"])
@@ -93,7 +103,8 @@ def verify(fitted: str | Path, rows_per_slide: int = 128) -> dict:
     dann = yaml.safe_load(Path(config["dann_config"]).read_text())
     settings = dict(dann["data"], path=str(output / "lesion.h5ad"), matrix_key="X",
                     intensity_transform="log1p", preprocessing_fingerprint=manifest["fingerprint"])
-    validate_preprocessing(output / "lesion.h5ad", settings, training_rows=state["training_rows"])
+    validate_preprocessing(output / "lesion.h5ad", settings, training_rows=state.get("fitting_rows", state.get("training_rows")))
+    validate_preprocessing(output / "tissue.h5ad", settings)
     metadata = load_anndata_metadata(output / "lesion.h5ad", settings["target_columns"], settings["batch_column"],
                                     "X", settings.get("cd8_normalization"))
     dataset = SparseAnnDataDataset(output / "lesion.h5ad", lesion_samples, metadata,
@@ -109,8 +120,9 @@ def verify(fitted: str | Path, rows_per_slide: int = 128) -> dict:
         dataset.close()
     result = dict(fingerprint=manifest["fingerprint"], schema_checked="all_rows",
                   linear_value_rows_checked=len(tissue_obs), linear_positive_values_checked=linear_values,
-                  lesion_value_rows_checked=len(lesion_samples),
-                  all_linear_values=True, all_sparse_zeros=True, sampled_lesion_tissue_agreement=True,
+                  lesion_value_rows_checked=len(lesion_obs),
+                  all_linear_values=True, all_sparse_zeros=True, exact_lesion_tissue_agreement=True,
+                  all_retained_counts_match_sources=True,
                   dann_log1p_exactly_once=True)
     json_write(output / "verification.json", result)
     return result
