@@ -181,7 +181,7 @@ def distribution_metrics(data: dict, y: np.ndarray, mask: np.ndarray, thresholds
     return results
 
 
-def fit_probes(train: dict, valid: dict, metadata, thresholds: list[float], epsilon: float, out: Path) -> dict:
+def fit_probes(train: dict, valid: dict, metadata, thresholds: list[float], epsilon: float, out: Path, *, persist_arrays: bool = True) -> dict:
     """Identical fixed probes; every scaler and model is fitted on training rows."""
     tr,va = train['rows'],valid['rows']
     scaler=StandardScaler().fit(train['latent'])
@@ -208,8 +208,9 @@ def fit_probes(train: dict, valid: dict, metadata, thresholds: list[float], epsi
     params['slide_coef']=model.coef_;params['slide_intercept']=model.intercept_
     params['slide_classes']=model.classes_
     print(f'Fitted slide probe in {int(np.max(model.n_iter_))} iterations',flush=True)
-    np.savez(out/'probe_parameters.npz',**params)
-    np.savez(out/'probe_predictions.npz',**predictions)
+    if persist_arrays:
+        np.savez(out/'probe_parameters.npz',**params)
+        np.savez(out/'probe_predictions.npz',**predictions)
     from importlib.metadata import version
     save_json(out/'probe_protocol.json',dict(
         training_rows=len(tr), training_rows_sha256=fingerprint(tr), validation_rows=len(va),

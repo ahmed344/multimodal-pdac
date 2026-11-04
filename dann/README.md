@@ -2932,3 +2932,36 @@ recommendation receives full tissue inference, spatial heatmaps, and latent
 variance analysis in the study directory. The study uses one training seed and
 validation-based selection; repeated diagnostic samples are not independent
 training replications. H&E-mediated transfer remains a separate assessment.
+
+### Combined-alignment refinement without tissue inference
+
+The separate refinement runner reuses a verified alignment study's frozen rows,
+thresholds, probe protocol, and checkpoints. It fits four fresh combined arms and
+pauses nHSIC 10/100 pilots after epoch five without changing their 300-epoch
+schedule. Pilot continuation requires the original biological/numerical limits
+and valid positive-weight objectives; early mixing alone is not a rejection.
+
+```bash
+python -m dann.verification.alignment_refinement \
+  --previous data/verification/alignment_sweep_2026-11-04_v6 \
+  --output data/verification/alignment_refinement_2026-11-04_v2 --prepare
+python -m dann.verification.alignment_refinement \
+  --output data/verification/alignment_refinement_2026-11-04_v2 --run
+```
+
+Rerunning `--run` verifies source/configuration/artifact hashes and reuses completed
+stages. Interrupted training resumes the last complete epoch with optimizer,
+scheduler, sampler, stopping and RNG state. An unavailable zero-weight alignment
+diagnostic records NaN with zero weighted contribution and explicit reasons.
+Positive-weight objectives without valid epoch evaluations and nonfinite outputs
+still fail: evidence and an unselectable, nonresumable snapshot go under
+`model/failures/`, leaving `best.pt`, `latest.pt` and archives untouched.
+
+The runner's stage allowlist contains only bounded training/validation smoke,
+training, pilot evaluation, checkpoint evaluation and full-validation UMAPs. It
+never invokes recommendation workflows, tissue inference, or spatial exports.
+Predictions/latents stay in memory; compact metrics, curves, UMAP coordinates and
+required checkpoints are retained. `report.html` links matched/common-epoch
+comparisons and distinguishes supervised selection from mixing selection. The
+existing combined recommendation is retained unless an eligible full fit improves
+both latent and UMAP neighbor excess.

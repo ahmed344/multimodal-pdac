@@ -31,7 +31,7 @@ from dann.initialization import initialize_supervised_heads
 from dann.model import AdversarialLatentFusion
 from dann.monitoring import GradientMonitor, StreamingCovariance, freeze_monitoring
 from dann.batch_alignment import (NAMES as ALIGNMENT_NAMES, alignment_settings, alignment_contract,
-                                  evaluate_alignment, sample_rows, AlignmentSummary, ValidationSample)
+                                  evaluate_alignment, sample_rows, AlignmentSummary, ValidationSample, AlignmentEvaluationError)
 from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
@@ -1028,9 +1028,14 @@ def run_epoch(
                         diagnostic_parts.clear()
             finite_outputs = torch.stack([torch.isfinite(value).all() for value in outputs.values()]).all()
             if not (torch.isfinite(total) & finite_outputs):
-                raise FloatingPointError(
+                error = FloatingPointError(
                     f"Non-finite objective or model output at epoch {epoch_index + 1}, step {step + 1}."
                 )
+                error.evidence = dict(alignment=alignment_summary.finish(strict=False),
+                    row_ids=batch['row_ids'].detach().cpu().tolist(),
+                    nonfinite_outputs={key: int((~torch.isfinite(value)).sum()) for key, value in outputs.items()},
+                    total_finite=bool(torch.isfinite(total)), step=step + 1, training=training)
+                raise error
             if training:
                 if sampled:
                     components = {f"{name}_{branch}": biology_weight * values[index] * bio_scale
@@ -1152,7 +1157,12 @@ def run_epoch(
             for measurement in measurements.values():
                 measurement.diagnostics.update(validation_sample.coverage())
             alignment_summary.add(measurements)
-    finalized.update(alignment_summary.finish())
+    try:
+        finalized.update(alignment_summary.finish())
+    except AlignmentEvaluationError as error:
+        error.evidence = dict(alignment=error.evidence, training=training, epoch=epoch_index + 1,
+                              completed_metrics=finalized)
+        raise
     finalized['total_loss'] = (finalized['supervised_objective'] + finalized.get('batch_weighted_loss', 0.)
                                + sum(finalized[f'alignment_{n}_weighted_loss'] for n in alignment_names))
     if gradient_monitor is not None:
@@ -1400,7 +1410,7 @@ def summarize_target_validity(bundle: DataBundle, config: Mapping[str, Any]) -> 
 
 
 def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
-                observer_updates: Sequence[int] = (1, 5, 10)) -> Path:
+                observer_updates: Sequence[int] = (1, 5, 10), stop_after_epoch: int | None = None) -> Path:
     """Train adversarial latent fusion and save best/latest checkpoints.
 
     Args:
@@ -1409,11 +1419,16 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
             bundle, effective config, and update record. RNG and module modes are
             restored after observation; callbacks must not mutate parameters.
         observer_updates (Sequence[int]): Completed optimizer updates to observe.
+        stop_after_epoch (int | None): Pause at this completed one-based epoch
+            without changing the configured scheduling horizon or stopping state.
 
     Returns:
         Path: Best validation checkpoint path.
     """
 
+    if stop_after_epoch is not None and (isinstance(stop_after_epoch, bool)
+            or not isinstance(stop_after_epoch, int) or stop_after_epoch < 1):
+        raise ValueError('stop_after_epoch must be a positive integer.')
     requested = config
     training = config["training"]
     resume = training.get("resume_checkpoint")
@@ -1607,7 +1622,7 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
         metadata["head_initialization"] = initialization
         if resume_payload.get('training_rng_state') is not None:
             restore_training_rng(resume_payload['training_rng_state'], bundle.loaders)
-        for epoch in range(start_epoch, epochs):
+        for epoch in range(start_epoch, min(epochs, stop_after_epoch or epochs)):
             print(f'Starting epoch {epoch + 1}/{epochs}.', flush=True)
             if artifacts is not None:
                 artifacts.check()
@@ -1689,7 +1704,7 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
                 if key not in history_columns:
                     history_columns.append(key)
             destinations = ['best.pt'] if improved else []
-            if (epoch + 1) % int(training["checkpoint_every"]) == 0 or should_stop or epoch + 1 == epochs:
+            if (epoch + 1) % int(training["checkpoint_every"]) == 0 or should_stop or epoch + 1 == epochs or epoch + 1 == stop_after_epoch:
                 destinations.append('latest.pt')
             archive_every = training.get('archive_checkpoint_every')
             if archive_every is not None and (epoch + 1) % archive_every == 0:
@@ -1728,6 +1743,34 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
             if should_stop:
                 print(f"Early stopping after epoch {epoch + 1}.", flush=True)
                 break
+    except (FloatingPointError, AlignmentEvaluationError) as error:
+        # This state may contain partial-epoch updates. Never publish it as best,
+        # latest, or an archive. An ordinary resume starts at the last complete epoch.
+        from uuid import uuid4
+        failure_dir = output_dir / 'failures' / f'epoch_{epoch + 1:04d}_{uuid4().hex[:12]}'
+        failure_dir.mkdir(parents=True)
+        evidence = dict(reason=str(error), epoch=epoch + 1, selectable=False, resumable=False,
+                        diagnostics=getattr(error, 'evidence', {}),
+                        last_completed_checkpoint=str(output_dir / 'latest.pt'))
+        snapshot = {**metadata, **cpu_snapshot(training_state(model, optimizer, lr_scheduler, warmup)),
+                    'checkpoint_kind': 'failure', 'selectable': False, 'resumable': False,
+                    'epoch': epoch, 'training_progress': asdict(progress_state),
+                    'training_rng_state': capture_training_rng(bundle.loaders), 'failure': evidence}
+        with atomic_output(failure_dir / 'snapshot.pt') as temporary:
+            torch.save(snapshot, temporary)
+        # Keep numerical diagnostics portable without depending on analysis modules.
+        def clean(value):
+            if isinstance(value, dict):
+                return {k: clean(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [clean(v) for v in value]
+            if isinstance(value, (float, np.floating)):
+                return float(value) if math.isfinite(value) else None
+            if isinstance(value, np.integer):
+                return int(value)
+            return value
+        atomic_json(failure_dir / 'diagnostics.json', clean(evidence))
+        raise
     finally:
         original_error = sys.exception()
         try:

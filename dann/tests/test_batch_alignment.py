@@ -86,6 +86,11 @@ def test_degeneracy_never_reports_zero_success(kind, reason):
     assert all(m.score is None and m.reason == reason for m in values.values())
     s = alignment_settings({'loss': {'batch_alignment': {'nhsic': {'enabled': True, 'weight': 0.}}}})
     summary = AlignmentSummary(s); summary.add({'nhsic': values['nhsic']})
+    result = summary.finish()
+    assert math.isnan(result['alignment_nhsic'])
+    assert result['alignment_nhsic_weighted_loss'] == 0.
+    assert result['alignment_nhsic_invalid_'+reason] == 1
+    s['nhsic']['weight'] = 1.
     with pytest.raises(ValueError, match='no valid evaluations'):
         summary.finish()
 

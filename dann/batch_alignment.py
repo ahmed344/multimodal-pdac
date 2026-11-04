@@ -168,6 +168,13 @@ def evaluate_alignment(latent: torch.Tensor, labels: torch.Tensor, names=NAMES,
     return result
 
 
+class AlignmentEvaluationError(ValueError):
+    """A positive-weight objective lacks valid epoch evaluations; retain evidence."""
+    def __init__(self, message: str, evidence: dict):
+        super().__init__(message)
+        self.evidence = evidence
+
+
 class AlignmentSummary:
     """Reduce valid evaluations equally over optimizer updates and expose coverage."""
     def __init__(self, settings):
@@ -178,23 +185,34 @@ class AlignmentSummary:
 
     def add(self, measurements):
         for name, measurement in measurements.items():
-            if measurement.score is None:
-                self.invalid[name][measurement.reason] += 1
+            if measurement.score is None or not torch.isfinite(measurement.score):
+                self.invalid[name][measurement.reason or 'nonfinite_score'] += 1
             else:
                 self.values[name].append(float(measurement.score.detach()))
             for key, value in measurement.diagnostics.items():
                 self.diagnostics[name].setdefault(key, []).append(float(value.detach() if isinstance(value, torch.Tensor) else value))
 
-    def finish(self):
-        result = {}
+    def finish(self, *, strict: bool = True) -> dict:
+        """Unavailable diagnostics contribute exactly zero when their weight is zero.
+
+        Build the entire evidence record before rejecting an unavailable weighted
+        objective. Missing scores stay NaN in history, never successful zeros.
+        """
+        result, failed = {}, []
         for name, values in self.values.items():
-            if not values:
-                raise ValueError(f'Enabled alignment objective {name} has no valid evaluations in epoch: {dict(self.invalid[name])}')
+            weight = self.settings[name]['weight']
+            score = float(np.mean(values)) if values else math.nan
             prefix = f'alignment_{name}'
-            result.update({prefix: float(np.mean(values)), prefix+'_weighted_loss': self.settings[name]['weight'] * float(np.mean(values)),
+            result.update({prefix: score, prefix+'_weighted_loss': weight * score if weight else 0.,
                            prefix+'_valid_count': len(values), prefix+'_invalid_count': sum(self.invalid[name].values())})
             result.update({prefix+'_invalid_'+reason: count for reason, count in self.invalid[name].items()})
             result.update({prefix+'_'+key: float(np.mean(v)) for key, v in self.diagnostics[name].items()})
+            if not values and weight > 0:
+                failed.append(name)
+        if strict and failed:
+            raise AlignmentEvaluationError(
+                f'Enabled alignment objective {", ".join(failed)} has no valid evaluations in epoch: '
+                f'{ {n: dict(self.invalid[n]) for n in failed} }', result)
         return result
 
 

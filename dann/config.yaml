@@ -224,7 +224,6 @@ training:
   early_stopping_patience: 10  # Epochs without improvement in the validation selection metric.
   early_stopping_min_delta: 0.001  # Minimum improvement in the selected score's units.
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
-  archive_checkpoint_every: null  # Optional epoch archives; null disables, study configs use 5.
   resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, and early stopping may override.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
 

@@ -32,6 +32,8 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     Flags missing from older versions mean false for the corresponding component.
     No checkpoint data is mutated or rewritten.
     """
+    if checkpoint.get('checkpoint_kind') == 'failure' or checkpoint.get('selectable') is False:
+        raise ValueError('Failure snapshots are diagnostic evidence, not selectable or resumable checkpoints.')
     config = copy.deepcopy(checkpoint['config'])
     saved = copy.deepcopy(checkpoint.get('architecture'))
     version = saved['version'] if saved is not None else 2
@@ -116,6 +118,8 @@ def legacy_parameter_conversion(state: Mapping[str, Any]) -> dict[str, Any]:
 def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any],
                         model=None, optimizer: bool = False) -> None:
     """Reject architecture or optimizer registration changes before loading state."""
+    if checkpoint.get('checkpoint_kind') == 'failure' or checkpoint.get('selectable') is False:
+        raise ValueError('Failure snapshots are diagnostic evidence, not selectable or resumable checkpoints.')
     if checkpoint['config']['data'].get('preprocessing_fingerprint') != config['data'].get('preprocessing_fingerprint'):
         raise ValueError('Changed MSI preprocessing requires fresh training; incompatible checkpoint.')
     saved = architecture_contract(checkpoint_config(checkpoint))

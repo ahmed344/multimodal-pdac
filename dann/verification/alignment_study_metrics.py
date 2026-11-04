@@ -86,7 +86,8 @@ def variance_spectrum(values: np.ndarray) -> dict:
         total = float(eig.sum())
         result[name] = dict(total_variance=total, eigenvalues=eig.tolist(),
                             numerical_rank=int(np.sum(eig > max(1e-12, float(eig[0])*1e-8))),
-                            participation_ratio=float(total**2/np.square(eig).sum()) if total > 0 else 0.)
+                            participation_ratio=float(total**2/np.square(eig).sum()) if total > 0 else 0.,
+                            leading_fraction=float(eig[0]/total) if total > 0 else None)
     # Operational numerical-collapse floor, fixed before examining candidates.
     result['noncollapsed'] = all(result[n]['total_variance'] > 1e-8 and
                                 result[n]['numerical_rank'] >= 2 for n in ('raw', 'normalized'))
@@ -96,6 +97,8 @@ def variance_spectrum(values: np.ndarray) -> dict:
 def eligibility(candidate: dict, reference: dict) -> dict:
     """Inclusive bounds; negative log likelihood uses 10% of reference magnitude."""
     checks = []
+    if candidate.get('selectable') is False or candidate.get('checkpoint_kind') == 'failure':
+        return dict(eligible=False, checks=[dict(metric='selectable', passed=False)])
     def bound(name, value, ref, allowance):
         finite = value is not None and ref is not None and np.isfinite(value) and np.isfinite(ref)
         checks.append(dict(metric=name, value=value, reference=ref, allowance=allowance,

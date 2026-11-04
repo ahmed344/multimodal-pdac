@@ -468,7 +468,7 @@ def evaluate_checkpoint(root: Path, arm: str, path: Path, m: dict, c: dict, bund
             pit = ndtr((np.log(values/(1-values))-valid['mu'][positive,j])/valid['sigma'][positive,j])
             distributions[name]['positive_pit_ks'] = float(kstest(pit,'uniform').statistic) if len(pit) else None
         record['distributions'] = distributions
-        predictions = fit_probes(train,valid,metadata,m['cd8_thresholds'],epsilon,out)
+        predictions = fit_probes(train,valid,metadata,m['cd8_thresholds'],epsilon,out,persist_arrays=False)
         record['probes'] = probe_metrics(predictions,y,mask,metadata.batch_codes[rows],m['cd8_thresholds'],np.ones(len(rows),bool))
         quartiles = np.digitize(y[:,3],m['stroma_quartiles'])
         record['stratified_probes'] = {f'stroma_q{q+1}':probe_metrics(predictions,y,mask,metadata.batch_codes[rows],
@@ -591,19 +591,10 @@ def execute_stage(root: Path, arm: str, stage: str) -> None:
     atomic_json(stamp,dict(status='running',identity=identity,started_utc=datetime.now(timezone.utc).isoformat()))
     try:
         if stage == 'smoke':
-            from dann.verification.dictionary_comparison import smoke
-            smoke_inputs(root,c)
-            # Exercise every weighted objective and archived checkpoints in isolation.
-            c['training']['archive_checkpoint_every'] = 1
-            c['analysis']['peaks']['enabled'] = False
-            c['analysis']['latent_interactive'] = False
+            from dann.verification.alignment_refinement import bounded_smoke
+            # Train and validate in isolation; never invoke the downstream helper.
             c['loss']['batch_alignment'].update({name:dict(enabled=True,weight=weight) for name,weight in zip(NAMES,(1.,.1,1.))})
-            result = smoke(root,arm,c)
-            checkpoint = Path(result['checkpoint'])
-            archive = checkpoint.parent/'archives/epoch_0001.pt'
-            if not archive.is_file() or not torch.load(archive,map_location='cpu',weights_only=False).get('training_rng_state'):
-                raise ValueError('Smoke did not archive restartable state.')
-            result['files'] = [str(checkpoint),str(archive)]
+            result = bounded_smoke(root,c)
         elif stage == 'train':
             latest = Path(c['training']['output_dir'])/'latest.pt'
             if latest.exists():
