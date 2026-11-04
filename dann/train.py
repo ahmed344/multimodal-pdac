@@ -30,6 +30,8 @@ from dann.lr_scheduler import (create_lr_scheduler, step_lr_scheduler, validate_
 from dann.initialization import initialize_supervised_heads
 from dann.model import AdversarialLatentFusion
 from dann.monitoring import GradientMonitor, StreamingCovariance, freeze_monitoring
+from dann.batch_alignment import (NAMES as ALIGNMENT_NAMES, alignment_settings, alignment_contract,
+                                  evaluate_alignment, sample_rows, AlignmentSummary, ValidationSample)
 from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
@@ -106,6 +108,7 @@ def accumulation_scales(batch: Mapping[str, Any], biology, ziln_loss: ZILNLoss,
 
 
 _RESUME_OVERRIDES = (
+    "archive_checkpoint_every",
     "early_stopping_enabled",
     "early_stopping_patience",
     "early_stopping_min_delta",
@@ -133,6 +136,12 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     if (saved_config.get('data', {}).get('preprocessing_fingerprint')
             != requested_config.get('data', {}).get('preprocessing_fingerprint')):
         raise ValueError('Changed MSI preprocessing requires fresh training; cannot resume this checkpoint.')
+    from dann.batch_alignment import alignment_contract
+    if alignment_contract(saved_config) != alignment_contract(requested_config):
+        raise ValueError('Changed alignment objective requires fresh training.')
+    if (saved_config.get('model', {}).get('heads', {}).get('discriminator', {}).get('enabled', True)
+            != requested_config.get('model', {}).get('heads', {}).get('discriminator', {}).get('enabled', True)):
+        raise ValueError('Changed enabled heads require fresh training.')
     saved_components = architecture_contract(saved_config)['components'] if 'model' in saved_config else {}
     requested_components = architecture_contract(requested_config)['components'] if 'model' in requested_config else {}
     for name, group in saved_components.items():
@@ -148,6 +157,8 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
                  for c in (saved_config, requested_config))
     if has_he and architecture_contract(saved_config)['components'].get('he') != architecture_contract(requested_config)['components'].get('he'):
         raise ValueError('Incompatible H&E settings on resume; adding or changing the head requires fresh training.')
+    if saved_components and architecture_contract(saved_config) != architecture_contract(requested_config):
+        raise ValueError('Changed architecture contract requires fresh training.')
     config = copy.deepcopy(dict(saved_config))
     training = config.setdefault("training", {})
     training["lr_scheduler"] = lr_scheduler_settings(training)
@@ -744,6 +755,10 @@ def _format_epoch_summary(
     )
     if "he_r2" in train_metrics:
         fit_parts += (("H&E R²", "he_r2", 4),)
+    loss_parts = tuple(p for p in loss_parts if p[1] in train_metrics)
+    fit_parts = tuple(p for p in fit_parts if p[1] in train_metrics)
+    loss_parts += tuple((f'{n} alignment', f'alignment_{n}', 6) for n in ALIGNMENT_NAMES
+                        if f'alignment_{n}' in train_metrics)
     loss_text = " | ".join(
         f"{label} = {_format_pair(train_metrics[key], validation_metrics[key], decimals)}"
         for label, key, decimals in loss_parts
@@ -832,6 +847,9 @@ def run_epoch(
     monitoring: Mapping[str, Any] | None = None,
     warmup: UpdateWarmup | None = None,
     update_callback_updates: Sequence[int] | None = None,
+    batch_alignment: Mapping[str, Any] | None = None,
+    alignment_seed: int = 0,
+    validation_alignment_rows: Sequence[int] | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -870,6 +888,15 @@ def run_epoch(
     """
 
     training = optimizer is not None
+    alignment = alignment_settings({'loss': {'batch_alignment': batch_alignment or {}}})
+    alignment_names = [n for n in ALIGNMENT_NAMES if alignment[n]['enabled']]
+    alignment_summary = AlignmentSummary(alignment)
+    validation_sample = None
+    diagnostic_parts = []
+    if alignment_names and not training:
+        if validation_alignment_rows is None:
+            raise ValueError('Enabled alignment requires preselected validation sample identities.')
+        validation_sample = ValidationSample(validation_alignment_rows)
     dataset = getattr(loader, 'dataset', None)
     resident = getattr(dataset, 'resident', None) or getattr(getattr(dataset, 'tiles', None), 'resident', None)
     validate_targets = resident is None
@@ -898,6 +925,8 @@ def run_epoch(
     gradient_monitor = (GradientMonitor(model, target_columns, steps_per_epoch,
                                        monitor_settings["gradient_updates_per_epoch"])
                         if training and monitor_settings["enabled"] else None)
+    if gradient_monitor is not None:
+        gradient_monitor.include_ihc = biology_weight > 0
     validation_monitor = StreamingCovariance() if not training and monitor_settings["enabled"] else None
     used_lrs = []
     warmup_updates = 0
@@ -920,6 +949,8 @@ def run_epoch(
             if artifacts is not None:
                 artifacts.check()
             group = cpu_batch.get("accumulation", {})
+            if training and group.get('count', 1) > 1 and any(alignment[n]['weight'] > 0 for n in alignment_names):
+                raise ValueError('Direct alignment requires unsplit optimizer batches; pairwise losses cannot be averaged across microbatches.')
             first = group.get("index", 0) == 0
             last = group.get("index", 0) + 1 == group.get("count", 1)
             if training and first and deadline is not None and perf_counter() >= deadline:
@@ -935,7 +966,8 @@ def run_epoch(
                 optimizer.zero_grad(set_to_none=True)
             if outputs is None:
                 outputs = model(batch, grl_strength=strength)
-            batch_class_count = outputs["batch_logits"].shape[-1]
+            if 'batch_logits' in outputs:
+                batch_class_count = outputs["batch_logits"].shape[-1]
             sampled = gradient_monitor is not None and state.update_in_epoch in gradient_monitor.positions
             biology = ziln_loss(
                 outputs["pi_logits"],
@@ -956,9 +988,8 @@ def run_epoch(
                 _update_fit_statistics(
                     metrics, outputs, batch, ziln_loss.logit_epsilon
                 )
-            discriminator = F.cross_entropy(
-                outputs["batch_logits"], batch["batches"], weight=class_weights
-            )
+            discriminator = (F.cross_entropy(outputs["batch_logits"], batch["batches"], weight=class_weights)
+                             if 'batch_logits' in outputs else biology.total.new_zeros(()))
             he_loss = biology.total.new_zeros(())
             if 'he_prediction' in outputs:
                 from dann.he import he_mse
@@ -967,6 +998,34 @@ def run_epoch(
             bio_scale, class_scale, he_scale = accumulation_scales(batch, biology, ziln_loss, class_weights)
             total = (biology_weight * biology.total * bio_scale
                      + batch_weight * discriminator * class_scale + he_weight * he_loss * he_scale)
+            alignment_components = {}
+            if alignment_names:
+                if not training:
+                    validation_sample.add(batch['row_ids'], batch['batches'], outputs['latent'])
+                else:
+                    # Diagnostic-only accumulation is allowed, but evaluated after gathering
+                    # the complete logical batch. Positive-weight objectives reject splitting.
+                    diagnostic_parts.append((batch['row_ids'].detach(), batch['batches'].detach(),
+                                             outputs['latent'] if group.get('count', 1) == 1 else outputs['latent'].detach()))
+                    if last:
+                        ids = torch.cat([p[0] for p in diagnostic_parts]).cpu().numpy()
+                        labels = torch.cat([p[1] for p in diagnostic_parts])
+                        latents = torch.cat([p[2] for p in diagnostic_parts])
+                        chosen = sample_rows(ids, labels.cpu().numpy(), alignment['train_per_slide'],
+                                             alignment_seed, state.optimizer_updates)
+                        indices = np.flatnonzero(np.isin(ids, chosen))
+                        measurements = evaluate_alignment(latents[indices], labels[indices], alignment_names,
+                                                          alignment['bandwidths'], alignment['temperature'])
+                        for measurement in measurements.values():
+                            measurement.diagnostics.update(optimizer_rows=len(ids),
+                                optimizer_slides=len(torch.unique(labels)), sampled_fraction=len(indices)/max(len(ids), 1),
+                                sampling_singleton_rows=int((torch.unique(labels, return_counts=True)[1] == 1).sum()))
+                        alignment_summary.add(measurements)
+                        for name, measurement in measurements.items():
+                            if measurement.score is not None and alignment[name]['weight'] > 0:
+                                alignment_components[name] = alignment[name]['weight'] * measurement.score
+                        total = total + sum(alignment_components.values())
+                        diagnostic_parts.clear()
             finite_outputs = torch.stack([torch.isfinite(value).all() for value in outputs.values()]).all()
             if not (torch.isfinite(total) & finite_outputs):
                 raise FloatingPointError(
@@ -977,8 +1036,10 @@ def run_epoch(
                     components = {f"{name}_{branch}": biology_weight * values[index] * bio_scale
                                   for branch, values in zip(("hurdle", "positive"), biology.differentiable_components)
                                   for index, name in enumerate(gradient_monitor.names)}
-                    components["batch"] = batch_weight * discriminator * class_scale
-                    if 'he_prediction' in outputs:
+                    if 'batch_logits' in outputs and batch_weight > 0:
+                        components["batch"] = batch_weight * discriminator * class_scale
+                    components.update(alignment_components)
+                    if 'he_prediction' in outputs and he_weight > 0:
                         components["he"] = he_weight * he_loss * he_scale
                     gradient_monitor.accumulate(components)
                     del components
@@ -1043,8 +1104,9 @@ def run_epoch(
             metrics["hurdle_per_target"] += biology.hurdle_per_target * report_mass
             metrics["positive_per_target"] += biology.positive_per_target * report_mass
             metrics["batch"] += discriminator.detach() * class_scale * group.get("rows", batch_size)
-            predictions = outputs["batch_logits"].argmax(dim=1)
-            metrics["batch_correct"] += (predictions == batch["batches"]).sum().detach()
+            if 'batch_logits' in outputs:
+                predictions = outputs["batch_logits"].argmax(dim=1)
+                metrics["batch_correct"] += (predictions == batch["batches"]).sum().detach()
     batches.close()
     if training and state.update_in_epoch == steps_per_epoch:
         state.epoch = epoch_index + 1
@@ -1078,8 +1140,25 @@ def run_epoch(
     finalized["batch_selection_penalty"] = grl_max_lambda * batch_weight * max(
         finalized["batch_chance_loss"] - finalized["batch_loss"], 0.0)
     finalized["batch_aware_objective"] = finalized["supervised_objective"] + finalized["batch_selection_penalty"]
+    if batch_class_count is None:
+        for key in ('batch_loss', 'batch_accuracy', 'batch_weighted_loss', 'batch_chance_loss',
+                    'batch_selection_penalty', 'batch_aware_objective'):
+            finalized.pop(key, None)
+    if validation_sample is not None:
+        latents, labels = validation_sample.tensors()
+        with torch.inference_mode():
+            measurements = evaluate_alignment(latents, labels, alignment_names,
+                alignment['bandwidths'], alignment['temperature'])
+            for measurement in measurements.values():
+                measurement.diagnostics.update(validation_sample.coverage())
+            alignment_summary.add(measurements)
+    finalized.update(alignment_summary.finish())
+    finalized['total_loss'] = (finalized['supervised_objective'] + finalized.get('batch_weighted_loss', 0.)
+                               + sum(finalized[f'alignment_{n}_weighted_loss'] for n in alignment_names))
     if gradient_monitor is not None:
         finalized.update(gradient_monitor.finish())
+        if batch_class_count is None:
+            finalized = {k: v for k, v in finalized.items() if 'grl_strength' not in k}
     if validation_monitor is not None:
         finalized.update(validation_monitor.finish())
     if audit is not None and sampling_audit_dir is not None:
@@ -1110,6 +1189,39 @@ def run_epoch(
     return finalized
 
 
+def capture_training_rng(loaders: Mapping[str, Any]) -> dict[str, Any]:
+    """Snapshot dropout and loader streams at a completed epoch boundary."""
+    import random
+    generators = {}
+    for name, loader in loaders.items():
+        source = getattr(loader, 'source', loader)
+        generator = getattr(source, 'generator', None)
+        if generator is not None:
+            generators[name] = generator.get_state().clone()
+    return dict(python=random.getstate(), numpy=np.random.get_state(),
+                torch=torch.get_rng_state().clone(),
+                cuda=[s.clone() for s in torch.cuda.get_rng_state_all()] if torch.cuda.is_available() else [],
+                loaders=generators,
+                prepared_iterations={name: loader._iteration_created for name, loader in loaders.items()
+                                     if hasattr(loader, '_iteration_created')})
+
+
+def restore_training_rng(state: Mapping[str, Any], loaders: Mapping[str, Any]) -> None:
+    """Restore new-format checkpoints without changing legacy resume behavior."""
+    import random
+    random.setstate(state['python'])
+    np.random.set_state(state['numpy'])
+    torch.set_rng_state(state['torch'])
+    if state['cuda']:
+        torch.cuda.set_rng_state_all(state['cuda'])
+    for name, value in state['loaders'].items():
+        source = getattr(loaders[name], 'source', loaders[name])
+        source.generator.set_state(value)
+    for name, value in state.get('prepared_iterations', {}).items():
+        if hasattr(loaders[name], '_iteration_created'):
+            loaders[name]._iteration_created = value
+
+
 def checkpoint_metadata(
     model: AdversarialLatentFusion,
     config: Mapping[str, Any],
@@ -1124,7 +1236,7 @@ def checkpoint_metadata(
         settings = component_settings(config["model"])
         for name, group in [("aggregation", saved_config["model"]["aggregation"]),
                             *saved_config["model"]["heads"].items()]:
-            if name == "he" and name not in settings["heads"]:
+            if name in {"he", "discriminator"} and name not in settings["heads"]:
                 continue
             resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
             group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
@@ -1138,6 +1250,8 @@ def checkpoint_metadata(
     validate_checkpoint({"config": saved_config, "architecture": architecture}, config, model)
     return {
         "monitoring_definitions": copy.deepcopy(config.get("monitoring_definitions")),
+        "objective_contract": alignment_contract(config),
+        "validation_alignment_sample": copy.deepcopy(config.get("validation_alignment_sample")),
         "optimization": dict(
             logical_updates_per_epoch=getattr(bundle.loaders["train"].sampler, "logical_updates",
                                               len(bundle.loaders["train"])),
@@ -1327,9 +1441,23 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
     if resume_payload:
         validate_training_data_contract(resume_payload, config)
     preparation_started = perf_counter()
+    print('Startup: preparing training data.', flush=True)
     bundle = create_data_bundle(config, resume_payload.get("split_indices"), resume_payload.get("data_identity"))
     if resume_payload and tuple(resume_payload["batch_names"]) != bundle.metadata.batch_names:
         raise ValueError("Resume batch order is incompatible.")
+    config = copy.deepcopy(dict(config))
+    alignment = alignment_settings(config)
+    if any(alignment[n]['enabled'] for n in ALIGNMENT_NAMES):
+        rows = bundle.split_indices['validation']
+        chosen = sample_rows(rows, bundle.metadata.batch_codes[rows], alignment['validation_per_slide'], int(training['seed']))
+        validation_sample = dict(row_ids=chosen.tolist(), batch_codes=bundle.metadata.batch_codes[chosen].tolist(),
+                                 batch_names=list(bundle.metadata.batch_names), seed=int(training['seed']),
+                                 split_rows=len(rows), sampled_fraction=len(chosen)/max(len(rows), 1),
+                                 estimator=alignment_contract(config))
+        saved_sample = resume_payload.get('validation_alignment_sample')
+        if resume_payload and saved_sample != validation_sample:
+            raise ValueError('Validation alignment sample changed; fresh training required.')
+        config['validation_alignment_sample'] = validation_sample
     config = freeze_monitoring(config)
     training = config["training"]
     preparation_seconds = perf_counter() - preparation_started
@@ -1361,8 +1489,12 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
                 module.training = mode
     if not resume:
         observe('parameters_initialized')
+    initialization_started = perf_counter()
+    print('Startup: restoring head initialization.' if resume else 'Startup: initializing supervised heads from training rows.', flush=True)
     initialization = (resume_payload.get("head_initialization", {"resumed_without_reinitialization": True})
                       if resume else initialize_supervised_heads(model, bundle, config))
+    initialization_seconds = perf_counter() - initialization_started
+    print(f'Startup: head initialization ready in {initialization_seconds:.2f}s.', flush=True)
     if not resume:
         observe('heads_initialized', {'head_initialization': initialization})
     ziln_loss = ZILNLoss.from_config(config).to(device)
@@ -1404,12 +1536,19 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
     with (output_dir / "execution_startup.json").open('w') as handle:
         json.dump(dict(preparation_seconds=preparation_seconds,
                        resident_spectra_bytes=resident.nbytes if resident is not None else 0,
+                       resident_he_bytes=bundle.he_reader.nbytes if bundle.he_reader is not None else 0,
+                       he_cache_seconds=bundle.he_reader.startup_seconds if bundle.he_reader is not None else 0.,
+                       head_initialization_seconds=initialization_seconds,
+                       peak_host_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20,
                        logical_updates_per_epoch=logical_updates,
                        microbatch_rows=training.get("microbatch_rows"),
                        grl_horizon_updates=training.get("grl_horizon_updates"),
                        performance=config.get('performance', {})), handle, indent=2)
     with (output_dir / "resolved_config.yaml").open("w", encoding="utf-8") as handle:
         yaml.safe_dump(dict(config), handle, sort_keys=False)
+    if 'validation_alignment_sample' in config:
+        with (output_dir / 'validation_alignment_sample.json').open('w') as handle:
+            json.dump(config['validation_alignment_sample'], handle, indent=2)
     with (output_dir / "data_schema.json").open("w", encoding="utf-8") as handle:
         json.dump(
             {
@@ -1466,7 +1605,10 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
         target_columns = list(config["data"]["target_columns"])
         metadata = checkpoint_metadata(model, config, bundle)
         metadata["head_initialization"] = initialization
+        if resume_payload.get('training_rng_state') is not None:
+            restore_training_rng(resume_payload['training_rng_state'], bundle.loaders)
         for epoch in range(start_epoch, epochs):
+            print(f'Starting epoch {epoch + 1}/{epochs}.', flush=True)
             if artifacts is not None:
                 artifacts.check()
             learning_rate = float(optimizer.param_groups[0]["lr"])
@@ -1487,6 +1629,9 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=gradient_clip_norm,
                 monitoring=config.get("monitoring"),
+                batch_alignment=config['loss'].get('batch_alignment'),
+                alignment_seed=int(training['seed']),
+                validation_alignment_rows=config.get('validation_alignment_sample', {}).get('row_ids'),
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
                 sampling_audit_dir=output_dir / "sampling",
@@ -1515,6 +1660,9 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=None,
                 monitoring=config.get("monitoring"),
+                batch_alignment=config['loss'].get('batch_alignment'),
+                alignment_seed=int(training['seed']),
+                validation_alignment_rows=config.get('validation_alignment_sample', {}).get('row_ids'),
                 cd8_index=target_columns.index(CD8),
                 target_columns=target_columns,
                 artifacts=artifacts,
@@ -1543,6 +1691,9 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
             destinations = ['best.pt'] if improved else []
             if (epoch + 1) % int(training["checkpoint_every"]) == 0 or should_stop or epoch + 1 == epochs:
                 destinations.append('latest.pt')
+            archive_every = training.get('archive_checkpoint_every')
+            if archive_every is not None and (epoch + 1) % archive_every == 0:
+                destinations.append(f'archives/epoch_{epoch + 1:04d}.pt')
             payload, snapshot_seconds = None, 0.
             if destinations:
                 snapshot_started = perf_counter()
@@ -1552,6 +1703,7 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
                 payload = checkpoint_payload(metadata, state, epoch, stopper.best, best_epoch=best_epoch,
                                              selection_start_epoch=selection_start_epoch, stopper=stopper,
                                              progress_state=progress_state)
+                payload['training_rng_state'] = capture_training_rng(bundle.loaders)
                 del state
             selection = dict(selection_metric=metric, best_epoch=best_epoch, selection_start_epoch=selection_start_epoch)
             summary = _format_epoch_summary(epoch + 1, epochs, train_metrics, validation_metrics,

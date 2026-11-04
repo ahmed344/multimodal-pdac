@@ -47,9 +47,10 @@ def weighted_history(history: pd.DataFrame, config: Mapping[str, Any] | None) ->
 
 # Target colors are stable across figures; branch and adversarial colors differ.
 COLORS = dict(ihc='C0', he='C2', batch='C5', cd8='C0', tumor='C1', collagen='C2',
-              stroma='C4', hurdle='#333333', positive='C3')
+              stroma='C4', hurdle='#333333', positive='C3', nhsic='C6', anova='C7', soft_nn='C8')
 LABELS = dict(ihc='IHC', he='H&E', batch='Adversarial', cd8='CD8', tumor='Tumor',
-              collagen='Collagen', stroma='Stroma', hurdle='Hurdle', positive='Positive')
+              collagen='Collagen', stroma='Stroma', hurdle='Hurdle', positive='Positive',
+              nhsic='nHSIC', anova='Cosine ANOVA', soft_nn='Soft-NN')
 TARGET_ORDER = ('cd8', 'tumor', 'collagen', 'stroma')
 
 
@@ -104,9 +105,9 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
     """Render explicit rows and column spans, preserving gaps and real zeros."""
     from matplotlib.lines import Line2D
     from matplotlib.ticker import PercentFormatter
-    width, height = figure_size(kind)
+    width, height = figure_size(kind, len(rows))
     figure = plt.figure(figsize=(width, height))
-    grid = figure.add_gridspec(FIGURE_ROWS[kind], 4, left=.075, right=.985,
+    grid = figure.add_gridspec(max(len(rows), 1), 4, left=.075, right=.985,
                               bottom=FOOTER_HEIGHT/height, top=1-HEADER_HEIGHT/height,
                               hspace=.65, wspace=.48)
     figure.suptitle(title, y=1-.18/height)
@@ -123,8 +124,14 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
                              label=f'Selected checkpoint: epoch {int(best_epoch)}'))
     figure.legend(handles=styles, loc='upper center', bbox_to_anchor=(.5, 1-1.32/height),
                   ncol=len(styles), frameon=False)
-    figure.legend(handles=[Line2D([], [], color=COLORS[n], linewidth=3, label=LABELS[n]) for n in components],
-                  loc='upper center', bbox_to_anchor=(.5, 1-1.78/height), ncol=len(components), frameon=False)
+    keys = [series[0] for row in rows for panel in row for series in panel['series']]
+    def represented(name):
+        tokens = ('biology', 'gradient_overall_ihc', 'hurdle_acc', 'mean_r2') if name == 'ihc' else (f'_{name}',)
+        return any(any(token in key for token in tokens) for key in keys)
+    components = [name for name in components if represented(name)]
+    if components:
+        figure.legend(handles=[Line2D([], [], color=COLORS[n], linewidth=3, label=LABELS[n]) for n in components],
+                      loc='upper center', bbox_to_anchor=(.5, 1-1.78/height), ncol=len(components), frameon=False)
     epochs = _values(history, 'epoch')
     for row_index, panels in enumerate(rows):
         column = 0
@@ -145,7 +152,13 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
                         data = np.asarray(data) * 100
                         data[:, ~np.isfinite(data).all(axis=0)] = np.nan
                         available = bool(np.isfinite(data).any())
-                        axis.stackplot(epochs, data, colors=[s[2] for s in panel['series']], alpha=.8)
+                        if len(epochs) == 1:
+                            bottom = 0.
+                            for values, series in zip(data, panel['series']):
+                                axis.bar(epochs, values, bottom=bottom, width=.6, color=series[2], alpha=.8)
+                                bottom += values[0]
+                        else:
+                            axis.stackplot(epochs, data, colors=[s[2] for s in panel['series']], alpha=.8)
                     axis.set_ylim(0, 100)
                     axis.yaxis.set_major_formatter(PercentFormatter())
                 else:
@@ -156,7 +169,7 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
                             zeros |= bool((values == 0).any())
                             values = np.where(values > 0, values, np.nan)
                         axis.plot(epochs, values, label=label, color=color, linestyle=style,
-                                  marker='.', markersize=3)
+                                  marker='.', markersize=5, zorder=3)
                     if panel.get('log'):
                         axis.set_yscale('log')
                         if not any(np.any(v > 0) for v in data):
@@ -183,7 +196,7 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
                 axis.text(.5, .5, 'Unavailable in saved history', transform=axis.transAxes,
                           ha='center', va='center', fontsize=12, color='dimgray')
             if best_epoch is not None:
-                axis.axvline(float(best_epoch), color='red', linestyle='--', linewidth=1, zorder=5)
+                axis.axvline(float(best_epoch), color='red', linestyle='--', linewidth=1, zorder=1)
             axis.xaxis.set_major_locator(MaxNLocator(integer=True, min_n_ticks=1))
             if len(epochs) == 1:
                 selected = float(best_epoch) if best_epoch is not None else epochs[0]
@@ -216,9 +229,29 @@ def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi:
         if best_epoch is None and 'selected_epoch' in history:
             selected = history['selected_epoch'].dropna()
             best_epoch = float(selected.iloc[-1]) if len(selected) else None
+    rows, ihc_rows, overall, alignment = objective_layout(history, config, metric)
+    output_path = Path(output_path)
+    with atomic_output(output_path.with_name('ihc_curves.png')) as temporary:
+        _render(history, ihc_rows, temporary, figure_dpi, 'ihc',
+                'IHC target fit, weighted objectives, and gradient composition', best_epoch, metric,
+                [*TARGET_ORDER, 'hurdle', 'positive'])
+    _render(history, rows, output_path, figure_dpi, 'loss',
+            'Overall objectives, shared gradients, and latent diversity', best_epoch, metric,
+            [*dict.fromkeys([*overall, *alignment]), 'hurdle', 'positive'])
+
+
+def objective_layout(history, config=None, metric=None):
+    """Build the actual rows shared by plotting and render-memory reservations."""
     he = (config.get('model', {}).get('heads', {}).get('he', {}).get('enabled', False) if config is not None
           else any('he_weighted_loss' in c or 'he_mse' in c or 'he_r2' in c for c in history))
-    overall = ['ihc', *(['he'] if he else []), 'batch']
+    from dann.batch_alignment import NAMES, alignment_settings
+    settings = alignment_settings(config or {})
+    alignment = [n for n in NAMES if (settings[n]['enabled'] and any(f'alignment_{n}' in c for c in history) if config is not None else f'train_alignment_{n}' in history)]
+    disc = (config.get('model', {}).get('heads', {}).get('discriminator', {}).get('enabled', True)
+            if config is not None else any('batch_loss' in c or 'batch_accuracy' in c for c in history))
+    active_alignment = [n for n in alignment if (settings[n]['weight'] > 0 if config is not None
+                        else f'train_gradient_overall_{n}_norm_mean' in history)]
+    overall = ['ihc', *(['he'] if he else []), *(['batch'] if disc else []), *active_alignment]
     gradients = _gradient_panels('gradient_overall', overall, 'Objectives')
     gradients[2]['cmap'] = 'coolwarm'
     rows = [
@@ -259,11 +292,30 @@ def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi:
         [dict(branches[name][4], series=[(f'train_gradient_{name}_retained_mean', 'Retained magnitude', COLORS[name], '-')])
          for name in TARGET_ORDER],
     ]
-    output_path = Path(output_path)
-    with atomic_output(output_path.with_name('ihc_curves.png')) as temporary:
-        _render(history, ihc_rows, temporary, figure_dpi, 'ihc',
-                'IHC target fit, weighted objectives, and gradient composition', best_epoch, metric,
-                [*TARGET_ORDER, 'hurdle', 'positive'])
-    _render(history, rows, output_path, figure_dpi, 'loss',
-            'Overall objectives, shared gradients, and latent diversity', best_epoch, metric,
-            [*overall, 'hurdle', 'positive'])
+    for name in alignment:
+        prefix = f'alignment_{name}'
+        rows.append([_fit(prefix, f'{LABELS[name]} raw dependence', COLORS[name]),
+                     _fit(prefix+'_weighted_loss', f'{LABELS[name]} weighted objective', COLORS[name]),
+                     _fit(prefix+'_row_coverage', f'{LABELS[name]} row coverage', COLORS[name]),
+                     _fit(prefix+'_invalid_count', f'{LABELS[name]} invalid evaluations', COLORS[name])])
+        if name == 'nhsic':
+            rows.append([_fit(prefix+'_'+key, f'nHSIC {key.replace("_", " ")}', COLORS[name])
+                         for key in ('numerator', 'denominator', 'latent_kernel_norm', 'label_kernel_norm')])
+    def compact(layout):
+        panels = []
+        for row in layout:
+            for panel in row:
+                if panel is None:
+                    continue
+                series = [s for s in panel['series'] if s[0] in history
+                          and (disc or not any(token in s[0] for token in ('batch_', 'grl_strength')))]
+                if series:
+                    panels.append(dict(panel, series=series, span=1))
+        packed = [panels[i:i+4] for i in range(0, len(panels), 4)]
+        if packed and len(packed[-1]) < 4:
+            # Fill the final row without allocating hidden axes or blank panel slots.
+            spans = {1: [4], 2: [2, 2], 3: [2, 1, 1]}[len(packed[-1])]
+            packed[-1] = [dict(p, span=s) for p, s in zip(packed[-1], spans)]
+        return packed
+    rows, ihc_rows = compact(rows), compact(ihc_rows)
+    return rows, ihc_rows, overall, alignment

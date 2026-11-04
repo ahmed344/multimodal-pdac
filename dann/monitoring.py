@@ -42,15 +42,15 @@ def freeze_monitoring(config: Mapping[str, Any]) -> dict[str, Any]:
     config["monitoring"] = settings
     saved = config.get("monitoring_definitions")
     if saved is not None:
-        if saved.get("version") not in (1, 2) or saved.get("target_transform") != target_contract(config):
+        if saved.get("version") not in (1, 2, 3) or saved.get("target_transform") != target_contract(config):
             raise ValueError("Incompatible saved monitoring definitions.")
     elif not settings["enabled"]:
         return config
     definitions = dict(
-        version=2,
+        version=3,
         scope=["training_gradients", "validation_latent_total_variance", "validation_latent_participation_ratio"],
         shared_parameters="encoder (including latent aggregation; excluding heads)",
-        gradient_components="weighted hurdle/positive per target, H&E, reversed batch (actual GRL)",
+        gradient_components="weighted hurdle/positive per target; enabled positive-weight H&E, reversed batch (actual GRL), direct alignment",
         gradient_reduction="objective common denominator and effective-batch accumulation scaling",
         epoch_statistics="mean, population standard deviation, finite count over sampled updates",
         gradient_definitions=dict(magnitude="L2 norm of weighted component gradient",
@@ -68,6 +68,15 @@ def freeze_monitoring(config: Mapping[str, Any]) -> dict[str, Any]:
         for key in definitions.keys() - {"version", "scope"}:
             if key in saved:
                 definitions[key] = saved[key]
+    from dann.batch_alignment import alignment_contract
+    from dann.config import component_settings
+    definitions['alignment'] = alignment_contract(config)
+    definitions['enabled_heads'] = sorted(component_settings(config['model'])['heads']) if 'model' in config else []
+    definitions['validation_alignment_sample'] = config.get('validation_alignment_sample')
+    if saved is not None and saved.get('version') == 3:
+        for key in ('alignment', 'enabled_heads', 'validation_alignment_sample'):
+            if saved.get(key) != definitions[key]:
+                raise ValueError('Changed monitoring objective or sample requires fresh training.')
     config["monitoring_definitions"] = definitions
     return config
 
@@ -148,6 +157,7 @@ class GradientMonitor:
         self.gradients: dict[str, torch.Tensor] = {}
         self.summary = ScalarSummaries()
         self.sample_count = 0
+        self.include_ihc = True
 
     def accumulate(self, components: Mapping[str, torch.Tensor]) -> None:
         """Use the existing forward graph; retain it for ordinary backward."""
@@ -168,11 +178,11 @@ class GradientMonitor:
         targets = {name: self.gradients[f"{name}_hurdle"] + self.gradients[f"{name}_positive"]
                    for name in order}
         ihc = sum(targets.values())
-        overall = {"ihc": ihc}
+        overall = {"ihc": ihc} if self.include_ihc else {}
         if "he" in self.gradients:
             overall["he"] = self.gradients["he"]
-        overall["batch"] = self.gradients["batch"]
-        values = gradient_statistics(overall, "gradient_overall")
+        overall.update({name: self.gradients[name] for name in ("batch", "nhsic", "anova", "soft_nn") if name in self.gradients})
+        values = gradient_statistics(overall, "gradient_overall") if overall else {}
         values.update(gradient_statistics(targets, "gradient_ihc"))
         for name in self.names:
             branches = {branch: self.gradients[f"{name}_{branch}"] for branch in ("hurdle", "positive")}

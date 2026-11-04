@@ -48,8 +48,10 @@ def test_retained_cohort_complete_workflow(tmp_path):
     assert saved['batch_names'] == ('d', 'b') or saved['batch_names'] == ['d', 'b']
     history = pd.read_csv(checkpoint.parent / 'history.csv')
     chance = [name for name in history if name.endswith('batch_chance_loss')]
-    assert chance
-    np.testing.assert_allclose(history[chance].to_numpy(), np.log(2))
+    assert not chance
+    assert history['validation_alignment_nhsic'].notna().all()
+    assert history['validation_alignment_nhsic_sample_slides'].tolist() == [2]
+    assert saved['architecture']['enabled_heads'] == ['biology']
     from dann.checkpoints import validate_checkpoint
     stale = copy.deepcopy(config)
     stale['data']['preprocessing_fingerprint'] = 'old_cohort'

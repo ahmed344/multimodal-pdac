@@ -218,7 +218,11 @@ class TrainingArtifacts:
         self.closing = self.closed = False
         self.report = dict(mode='async', jobs=[], coalesced_checkpoints=0, coalesced_plots=0)
         from dann.curve_layout import render_reservation_bytes
-        self.render_reserve = render_reservation_bytes(int(config['analysis']['figure_dpi']))
+        from dann.batch_alignment import alignment_settings, NAMES
+        alignment = alignment_settings(config)
+        extra_rows = sum(2 if n == 'nhsic' else 1 for n in NAMES if alignment[n]['enabled'])
+        self.render_reserve = render_reservation_bytes(int(config['analysis']['figure_dpi']),
+            {'loss': 6 + extra_rows, 'ihc': 10})
         self.budget = config['performance']['host_budget_gib'] * 2**30
         self.pools = {}
         # Reserve worker imports before launch, then use actual child RSS thereafter.
@@ -311,6 +315,16 @@ class TrainingArtifacts:
                      payload: Mapping[str, Any] | None = None, destinations: Sequence[str] = (),
                      summary: str | None = None) -> None:
         """Keep complete history but replace pending plots and superseded saves."""
+        from dann.objective_curves import objective_layout, weighted_history
+        from dann.curve_layout import render_reservation_bytes
+        import pandas as pd
+        layout = objective_layout(weighted_history(pd.DataFrame(rows), self.config), self.config,
+                                  selection.get('selection_metric'))
+        actual_reserve = render_reservation_bytes(int(self.config['analysis']['figure_dpi']),
+                                                 {'loss': len(layout[0]), 'ihc': len(layout[1])})
+        with self.condition:
+            # Active workers may still be rendering a previous, larger snapshot.
+            self.render_reserve = max(self.render_reserve if self.active else 0, actual_reserve)
         self.reserve(2 * state_bytes((rows, columns, preserved, selection)))
         history = copy.deepcopy((self.directory / 'history.csv', rows, columns, preserved))
         plot = (history[1], self.directory / 'loss_curves.png',

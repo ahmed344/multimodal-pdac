@@ -7,8 +7,9 @@ heads can independently use MLPs, local spatial CNNs, or residual GATv2 attentio
 
 The four biology targets each use a structural-zero hurdle with three parameters:
 zero probability `pi`, positive logit mean `mu`, and positive logit standard
-deviation `sigma`. A gradient reversal layer trains the shared latent space to
-confuse the batch discriminator while preserving IHC prediction.
+deviation `sigma`. The current configuration aligns normalized aggregation latents
+with direct HSIC supervision. An optional discriminator retains the legacy gradient
+reversal path. Neither alignment method guarantees biological preservation.
 
 The study configuration uses the linear MSI exports from
 [`msi_preprocess`](../msi_preprocess/README.md), retaining `matrix_key: X` and
@@ -48,7 +49,8 @@ an active-occurrences by output-width tensor. There is no abundance channel.
 Both norms remove positive global scaling above the floor; L2 has a different
 row-dependent scale, so absolute latent variance alone is not a quality metric.
 
-Checkpoint architecture version 8 records these semantics. Versions 2–7 keep
+Checkpoint architecture version 9 records these semantics and enabled heads;
+version 8 introduced explicit pooling metadata. Versions 2–7 keep
 their original occurrence pooling and residual/centering interpretation, with
 unchanged parameter registration and seeded draws. Existing raw-embedding
 visualizations remain raw embeddings; an occurrence encoder does not have a
@@ -113,8 +115,8 @@ or independent validation of the selected models.
 blocks follow the biology head interfaces; the initial settings copy biology.
 `output_dim: 1536` must match `obsm[data.he_features_key]` (default
 `hes_features`) in **data.path**, at exactly the MSI observation positions.
-Targets are read lazily with handles local to each read, safe across preparation
-threads and loader processes. Only selected core targets enter batches; large
+Targets are read lazily with handles local to each read, or from one shared,
+immutable float32 cache when `performance.he_ram_cache` is enabled. Only selected core targets enter batches; large
 H&E arrays are never retained in cached tile geometry. The reader rejects
 incorrect shape, nonnumeric values, and nonfinite supervised values, reporting
 invalid source row positions. Stored column order is preserved.
@@ -166,21 +168,21 @@ There are three groups and five selectors, all in `dann/config.yaml`:
 | Group | Selector | Choices | Default |
 |---|---|---|---|
 | Spectral processing | `model.spectral_encoder.type` | `deep_sets` | `deep_sets` |
-| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
-| Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
-| Prediction heads | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `gatv2` |
-| Optional H&E head | `model.heads.he.type` | `mlp`, `cnn`, `gatv2` | `gatv2` (enabled) |
+| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
+| Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
+| Optional discriminator | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `mlp` (disabled) |
+| Optional H&E head | `model.heads.he.type` | `mlp`, `cnn`, `gatv2` | `mlp` (enabled) |
 
 All aggregation/head combinations are supported. Selectable neural modules
 live in `dann/model_components/`; `dann/model.py` composes them. The Deep Sets stage uses
-128-dimensional learned peak embeddings, multiplies each by its transformed
-intensity, applies the original per-peak MLP with `[256, 256]` hidden widths and
-256 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
-The selectable aggregation produces the **exported 256-dimensional latent**.
-The MLP aggregation uses `[256, 256]` hidden widths; all MLP heads use
+256-dimensional learned peak embeddings, multiplies each by its transformed
+intensity, applies the per-peak MLP with `[512, 512]` hidden widths and
+512 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
+The selectable aggregation produces the **exported 512-dimensional latent**.
+The MLP aggregation uses `[512, 512]` hidden widths; all MLP heads use
 `[256, 128, 64]`. The shared ZILN transformation, weighted four-target objective,
-class-weighted batch cross-entropy, and gradient reversal schedule are unchanged.
-Only the discriminator input receives gradient reversal.
+and optional class-weighted batch cross-entropy retain their definitions.
+Only an enabled discriminator input receives gradient reversal.
 
 Each CNN independently projects to 128 channels, applies three 3×3 stride-one
 convolutions, and finishes with a pointwise output projection. Hidden stages use
@@ -458,31 +460,31 @@ counts, then assign the remainder to test. Loading or resuming historical
 checkpoints preserves their saved split membership even if configured fractions
 have changed. H&E-mediated transfer is assessed separately.
 
-Checkpoint selection and early stopping both use **validation batch-aware objective**
-with `training.early_stopping_metric: batch_aware_objective` in the checked-in YAML.
-The optimized loss is unchanged:
+Checkpoint selection, early stopping, and LR scheduling use **validation supervised
+objective** in the checked-in YAML. The enabled HSIC objective contributes to
+training with weight 0.1. Legacy discriminator-enabled runs retain these definitions:
 
 ```text
 IHC_weighted = biology_weight * IHC_loss
 HE_weighted = he_weight * he_mse                 # omitted when disabled
 Batch_weighted = batch_weight * batch_cross_entropy
 Supervised = IHC_weighted + HE_weighted          # LR scheduling score
-Total = Supervised + Batch_weighted             # backpropagation objective
+Total = Supervised + Batch_weighted + Alignment_weighted  # enabled terms only
 Batch_chance = ln(K)                            # discriminator output class count
 Batch_selection_penalty = grl_max_lambda * batch_weight * max(0, Batch_chance - batch_cross_entropy)
-Batch_aware = Supervised + Batch_selection_penalty  # stopping / best.pt score
+Batch_aware = Supervised + Batch_selection_penalty  # optional legacy selection
 ```
 
-The score uses finalized epoch losses and the discriminator's full output width
+The legacy batch-aware score uses finalized epoch losses and the discriminator's full output width
 for `K`, including classes absent from a particular minibatch or validation split.
 The fixed coefficient uses the configured maximum GRL strength, not the current
-schedule value. With the current weights and 43 classes, the penalty is
+schedule value. With batch weight 1, maximum GRL 0.25, and 43 classes, the penalty is
 `0.25 * max(0, 3.7612 - batch_cross_entropy)`. It decreases as the discriminator
 approaches chance cross-entropy and remains zero above chance. Both `batch_weight`
 and `grl_max_lambda` must be finite and nonnegative. Selection starts at the first
 completed validation epoch, with no additional warmup.
 
-`supervised_objective` and `cd8_loss` remain available for comparison. An absent
+`cd8_loss` remains available for comparison; `batch_aware_objective` requires an enabled discriminator. An absent
 setting retains legacy `cd8_loss` selection: mean validation CD8 ZILN loss over
 valid CD8 rows. `early_stopping_min_delta` measures units of the selected score.
 The selection policy does not change the optimized loss, gradients, GRL schedule,
@@ -599,7 +601,9 @@ and metric equality; production training settings are unchanged.
 History retains raw loss and fit columns and adds `biology_weighted_loss`,
 `hurdle_weighted_loss`, `positive_weighted_loss`, `batch_weighted_loss`,
 `supervised_objective`, `batch_chance_loss`, `batch_selection_penalty`, and
-`batch_aware_objective`, each prefixed by `train_` or `validation_`. Per-signal
+`batch_aware_objective`, each prefixed by `train_` or `validation_`, when the
+discriminator is enabled. Direct objectives add `alignment_<name>`, weighted
+contributions, validity counts, sample coverage, and estimator diagnostics. Per-signal
 `hurdle_weighted_loss_<signal>` and `positive_weighted_loss_<signal>` include both
 the signal's target weight and `biology_weight`. Their sums equal the aggregate
 IHC objective. For mean reduction, every signal and both branches share the total
@@ -612,19 +616,16 @@ existing sample-weighted average of batch sums for aggregate and per-signal repo
 epoch). Both appear in epoch logs and are equal for fixed-LR runs. Older history
 rows without these columns remain blank when resumed; no past LR is inferred.
 
-The four-column overall plot pairs IHC balanced hurdle accuracy, IHC positive-logit
-R², H&E R², and discriminator accuracy with their objectives directly below.
-The next row shows total objective, supervised objective, actual GRL strength,
-and batch-aware objective. The active selection metric is labelled in the figure
-header, and the supervised or batch-aware panel is marked when selected.
-Epoch summaries also report the new score.
-Historical rows without batch-aware metrics remain gaps, even if raw batch losses
-are available. The separate IHC figure places each signal's fit metrics above its
-weighted hurdle and positive likelihood objectives. The combined IHC objective
-remains in history and the additive formulas. Disabled H&E panels are hidden. One shared legend
-identifies Train, Validation, and the selected checkpoint epoch across all panels.
-Epoch axes are aligned, with numeric ticks and no repeated "Epoch" axis labels;
-no minimum is inferred from incomplete history.
+The four-column overall plot includes available IHC/H&E fit metrics, weighted
+objectives, latent diversity, and sampled gradient decomposition. Enabled direct
+alignment objectives add raw scores, contributions, coverage, and kernel diagnostics.
+Discriminator and GRL panels appear only for discriminator-enabled runs. Panels
+reflow without empty slots, and canvas height and render-memory reservations track
+the actual layout. The header identifies the selection metric and selected epoch.
+Historical missing observations remain gaps. The separate IHC figure shows available
+per-target fit, objective, and gradient metrics. Disabled objectives are omitted.
+Epoch axes use numeric ticks without repeated labels; no minimum is inferred from
+incomplete history.
 
 `train_he_r2` and `validation_he_r2` are variance-weighted feature R² values:
 `1 - sum((target - prediction)**2) / sum((target - feature_mean)**2)`, where each
@@ -1623,7 +1624,70 @@ duplicates. Ordinary DataLoaders use `__getitems__` with the same batch gatherin
 returning NumPy/scalar sample dictionaries for existing and custom collators.
 Scalar `__getitem__` remains available as a reference. Empty splits produce no
 batches; explicit empty `get_batch` requests raise the collator's empty-sequence
-error. No dense spectra or full-dataset H&E cache is constructed.
+error. MSI spectra remain sparse; H&E residency is optional and separate from tile geometry.
+
+`he_ram_cache` requires `ram_cache` and uses the shared-thread loader, avoiding
+per-process feature copies. It defaults to false for older configurations and is
+enabled in the current YAML. The current 1,665,807 by 1,536 H&E matrix needs about
+9.53 GiB. A single HDF5 read fills preallocated float32 storage; cached batches
+perform no HDF5 feature reads. Cache allocation, reduction scratch, geometry, and
+bounded preparation are checked against `host_budget_gib`.
+
+`startup_workers` (default 1) parallelizes independent NumPy MSI transforms and
+resident H&E reductions. HDF5 reads remain ordered to avoid rereading storage
+chunks for scattered training rows. Head initialization visits selected training
+rows in storage order, accumulates float64 partial sums in a fixed order, and
+never changes sampler order or includes held-out rows in fitted statistics.
+With residency disabled, initialization streams each relevant row block through
+one handle. Nonfinite values are rejected only when selected for supervision.
+Parallel reductions may differ from the former shuffled reduction in floating
+point roundoff, but preserve its train-only statistical definition.
+
+Startup logs identify data preparation, cache loading, head initialization, and
+epoch entry. `execution_startup.json` includes cache sizes, initialization timing,
+worker settings, and peak process RSS. Raise `prepared_batches` together with
+`preparation_workers` when benchmarking: the queue bounds outstanding work, so
+two queued batches cannot use eight workers concurrently.
+
+Benchmark startup and preparation concurrency on the current pixel model with:
+
+```bash
+CUBLAS_WORKSPACE_CONFIG=:4096:8 python -m dann.verification.startup_benchmark --config dann/config.yaml \
+  --output /tmp/dann-startup-benchmark --steps 16
+```
+
+The output directory must be new. Three trials compare 1/2/4/8/16 startup
+workers and 2/4/8/16 preparation workers, with twice as many queued batches.
+Matched CUDA training includes the configured losses, alignment and monitoring;
+the old backed H&E reader provides a baseline. The report recommends the smallest
+worker count within 5% of the fastest elapsed median, verifies unchanged values
+and exact deterministic CUDA updates separately from default-profile timings,
+and records GPU utilization, loader wait and RAM peaks. Default CUDA timing runs
+also report parameter differences, since their scatter reductions are not
+necessarily bitwise reproducible. A completed startup sweep can be reused with
+`--startup-report /path/to/benchmark.json` when the configuration is identical.
+
+The 2026-11-03 comparison used the current 1,665,807-row lesion file and RTX 5090.
+Across three trials, 8 startup workers minimized the combined CSR loading/
+transformation and full-training H&E reduction median (2.58 s). The H&E reduction
+alone took 1.10 s; the shared 9.53 GiB H&E cache loaded in about 2.6 s. Metadata,
+splitting, and both input caches together took approximately 5.3 s.
+
+| Matched 16-batch training | Backed H&E | Cached H&E |
+| --- | ---: | ---: |
+| Median elapsed seconds | 25.10 | 19.24 |
+| Median rows/second | 1,306 | 1,704 |
+| Median loader-wait seconds | 6.400 | 0.008 |
+| Median sampled GPU utilization | 75.8% | 99.3% |
+
+The selected preparation profile is 2 workers and 4 queued batches: 4–16 workers
+were within roughly 1% in elapsed time, so more threads did not improve useful
+throughput. Two deterministic CUDA updates matched exactly between backed loading
+with 2 workers and cached loading with 16. Timing runs retain normal nondeterministic
+CUDA execution. These are capped training measurements, not full-epoch estimates.
+The final profile also completed a separate production-entrypoint smoke epoch,
+validation, and checkpoint write; its startup peak RSS was 17.77 GiB. Architecture,
+batch sizes, training splits, and loss settings were unchanged.
 
 This is automatic for pixel training, validation, and testing, with unchanged
 samplers, batch boundaries, preprocessing, targets, losses, and checkpoint schema.
@@ -2778,3 +2842,93 @@ encoding domains, and rejects mismatched checkpoints and downstream artifacts by
 preprocessing fingerprint. The `_qc40` run uses fresh training on 40 retained
 slides with the existing seeded 90%/10% within-slide split. See
 [preprocessing workflow](../msi_preprocess/README.md) for exclusions and rollout checks.
+
+### Direct slide alignment
+
+`loss.batch_alignment` independently enables `nhsic`, `anova`, and `soft_nn`, each
+with its own nonnegative `weight`. An enabled zero-weight objective is a diagnostic;
+disabled objectives are neither evaluated nor plotted. The current experiment uses
+nHSIC at 0.1 and `model.heads.discriminator.enabled: false` (legacy default: true).
+Disabling the discriminator removes its parameters, logits, GRL, and spatial halo.
+Both checkpoint selection and LR scheduling use validation `supervised_objective`.
+
+Alignment compares L2-normalized aggregation latents across all pixels without
+tissue conditioning, giving each represented slide equal total weight. Training
+samples up to 32 rows per slide per complete optimizer update; positive-weight
+alignment rejects split optimizer batches. Validation gathers a saved sample of up
+to 64 rows per slide across the complete pass. Undefined geometry is recorded as
+unavailable; enabled objectives with no valid evaluations fail the epoch. Changing
+alignment or architecture contracts requires fresh training. Normalization does not
+guarantee preservation of slide-associated biology.
+
+Use `python -m dann.verification.batch_alignment_comparison FIRST_ANALYSIS
+SECOND_ANALYSIS --output NEW_DIRECTORY --device cuda` for a matched five-seed,
+43-slide archived comparison. It uses archived exports and provenance rather than
+the current data configuration. Formulas, historical results, and interpretation
+limits are documented in [the alignment analysis](../markdowns/dann_batch_alignment_objectives.md).
+
+### Alignment sweep with slide-mixing selection
+
+The 40-slide study runner keeps the current 512-dimensional MLP, 90%/10% split,
+seed 20260719, optimizer, preprocessing, IHC weight 2 and H&E weight 10. It compares
+a fresh zero-alignment control and nHSIC weights 1, 10 and 100 with the existing
+0.1 checkpoint. It then tests ANOVA 0.1/1 and soft-NN 1/10 separately at the
+selected nHSIC weight. A ninth, combined fit runs only when each addition improves
+both mixing measures while meeting the reference eligibility limits.
+
+```bash
+python -m dann.verification.alignment_sweep --output data/verification/alignment_sweep --prepare
+python -m dann.verification.alignment_sweep --output data/verification/alignment_sweep --run
+# The same --run command resumes an interrupted study.
+python -m dann.verification.alignment_sweep --output data/verification/alignment_sweep --report
+```
+
+Preparation creates a new directory and freezes source code, input identities,
+configurations, split arrays, training probe rows, thresholds, and initialization
+hashes. Subprocesses import the frozen source snapshot and run sequentially on the
+GPU. Complete stages have checksummed output records; modified completed artifacts
+fail validation. An isolated real-data smoke workflow runs before full training.
+Adaptive choices are immutable records in `decisions/`. `report.html`, CSV tables,
+and `status.json` expose progress and final results without changing existing runs.
+
+`training.archive_checkpoint_every` accepts a positive integer or `null` (the
+default). The study uses 5 and saves `model/archives/epoch_0005.pt`, etc., through
+the same atomic asynchronous writer as `best.pt` and `latest.pt`. Archive paths
+are distinct, so queue coalescing cannot discard earlier archives. New training
+checkpoints retain dropout and loader RNG streams, including the threaded loader's
+iterator state, for continuation at epoch boundaries. Legacy checkpoints retain
+their historical resume behavior. `best.pt` always remains the supervised-objective
+selection; the study recommendation records a separate checkpoint path.
+
+Every archive, `best.pt`, and `latest.pt` is evaluated (identical model epochs are
+deduplicated). The panel uses equal numbers up to 512 randomly selected validation
+rows per slide. Five fixed, matched draws of 64 rows per slide come from this panel.
+Exact 30-neighbor mixing uses cosine distance in latent space and Euclidean distance
+in UMAP; self-neighbors are excluded. Chance is `(slide_count - 1)/(sample_count - 1)`;
+excess is observed fraction minus chance. Neighbors are recomputed inside stromal
+quartiles defined using training rows. UMAP retains cosine/30/0.3 settings and a
+fixed seed; slide colors and observations are identical across arms. Each arm's
+study-selected epoch also receives a full-validation UMAP; when no epoch qualifies,
+its supervised-selected epoch is shown without implying eligibility.
+
+Eligibility requires finite representations, raw and normalized total variance
+above `1e-8`, both numerical covariance ranks at least 2, and latent norms above
+`1e-8`. A numerically resolved eigenvalue exceeds `max(1e-12, largest * 1e-8)`.
+Participation ratios are reported separately: a dominant variance direction does
+not by itself imply loss of all other directions or biological information.
+Training-fitted ridge and logistic probes use the existing 65,536-row protocol.
+Stroma/collagen/tumor probe MSE may deteriorate by at most 10%; CD8 presence and
+exceedance probe Brier scores by at most 0.02. Relative to the 0.1 reference,
+CD8 loss may rise by `0.10 * abs(reference_loss)` (also defined for negative
+log likelihoods), each presence/exceedance Brier score by 0.02, positive PIT KS by
+0.04, and absolute 50%/90% coverage errors by 0.04. All bounds are inclusive.
+CD8 exceedance thresholds are frozen training-positive quartiles.
+
+Eligible candidates must improve both mixing excesses. Lower latent excess leads;
+values within 0.01 of the lowest excess are tied, then ordered by UMAP excess and
+CD8 loss. Additions must also improve both measures over their selected nHSIC-only
+base. If none qualifies, the report declares no winner. Only a qualifying
+recommendation receives full tissue inference, spatial heatmaps, and latent
+variance analysis in the study directory. The study uses one training seed and
+validation-based selection; repeated diagnostic samples are not independent
+training replications. H&E-mediated transfer remains a separate assessment.

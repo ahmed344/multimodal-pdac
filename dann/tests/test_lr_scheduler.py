@@ -30,7 +30,7 @@ def test_config_defaults_and_mode_floors(tmp_path):
     expected = dict(enabled=True, factor=.5, patience=5, cooldown=2,
                     threshold=.001, min_lr_factor=.01, eps=0.)
     assert config["training"]["lr_scheduler"] == expected
-    assert config["training"]["early_stopping_patience"] == 20
+    assert config["training"]["early_stopping_patience"] == 10
     for mode, starting_lr in (("spatial", 1e-6), ("pixel", .001)):
         config["model"]["aggregation"]["type"] = "cnn" if mode == "spatial" else "mlp"
         for group in config["model"]["heads"].values():

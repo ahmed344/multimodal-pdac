@@ -123,7 +123,7 @@ class AdversarialLatentFusion(nn.Module):
         self.biology_predictor = biology_predictor
         self.batch_discriminator = batch_discriminator
         self.he_predictor = he_predictor
-        self.gradient_reversal = GradientReversal()
+        self.gradient_reversal = GradientReversal() if batch_discriminator is not None else None
         self.spatial = False
         self.peak_budget = 65536
         self.checkpointing = True
@@ -151,14 +151,16 @@ class AdversarialLatentFusion(nn.Module):
             encoder.aggregation_mlp = AggregationGATv2(spectral["peak_output_dim"],
                 values["latent_dim"], **settings["aggregation"]["gatv2"])
         bio = settings["heads"]["biology"]
-        disc = settings["heads"]["discriminator"]
+        disc = settings["heads"].get("discriminator")
         if bio["type"] == "mlp":
             biology = BiologyPredictor(values["latent_dim"], bio["mlp"]["hidden_dims"],
                                        num_targets, values["sigma_min"], residual=bio["mlp"]["residual"], **common)
         else:
             biology = {"cnn": CNNBiology, "gatv2": BiologyGATv2}[bio["type"]](
                 values["latent_dim"], num_targets * 3, **bio[bio["type"]])
-        if disc["type"] == "mlp":
+        if disc is None:
+            discriminator = None
+        elif disc["type"] == "mlp":
             discriminator = BatchDiscriminator(values["latent_dim"], disc["mlp"]["hidden_dims"],
                                                num_batches, residual=disc["mlp"]["residual"], **common)
         else:
@@ -185,7 +187,7 @@ class AdversarialLatentFusion(nn.Module):
         model.pixel_spectral_microbatching = values.get("pixel_spectral_microbatching", False)
         model.peak_budget = values.get("spectral_peak_budget", 65536)
         model.checkpointing = values.get("spectral_checkpointing", True)
-        model.halo = encoder.aggregation_mlp.radius + max(biology.radius, discriminator.radius, he_predictor.radius if he_predictor is not None else 0)
+        model.halo = encoder.aggregation_mlp.radius + max(biology.radius, discriminator.radius if discriminator is not None else 0, he_predictor.radius if he_predictor is not None else 0)
         return model
 
     @staticmethod
@@ -246,8 +248,9 @@ class AdversarialLatentFusion(nn.Module):
         """Predict aligned core outputs, retaining spatial context for all enabled heads."""
         if not self.spatial:
             latent = self.encode(batch)
-            outputs = {"latent": latent, **self.biology_predictor(latent),
-                       "batch_logits": self.batch_discriminator(self.gradient_reversal(latent, grl_strength))}
+            outputs = {"latent": latent, **self.biology_predictor(latent)}
+            if self.batch_discriminator is not None:
+                outputs["batch_logits"] = self.batch_discriminator(self.gradient_reversal(latent, grl_strength))
             if predict_he and self.he_predictor is not None:
                 outputs["he_prediction"] = self.he_predictor(latent)
             return outputs
@@ -260,9 +263,10 @@ class AdversarialLatentFusion(nn.Module):
                                         self.num_targets, self.sigma_min)
         else:
             biology = self.biology_predictor(latent)
-        reversed_grid = self.gradient_reversal(grid, grl_strength)
-        logits = self._select(self._prepared_map(self.batch_discriminator, reversed_grid, mask, batch), batch)
-        outputs = {"latent": latent, **biology, "batch_logits": logits}
+        outputs = {"latent": latent, **biology}
+        if self.batch_discriminator is not None:
+            reversed_grid = self.gradient_reversal(grid, grl_strength)
+            outputs["batch_logits"] = self._select(self._prepared_map(self.batch_discriminator, reversed_grid, mask, batch), batch)
         if predict_he and self.he_predictor is not None:
             outputs["he_prediction"] = (self._select(self._prepared_map(self.he_predictor, grid, mask, batch), batch)
                                         if self.he_predictor.radius else self.he_predictor(latent))

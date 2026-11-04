@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 import h5py
 import numpy as np
@@ -12,6 +12,9 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from dann.targets import prepare_targets
+
+if TYPE_CHECKING:
+    from dann.he import HETargetReader
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class DataBundle:
     datasets: dict[str, Dataset]
     loaders: dict[str, DataLoader[dict[str, torch.Tensor]]]
     batch_class_weights: torch.Tensor
+    he_reader: HETargetReader | None = None
 
 
 def _matrix_group_path(matrix_key: str) -> str:
@@ -636,12 +640,25 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         torch.set_num_threads(performance['torch_threads'])
     resident = None
     if performance['ram_cache']:
-        from dann.execution import ResidentSpectra
-        resident = ResidentSpectra(path, data_config, int(performance['host_budget_gib'] * 2**30))
+        from dann.execution import ResidentSpectra, check_startup_budget
+        with h5py.File(path, 'r') as handle:
+            group = handle[_matrix_group_path(data_config['matrix_key'])]
+            size = group['data'].size * 12 + group['indptr'].size * 8
+            scratch = min(group['data'].size, 4_000_000) * 4 * performance['startup_workers']
+            required = max(size * (3 if data_config['nonzero_threshold'] > 0 else 2), size + scratch)
+        check_startup_budget(int(performance['host_budget_gib'] * 2**30), required, 'MSI cache')
+        print(f"Startup: loading MSI cache ({performance['startup_workers']} transform workers).", flush=True)
+        resident = ResidentSpectra(path, data_config, int(performance['host_budget_gib'] * 2**30),
+                                  workers=performance['startup_workers'])
+        print(f'Startup: MSI cache ready in {resident.startup_seconds:.2f}s ({resident.nbytes / 2**30:.2f} GiB).', flush=True)
     from dann.he import HETargetReader, he_settings
     he = he_settings(config)
     he_reader = (HETargetReader(path, data_config.get('he_features_key', 'hes_features'),
                                metadata.num_observations, he['output_dim']) if he else None)
+    if he_reader is not None and performance['he_ram_cache']:
+        print('Startup: loading shared H&E cache.', flush=True)
+        he_reader.cache_in_memory(int(performance['host_budget_gib'] * 2**30))
+        print(f'Startup: H&E cache ready in {he_reader.startup_seconds:.2f}s ({he_reader.nbytes / 2**30:.2f} GiB).', flush=True)
     dataset_kwargs = {
         "he_reader": he_reader,
         "resident": resident,
@@ -666,7 +683,7 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         spatial_cache = {}
         for name, indices in active_indices.items():
             datasets[name] = SpatialTileDataset(config, indices, metadata, geometry=geometry,
-                resident=resident, spatial_cache=spatial_cache, progress=progress)
+                resident=resident, spatial_cache=spatial_cache, progress=progress, he_reader=he_reader)
             geometry = datasets[name].geometry
         collator = tile_collate
     num_workers = int(training_config["num_workers"])
@@ -722,4 +739,5 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         batch_class_weights=compute_batch_class_weights(
             metadata.batch_codes, split_indices["train"]
         ),
+        he_reader=he_reader,
     )

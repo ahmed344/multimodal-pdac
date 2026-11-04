@@ -203,7 +203,7 @@ def test_reduced_definitions_need_no_targets_or_probability_settings(monkeypatch
     monkeypatch.setattr(np, 'quantile', forbidden)
     config = definitions()
     frozen = copy.deepcopy(config['monitoring_definitions'])
-    assert frozen['version'] == 2
+    assert frozen['version'] == 3
     assert frozen['scope'] == ['training_gradients', 'validation_latent_total_variance',
                                'validation_latent_participation_ratio']
     config['analysis']['calibration_coverage_levels'] = 'standalone analysis only'
@@ -307,7 +307,7 @@ def test_resume_starts_monitoring_and_keeps_frozen_definitions(spatial_config, m
     second = torch.load(output/'latest.pt', weights_only=False)
     definitions = second['monitoring_definitions']
     assert definitions == second['config']['monitoring_definitions']
-    assert definitions['version'] == 2
+    assert definitions['version'] == 3
     config['training']['epochs'] = 3
     config['monitoring']['gradient_updates_per_epoch'] = None
     config['analysis']['calibration_coverage_levels'] = [.8]

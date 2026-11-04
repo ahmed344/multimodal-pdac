@@ -309,6 +309,11 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("model.spectral_encoder.type must be deep_sets.")
     if set(settings["heads"]) - {"biology", "discriminator", "he"} or not {"biology", "discriminator"} <= set(settings["heads"]):
         raise ValueError("model.heads requires biology and discriminator, with optional he.")
+    disc = settings["heads"]["discriminator"]
+    if not isinstance(disc.get("enabled", True), bool):
+        raise ValueError("model.heads.discriminator.enabled must be boolean.")
+    if not disc.get("enabled", True):
+        settings["heads"].pop("discriminator")
     he = settings["heads"].get("he", {"enabled": False})
     if not isinstance(he, Mapping):
         raise ValueError("model.heads.he must be a mapping.")
@@ -367,7 +372,7 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
 def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     """Derive execution mode and combined halo from the selected components."""
     settings = component_settings(config["model"])
-    groups = [settings["aggregation"], settings["heads"]["biology"], settings["heads"]["discriminator"]]
+    groups = [settings["aggregation"], settings["heads"]["biology"], settings["heads"].get("discriminator", {"type": "mlp"})]
     if "he" in settings["heads"]:
         groups.append(settings["heads"]["he"])
     radii = []
@@ -381,6 +386,8 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     result = {"mode": "spatial" if any(radii) else "pixel", "halo": radii[0] + max(radii[1:]),
             "latent_radius": radii[0], "biology_radius": radii[0] + radii[1],
             "combination": "deep_sets__agg-{}__bio-{}__disc-{}".format(*(g["type"] for g in groups[:3]))}
+    if "discriminator" not in settings["heads"]:
+        result["combination"] = result["combination"].replace("disc-mlp", "disc-none")
     if len(groups) == 4:
         result.update(he_radius=radii[0] + radii[3])
         result["combination"] += "__he-" + groups[3]["type"]
@@ -398,6 +405,8 @@ def validate_batch_selection_settings(config: Mapping[str, Any]) -> None:
 def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve mode-specific settings and all run paths once, without overrides."""
     monitoring_settings(config)
+    from dann.batch_alignment import alignment_settings
+    alignment = alignment_settings(config)
     weight = config.get("loss", {}).get("he_weight", 1.0)
     if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not np.isfinite(weight) or weight < 0:
         raise ValueError("loss.he_weight must be finite and nonnegative.")
@@ -412,7 +421,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     if "spectral_encoder" in config["model"]:
         for name, group in [("aggregation", config["model"]["aggregation"]),
                             *config["model"]["heads"].items()]:
-            if name == "he" and name not in settings["heads"]:
+            if name in {"he", "discriminator"} and name not in settings["heads"]:
                 continue
             resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
             group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
@@ -432,6 +441,11 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     if mode in training:
         training.update(training[mode])
     validate_batch_selection_settings(config)
+    if any(alignment[n]['enabled'] and alignment[n]['weight'] > 0 for n in ('nhsic', 'anova', 'soft_nn')):
+        if mode == 'spatial' and spatial_batching['microbatch_rows'] is not None and spatial_batching['microbatch_rows'] < spatial_batching['supervised_rows_per_batch']:
+            raise ValueError('Direct alignment requires unsplit optimizer batches; set microbatch_rows: null.')
+    if 'discriminator' not in settings['heads'] and training['early_stopping_metric'] == 'batch_aware_objective':
+        raise ValueError('Discriminator-free training requires supervised_objective or cd8_loss selection.')
     training["lr_scheduler"] = lr_scheduler_settings(training)
     training["warmup"] = warmup_settings(training)
     training["head_initialization"] = head_initialization_settings(training)
@@ -466,6 +480,10 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     if horizon is not None and (isinstance(horizon, bool) or not isinstance(horizon, int) or horizon <= 0):
         raise ValueError("training.grl_horizon_updates must be a positive integer or null.")
     training.setdefault("early_stopping_enabled", True)
+    archive_every = training.setdefault("archive_checkpoint_every", None)
+    if archive_every is not None and (isinstance(archive_every, bool)
+            or not isinstance(archive_every, int) or archive_every <= 0):
+        raise ValueError("training.archive_checkpoint_every must be a positive integer or null.")
     if not isinstance(training["early_stopping_enabled"], bool):
         raise ValueError("training.early_stopping_enabled must be boolean.")
     if (isinstance(training["num_workers"], bool) or not isinstance(training["num_workers"], int)
@@ -520,7 +538,8 @@ def inference_input(config: Mapping[str, Any], explicit: Path | None = None) -> 
 
 
 PERFORMANCE_DEFAULTS = dict(
-    ram_cache=False, cache_geometry=False, preparation_workers=0, prepared_batches=2, torch_threads=None,
+    ram_cache=False, he_ram_cache=False, startup_workers=1, cache_geometry=False,
+    preparation_workers=0, prepared_batches=2, torch_threads=None,
     transfer_prefetch=False, async_artifacts=False, validation_tiles=None, validation_peak_budget=None,
     validation_gat_tiles=None, validation_feature_cache=False, feature_cache_rows=1024,
     host_budget_gib=128., vram_budget_gib=24.,
@@ -535,10 +554,10 @@ def performance_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     settings = {**PERFORMANCE_DEFAULTS, **supplied}
     if set(settings) != set(PERFORMANCE_DEFAULTS):
         raise ValueError('Unknown performance setting.')
-    for key in ('ram_cache', 'cache_geometry', 'transfer_prefetch', 'validation_feature_cache', 'async_artifacts'):
+    for key in ('ram_cache', 'he_ram_cache', 'cache_geometry', 'transfer_prefetch', 'validation_feature_cache', 'async_artifacts'):
         if not isinstance(settings[key], bool):
             raise ValueError(f'performance.{key} must be boolean.')
-    for key in ('preparation_workers', 'prepared_batches', 'validation_tiles',
+    for key in ('preparation_workers', 'startup_workers', 'prepared_batches', 'validation_tiles',
                 'validation_peak_budget', 'validation_gat_tiles', 'feature_cache_rows', 'torch_threads'):
         value = settings[key]
         if value is None and (key.startswith('validation_') or key == 'torch_threads'):
@@ -551,6 +570,8 @@ def performance_settings(config: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f'performance.{key} must be finite and positive.')
     if settings['preparation_workers'] and not settings['ram_cache']:
         raise ValueError('Threaded preparation requires ram_cache (HDF5 handles are not shared).')
+    if settings['he_ram_cache'] and not settings['ram_cache']:
+        raise ValueError('H&E residency requires ram_cache and shared-thread preparation.')
     if settings['validation_feature_cache'] and not (settings['ram_cache'] and settings['cache_geometry']):
         raise ValueError('Validation features require ram_cache and cache_geometry.')
     return settings

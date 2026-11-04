@@ -19,7 +19,7 @@ def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         if group['type'] == 'gatv2':
             selected[name]['graph_semantics'] = copy.deepcopy(GRAPH_SEMANTICS)
             selected[name]['reach'] = graph_reach(group['gatv2']['depth'], group['gatv2']['neighbor_radius'])
-    return {'version': 8, 'components': selected,
+    return {'version': 9, 'components': selected, 'enabled_heads': sorted(settings['heads']),
             'numerics': {key: config['model'][key] for key in
                          ('num_peaks', 'latent_dim', 'activation', 'dropout', 'use_layer_norm', 'sigma_min')},
             'spatial': execution_settings(config)}
@@ -35,9 +35,9 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(checkpoint['config'])
     saved = copy.deepcopy(checkpoint.get('architecture'))
     version = saved['version'] if saved is not None else 2
-    if version not in (2, 3, 4, 5, 6, 7, 8):
+    if version not in (2, 3, 4, 5, 6, 7, 8, 9):
         raise ValueError('Unsupported checkpoint architecture version.')
-    if version == 8 and not {'pooling', 'normalization', 'normalization_epsilon'} <= set(
+    if version >= 8 and not {'pooling', 'normalization', 'normalization_epsilon'} <= set(
             saved.get('components', {}).get('spectral_encoder', {}).get('deep_sets', {})):
         raise ValueError('Version 8 checkpoint architecture requires explicit pooling, normalization and normalization_epsilon.')
     if 'spectral_encoder' in config['model']:
@@ -56,7 +56,7 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     if 'spectral_encoder' in config['model']:
         for name, group in [('aggregation', config['model']['aggregation']),
                             *config['model']['heads'].items()]:
-            if name == 'he' and not group.get('enabled', False):
+            if name in {'he', 'discriminator'} and not group.get('enabled', name == 'discriminator'):
                 continue
             if group['type'] == 'gatv2':
                 if version < 5:
@@ -72,6 +72,8 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
                 raise ValueError(f'Checkpoint configuration requires a boolean {name} CNN residual setting.')
     if saved is not None:
         for name in ('aggregation', 'biology', 'discriminator'):
+            if name not in saved['components']:
+                continue
             group = saved['components'][name]
             if group['type'] == 'gatv2':
                 if version < 5:
@@ -94,9 +96,15 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
         if version < 8:
             saved['components']['spectral_encoder']['deep_sets'].update(
                 pooling='occurrence_mlp', normalization='count', normalization_epsilon=1.0e-8)
-        saved['version'] = 8
+        if version < 9:
+            saved['enabled_heads'] = sorted(n for n in ('biology', 'discriminator', 'he') if n in saved['components'])
+        saved['version'] = 9
         if saved != architecture_contract(config):
             raise ValueError('Checkpoint configuration disagrees with architecture metadata.')
+    if checkpoint.get('objective_contract') is not None:
+        from dann.batch_alignment import alignment_contract
+        if checkpoint['objective_contract'] != alignment_contract(config):
+            raise ValueError('Checkpoint configuration disagrees with alignment objective metadata.')
     return config
 
 
@@ -115,8 +123,8 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
     if saved != requested:
         message = 'Checkpoint components or numerical settings are incompatible; changing pooling, normalization or H&E requires fresh training.'
         for name in ('aggregation', 'biology', 'discriminator'):
-            saved_group = saved['components'][name]
-            requested_group = requested['components'][name]
+            saved_group = saved['components'].get(name, {'type': 'none'})
+            requested_group = requested['components'].get(name, {'type': 'none'})
             if (saved_group['type'] == requested_group['type'] == 'cnn'
                     and saved_group['cnn']['residual'] != requested_group['cnn']['residual']):
                 flag = str(saved_group['cnn']['residual']).lower()
@@ -132,6 +140,10 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
                              ('biology', model.biology_predictor),
                              ('discriminator', model.batch_discriminator),
                              *([('he', model.he_predictor)] if 'he' in requested['components'] else [])]:
+            if name not in requested['components']:
+                if module is not None:
+                    raise ValueError(f'Model has disabled head {name}.')
+                continue
             group = requested['components'][name]
             if group['type'] == 'gatv2':
                 from dann.model_components.layers_gatv2 import GATv2Network
@@ -153,6 +165,10 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
                             if group['mlp']['residual'] else 0)
                 if sum(isinstance(m, NormalizedResidual) for m in module.modules()) != expected:
                     raise ValueError(f'Model {name} MLP residual settings are incompatible.')
+    if optimizer:
+        from dann.batch_alignment import alignment_contract
+        if alignment_contract(checkpoint['config']) != alignment_contract(config):
+            raise ValueError('Changed alignment objective requires fresh training.')
     if optimizer and model is not None:
         names = list(dict(model.named_parameters()))
         saved_names = checkpoint.get('optimizer_parameter_names', list(checkpoint['model_state']))

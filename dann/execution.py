@@ -18,10 +18,26 @@ import numpy as np
 import torch
 
 
+def check_startup_budget(budget_bytes: int, extra_bytes: int, stage: str) -> None:
+    """Check process/child residency and pending startup allocations together."""
+    import psutil
+    process = psutil.Process()
+    used = process.memory_info().rss
+    for child in process.children(recursive=True):
+        try:
+            used += child.memory_info().rss
+        except psutil.Error:
+            pass
+    if used + extra_bytes > budget_bytes:
+        raise MemoryError(f'{stage} exceeds host budget: {(used + extra_bytes) / 2**30:.2f} GiB '
+                          f'required, {budget_bytes / 2**30:.2f} GiB allowed.')
+
+
 class ResidentSpectra:
     """Read and transform CSR storage once without sorting or dropping stored zeros."""
 
-    def __init__(self, path: Path, data: Mapping[str, Any], budget_bytes: int) -> None:
+    def __init__(self, path: Path, data: Mapping[str, Any], budget_bytes: int,
+                 *, workers: int = 1) -> None:
         from dann.data_loader import _matrix_group_path
         started = perf_counter()
         self.source_identity = self.identity(path, data)
@@ -29,7 +45,8 @@ class ResidentSpectra:
             group = handle[_matrix_group_path(data['matrix_key'])]
             size = group['data'].size * 12 + group['indptr'].size * 8
             construction_factor = 3 if data['nonzero_threshold'] > 0 else 2
-            if size * construction_factor > budget_bytes:
+            scratch = min(group['data'].size, 4_000_000) * 4 * max(workers, 1)
+            if max(size * construction_factor, size + scratch) > budget_bytes:
                 raise MemoryError('Resident CSR construction exceeds host budget (including scratch).')
             self.indptr = np.asarray(group['indptr'], dtype=np.int64)
             self.indices = np.asarray(group['indices'], dtype=np.int64)
@@ -45,7 +62,7 @@ class ResidentSpectra:
             self.indptr = cumulative[self.indptr]
             self.indices, self.values = self.indices[keep], self.values[keep]
         # Bound temporary validation/transform arrays independently of source size.
-        for start in range(0, len(self.values), 4_000_000):
+        def transform_block(start):
             values = self.values[start:start + 4_000_000]
             peaks = self.indices[start:start + 4_000_000]
             if np.any(peaks < 0) or np.any(peaks >= self.num_peaks):
@@ -61,6 +78,14 @@ class ResidentSpectra:
                 position = start + np.flatnonzero(invalid)[0]
                 row = np.searchsorted(self.indptr[1:], position, side='right')
                 raise ValueError(f'Invalid transformed MSI intensities in resident cache at row {row}.')
+        starts = range(0, len(self.values), 4_000_000)
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='dann-msi-startup') as pool:
+                for _ in pool.map(transform_block, starts):
+                    pass
+        else:
+            for start in starts:
+                transform_block(start)
         for array in (self.indptr, self.indices, self.values):
             array.flags.writeable = False
         self.nbytes = sum(a.nbytes for a in (self.indptr, self.indices, self.values))
@@ -189,8 +214,10 @@ class PreparedLoader:
         resident = getattr(self.dataset, 'resident', None) or getattr(tiles, 'resident', None)
         resident_bytes = resident.nbytes if resident is not None else 0
         geometry_bytes = getattr(self.dataset, 'geometry_bytes', 0) or getattr(tiles, 'geometry_bytes', 0)
+        he_reader = getattr(self.dataset, 'he_reader', None) or getattr(tiles, 'he_reader', None)
+        he_bytes = he_reader.nbytes if he_reader is not None else 0
         # CPU prepared, pinned staging, current and transfer batches can coexist.
-        required = resident_bytes + geometry_bytes + size * (3 * self.settings['prepared_batches'] + 6)
+        required = resident_bytes + he_bytes + geometry_bytes + size * (3 * self.settings['prepared_batches'] + 6)
         if required > self.settings['host_budget_gib'] * 2**30:
             raise MemoryError('Resident cache plus bounded preparation exceeds host budget.')
         if self.inference:

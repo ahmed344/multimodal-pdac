@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Mapping
 from uuid import uuid4
 
@@ -18,13 +20,16 @@ def he_settings(config: Mapping[str, Any]) -> dict[str, Any] | None:
 
 
 class HETargetReader:
-    """Read selected obsm rows with invocation-local handles, safe across workers/threads.
+    """Read selected obsm rows from disk or a shared immutable float32 cache.
 
-    No HDF5 handle or target matrix is retained in the dataset or geometry cache.
-    Stored feature order and values are preserved (float32 model precision).
+    Backed reads own their handles; resident reads need no HDF5 calls. Values are
+    validated only when selected, so held-out nonfinite rows cannot affect fitting.
     """
     def __init__(self, path: Path, key: str, rows: int, width: int) -> None:
         self.path, self.key, self.width = Path(path), key, width
+        self.rows = rows
+        self.values: np.ndarray | None = None
+        self.startup_seconds = 0.
         with h5py.File(self.path, 'r') as handle:
             name = f'obsm/{key}'
             if name not in handle:
@@ -34,18 +39,114 @@ class HETargetReader:
                 raise ValueError(f'H&E targets {name} must have shape ({rows}, {width}).')
             if array.dtype.kind not in 'fiu':
                 raise TypeError(f'H&E targets {name} must have a real numeric dtype.')
+            self.chunk_rows = array.chunks[0] if array.chunks else None
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes retained by this shared reader, excluding temporary batches."""
+        return self.values.nbytes if self.values is not None else 0
+
+    def cache_in_memory(self, budget_bytes: int) -> None:
+        """Read once into preallocated RAM, rejecting oversized allocations first."""
+        from dann.execution import check_startup_budget
+        if self.values is not None:
+            return
+        required = self.rows * self.width * np.dtype(np.float32).itemsize
+        check_startup_budget(budget_bytes, required + min(required, 64 * 2**20), 'H&E cache')
+        started = perf_counter()
+        values = np.empty((self.rows, self.width), dtype=np.float32)
+        # HDF5 converts directly into the final array; no second matrix or IPC copy.
+        if self.rows:
+            with h5py.File(self.path, 'r') as handle:
+                handle[f'obsm/{self.key}'].read_direct(values)
+        values.flags.writeable = False
+        self.values = values
+        self.startup_seconds = perf_counter() - started
+
+    def _rows(self, rows: np.ndarray) -> np.ndarray:
+        rows = np.asarray(rows, dtype=np.int64)
+        if rows.ndim != 1 or np.any(rows < 0) or np.any(rows >= self.rows):
+            raise ValueError('H&E row positions must be one-dimensional and within the source.')
+        return rows
+
+    @staticmethod
+    def _validate(values: np.ndarray, rows: np.ndarray) -> None:
+        invalid = rows[~np.isfinite(values).all(axis=1)]
+        if len(invalid):
+            raise ValueError(f'Invalid H&E supervised source row positions: {np.unique(invalid).tolist()} (nonfinite float32 values).')
 
     def read(self, rows: np.ndarray) -> np.ndarray:
         """Read arbitrary row order and explicitly report nonfinite supervised rows."""
-        rows = np.asarray(rows, dtype=np.int64)
+        rows = self._rows(rows)
+        if not len(rows):
+            return np.empty((0, self.width), dtype=np.float32)
+        if self.values is not None:
+            values = self.values[rows]
+            self._validate(values, rows)
+            return values
         unique, inverse = np.unique(rows, return_inverse=True)
         with h5py.File(self.path, 'r') as handle:
             with np.errstate(over='ignore', invalid='ignore'):
                 values = np.asarray(handle[f'obsm/{self.key}'][unique], dtype=np.float32)
-        invalid = unique[~np.isfinite(values).all(axis=1)]
-        if len(invalid):
-            raise ValueError(f'Invalid H&E supervised source row positions: {invalid.tolist()} (nonfinite float32 values).')
+        self._validate(values, unique)
         return values[inverse]
+
+    def mean(self, rows: np.ndarray, chunk_rows: int = 1024, *, workers: int = 1,
+             budget_bytes: int | None = None) -> np.ndarray:
+        """Reduce selected rows in storage order with deterministic float64 sums.
+
+        Backed input visits each relevant row block once using one handle. Cached
+        input uses independent NumPy reductions, without changing sampler order.
+        Duplicate row requests retain their multiplicity; empty input returns zero.
+        """
+        from dann.execution import check_startup_budget
+        if chunk_rows <= 0 or workers <= 0:
+            raise ValueError('H&E reduction chunk_rows and workers must be positive.')
+        rows = self._rows(rows)
+        total = np.zeros(self.width, dtype=np.float64)
+        if not len(rows):
+            return total
+        block_rows = min(max(chunk_rows, self.chunk_rows or 1),
+                         max(1, 64 * 2**20 // (self.width * 4)))
+        workers = min(workers, len(rows), len(os.sched_getaffinity(0)) if hasattr(os, 'sched_getaffinity') else os.cpu_count() or 1)
+        if budget_bytes is not None:
+            # One storage slab plus a selected-row buffer per task, and sort/index scratch.
+            scratch = 3 * rows.nbytes + (workers if self.values is not None else 1) * (
+                block_rows * self.width * 9 + self.width * 8)
+            check_startup_budget(budget_bytes, scratch, 'H&E mean reduction')
+        ordered = np.sort(rows)
+        blocks = ordered // block_rows
+        boundaries = np.r_[0, np.flatnonzero(np.diff(blocks)) + 1, len(ordered)]
+        spans = list(zip(boundaries[:-1], boundaries[1:]))
+
+        def reduce_block(source, span):
+            left, right = span
+            start = int(ordered[left] // block_rows * block_rows)
+            stop = min(start + block_rows, self.rows)
+            # Select before validating: held-out NaNs never enter fitted statistics.
+            slab = np.asarray(source[start:stop], dtype=np.float32)
+            partial = np.zeros(self.width, dtype=np.float64)
+            # Also bound requests containing many duplicates within one storage block.
+            for first in range(left, right, block_rows):
+                selected = ordered[first:min(first + block_rows, right)]
+                values = slab[selected - start]
+                self._validate(values, selected)
+                partial += values.sum(axis=0, dtype=np.float64)
+            return partial
+
+        if self.values is None:
+            with h5py.File(self.path, 'r') as handle, np.errstate(over='ignore', invalid='ignore'):
+                source = handle[f'obsm/{self.key}']
+                for span in spans:
+                    total += reduce_block(source, span)
+        elif workers == 1:
+            for span in spans:
+                total += reduce_block(self.values, span)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='dann-he-mean') as pool:
+                for partial in pool.map(lambda span: reduce_block(self.values, span), spans):
+                    total += partial
+        return total / len(rows)
 
 
 def he_mse(prediction: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:

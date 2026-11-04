@@ -112,6 +112,7 @@ model:
         attention_dropout: 0.05  # Drop attention coefficients during training.
 
     discriminator:
+      enabled: false  # Omit the classifier and GRL; direct alignment uses ordinary backpropagation.
       type: mlp  # Choices: mlp, cnn, gatv2. Predicts batch class from gradient-reversed latents.
       mlp:
         residual: true
@@ -145,6 +146,14 @@ model:
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
 
 loss:
+  batch_alignment:
+    nhsic: {enabled: true, weight: 0.1}  # Initial experimental weight, not an established optimum.
+    anova: {enabled: false, weight: 0.0}
+    soft_nn: {enabled: false, weight: 0.0}
+    bandwidths: [0.05, 0.1, 0.2, 0.5]
+    temperature: 0.1
+    train_per_slide: 32
+    validation_per_slide: 64
   ziln_reduction: mean  # Reduction over valid weighted target entries: mean or sum.
   target_weights: [8.0, 4.0, 2.0, 1.0]  # Relative weights in data.target_columns order.
   logit_epsilon: 0.00001  # Clamp positive target densities before taking their logits.
@@ -212,9 +221,10 @@ training:
   grl_horizon_updates: null  # Full-fit epoch-based schedule derived from actual logical updates; the pilot's 500-update horizon is not used.
   early_stopping_enabled: true  # Disable only for bounded diagnostic comparisons.
   early_stopping_metric: supervised_objective  # Also supports supervised_objective and cd8_loss; omission retains legacy CD8 selection.
-  early_stopping_patience: 20  # Epochs without improvement in the validation selection metric.
+  early_stopping_patience: 10  # Epochs without improvement in the validation selection metric.
   early_stopping_min_delta: 0.001  # Minimum improvement in the selected score's units.
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
+  archive_checkpoint_every: null  # Optional epoch archives; null disables, study configs use 5.
   resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, and early stopping may override.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
 
@@ -323,17 +333,19 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: "he10_biology2_discriminator1_512_occurrence_mlp_count_zero_input_cleaned_qc40"  # 512-wide occurrence-MLP fit; dictionary arms use separate configs.
+  run_name: "he10_biology2_nhsic0p1_512_occurrence_mlp_count_zero_input_cleaned"  # 512-wide occurrence-MLP fit; dictionary arms use separate configs.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.
 performance:
   async_artifacts: true  # CPU workers save checkpoints/audits/history and render curves while the next epoch trains.
   ram_cache: true
+  he_ram_cache: true  # One shared float32 H&E cache for initialization and all supervised splits.
+  startup_workers: 8  # Measured startup optimum: parallel MSI transforms and train-only H&E reductions.
   cache_geometry: true
   torch_threads: 4  # Intra-operation CPU threads; null keeps the process default.
-  preparation_workers: 2  # Threads; requires ram_cache. Start comparisons at 2 or 4.
-  prepared_batches: 2  # Bounded CPU queue; completed results retain sampler order.
+  preparation_workers: 2  # Cached-data GPU benchmark: more workers gave no meaningful throughput gain.
+  prepared_batches: 4  # Two requests per preparation worker; completed results retain sampler order.
   transfer_prefetch: true  # One pinned staging batch on a dedicated CUDA stream.
   validation_tiles: 8  # Tested physical validation batch for 32x32 cores; tiles_per_batch still defines losses.
   validation_peak_budget: 262144  # Explicit values also set the inner inference chunk cap; null keeps model limits.

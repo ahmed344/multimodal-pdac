@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from dann.config import head_initialization_settings
+from dann.config import head_initialization_settings, performance_settings
 from dann.he import HETargetReader
 
 
@@ -65,12 +65,12 @@ def initialize_supervised_heads(model: nn.Module, bundle: Any,
         config['loss']['logit_epsilon'], settings['min_positive_sigma'], config['model']['sigma_min'])
     projections = [(final_projection(model.biology_predictor), bias)]
     if model.he_predictor is not None:
-        reader = HETargetReader(Path(config['data']['path']), config['data'].get('he_features_key', 'hes_features'),
-                                metadata.num_observations, model.he_output_dim)
-        total = np.zeros(model.he_output_dim, dtype=np.float64)
-        for start in range(0, len(rows), chunk_rows):
-            total += reader.read(rows[start:start+chunk_rows]).sum(axis=0, dtype=np.float64)
-        mean = total / max(len(rows), 1)
+        reader = getattr(bundle, 'he_reader', None) or HETargetReader(
+            Path(config['data']['path']), config['data'].get('he_features_key', 'hes_features'),
+            metadata.num_observations, model.he_output_dim)
+        performance = performance_settings(config)
+        mean = reader.mean(rows, chunk_rows, workers=performance['startup_workers'],
+                           budget_bytes=int(performance['host_budget_gib'] * 2**30))
         report['he'] = dict(count=len(rows), mean=mean.tolist(),
                             fallbacks=[] if len(rows) else ['no_training_rows: mean=0'])
         projections.append((final_projection(model.he_predictor), mean))

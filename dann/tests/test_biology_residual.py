@@ -172,7 +172,7 @@ def test_checkpoint_predictions_resume_and_analysis(spatial_config, tmp_path, ki
         path = tmp_path / 'checkpoint.pt'
         save_checkpoint(path, model, optimizer, 0, config, bundle, 1.)
         payload = torch.load(path, weights_only=False)
-        assert payload['architecture']['version'] == 8
+        assert payload['architecture']['version'] == 9
         payload['architecture']['version'] = 4  # Exercise the historical v4 contract.
         for name, enabled in zip(COMPONENTS, flags):
             assert component_group(payload['config'], name)['cnn']['residual'] is enabled
@@ -202,7 +202,9 @@ def test_checkpoint_predictions_resume_and_analysis(spatial_config, tmp_path, ki
         requested = copy.deepcopy(config)
         for name, enabled in zip(COMPONENTS, flags):
             component_group(requested, name)['cnn']['residual'] = not enabled
-        resumed_config = resume_training_config(checkpoint_config(payload), requested)
+        with pytest.raises(ValueError, match='fresh training'):
+            resume_training_config(checkpoint_config(payload), requested)
+        resumed_config = resume_training_config(checkpoint_config(payload), checkpoint_config(payload))
         fresh = AdversarialLatentFusion.from_config(resumed_config, 2, 4)
         resumed_optimizer = torch.optim.AdamW(fresh.parameters())
         assert load_training_checkpoint(path, fresh, resumed_optimizer, torch.device('cpu'), resumed_config) == (1, 1.)

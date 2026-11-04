@@ -97,7 +97,8 @@ class SpatialTileDataset(Dataset):
     """Gather full MSI context while exposing labels only for selected core rows."""
     def __init__(self, config: Mapping[str, Any], selected_rows: np.ndarray,
                  metadata: AnnDataMetadata | None = None, input_path: Path | None = None,
-                 geometry: tuple | None = None, resident=None, spatial_cache=None, progress=None) -> None:
+                 geometry: tuple | None = None, resident=None, spatial_cache=None, progress=None,
+                 he_reader=None) -> None:
         from dann.config import execution_settings
         from dann.spatial import SparseInferenceDataset
         self.data = config['data']
@@ -143,8 +144,14 @@ class SpatialTileDataset(Dataset):
         self.metadata = metadata
         from dann.he import HETargetReader, he_settings
         he = he_settings(config)
-        self.he_reader = (HETargetReader(self.path, self.data.get('he_features_key', 'hes_features'),
-                                        len(self.keys), he['output_dim']) if metadata is not None and he else None)
+        self.he_reader = None
+        if metadata is not None and he:
+            key = self.data.get('he_features_key', 'hes_features')
+            if he_reader is not None and (he_reader.path.resolve() != self.path.resolve()
+                    or he_reader.key != key or he_reader.rows != len(self.keys)
+                    or he_reader.width != he['output_dim']):
+                raise ValueError('Shared H&E reader source or dimensions differ from tile input.')
+            self.he_reader = he_reader or HETargetReader(self.path, key, len(self.keys), he['output_dim'])
         self.core_size = int(config['training'].get('core_size', 32))
         self.halo = execution_settings(config)['halo']
         self.latent_radius = execution_settings(config)['latent_radius']
@@ -193,8 +200,10 @@ class SpatialTileDataset(Dataset):
             self.geometry_bytes = sum(
                 sum(v.nbytes for v in g.values() if isinstance(v, np.ndarray))
                 + tensor_bytes(g.get('graphs', {})) for g in self.spatial_cache.values())
-            if self.geometry_bytes + (resident.nbytes if resident is not None else 0) > self.performance.get('host_budget_gib', 128) * 2**30:
-                raise MemoryError('Spatial geometry plus spectra exceed host budget.')
+            if (self.geometry_bytes + (resident.nbytes if resident is not None else 0)
+                    + (self.he_reader.nbytes if self.he_reader is not None else 0)
+                    > self.performance.get('host_budget_gib', 128) * 2**30):
+                raise MemoryError('Spatial geometry plus resident caches exceed host budget.')
 
     def _prepare_geometry(self, item: int) -> dict[str, Any]:
         """Cache immutable full footprints and graphs shared by all label splits."""
