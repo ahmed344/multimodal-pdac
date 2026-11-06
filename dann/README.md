@@ -2965,3 +2965,61 @@ required checkpoints are retained. `report.html` links matched/common-epoch
 comparisons and distinguishes supervised selection from mixing selection. The
 existing combined recommendation is retained unless an eligible full fit improves
 both latent and UMAP neighbor excess.
+
+### H&E-disabled alignment and architecture transfer
+
+`dann.verification.alignment_no_he` freezes a new experiment while preserving the
+editable root configuration and all historical artifacts. New arms disable the
+H&E head and set its weight to zero. The sequential MLP sweep tests nHSIC
+`0, .01, .03, .1, .3, 1`, then ANOVA `.003, .01, .03, .1`, then soft-NN
+`.1, .3, 1, 3`. Eligible additions must improve both latent and UMAP neighbor
+excess. Final MLP weights transfer to fresh CNN/CNN and GATv2/GATv2 fits, each
+with its own zero-alignment control. Identical configurations are reused.
+
+```bash
+python -m dann.verification.alignment_no_he \
+  --previous data/verification/alignment_sweep_2026-11-04_v6 \
+  --output data/verification/alignment_no_he_2026-11-04 --prepare
+python -m dann.verification.alignment_no_he \
+  --output data/verification/alignment_no_he_2026-11-04 --run
+# Run through a particular decision, regenerate reports, or validate artifacts:
+python -m dann.verification.alignment_no_he \
+  --output data/verification/alignment_no_he_2026-11-04 --run --through nhsic
+python -m dann.verification.alignment_no_he \
+  --output data/verification/alignment_no_he_2026-11-04 --report --audit
+```
+
+Registered arms also support `--arm NAME --stage smoke|train|evaluate|full_umap`.
+The runner requires the DANN synthetic suite and bounded real-region smokes for
+all three architectures before full fitting. Spatial evaluation uses normal
+lesion tile/context loaders, restores frozen core-row order, and rejects missing
+or duplicate identities. Exact coverage must match across architectures; sampling
+order and initialization are compared within each architecture.
+
+Eligibility retains the original numerical-collapse and biological/CD8 bounds,
+applied against both the new supervised-selected H&E-disabled control and the
+original nHSIC-0.1 reference. Initial nHSIC selection does not require a mixing
+improvement over the old reference. Invalid MLP comparison references or no
+eligible MLP candidate stop the study before architecture transfer. An unusable
+spatial control marks its architecture comparison unavailable. Supervised-selected
+and mixing-selected checkpoints remain distinct;
+replacing the combined recommendation also requires improved mixing in both spaces.
+
+Every stage uses frozen sources/configurations, immutable decisions and checksummed
+completion receipts. Interrupted fits restore optimizer, scheduler, sampler,
+stopping and RNG state; numerical failures are explicit exclusions. Re-running a
+completed study verifies and reuses successful stages. Training retains the
+300-epoch horizon, supervised stopping, `best.pt`, `latest.pt`, and five-epoch
+archives. H&E performance is unavailable, with no target reads or H&E curves.
+Predictions, probes and latent arrays stay in memory. Compact metrics, full
+validation UMAPs, a linked HTML report and an image ZIP are saved. Historical
+comparisons use biology/CD8 components, because supervised objectives differ.
+All normal, resumed and smoke stages forbid tissue inference, spatial prediction
+exports, and post-training workflows.
+
+Reporting or orchestration repairs can be recorded with
+`--recover-reporting "REASON"` after the runner has stopped. This appends a
+checksummed source snapshot, patch, and parent provenance under `recoveries/`;
+it preserves the original snapshot and completed receipts. The repair mechanism
+rejects changes to scientific functions. Subsequent commands use the latest
+verified recovery snapshot, and new stage receipts identify that revision.

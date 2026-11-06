@@ -91,7 +91,7 @@ model:
         attention_dropout: 0.05  # Drop attention coefficients during training.
 
     he:
-      enabled: true  # Auxiliary raw UNI2-h feature prediction.
+      enabled: false  # Auxiliary raw UNI2-h feature prediction.
       output_dim: 1536
       type: mlp  # Choices: mlp, cnn, gatv2. Emits unrestricted linear feature predictions.
       mlp:

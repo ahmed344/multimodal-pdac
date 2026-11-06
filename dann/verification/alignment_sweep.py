@@ -301,16 +301,49 @@ def training_observer(root: Path, arm: str, m: dict):
     return observe
 
 
+def restore_row_order(arrays: dict, rows: np.ndarray) -> dict:
+    """Reject duplicate, missing or extra core identities and restore frozen order."""
+    rows = np.asarray(rows)
+    actual = np.asarray(arrays['rows'])
+    if len(np.unique(rows)) != len(rows) or len(np.unique(actual)) != len(actual):
+        raise ValueError('Duplicate requested or extracted row identities.')
+    order = pd.Index(actual).get_indexer(rows)
+    if len(actual) != len(rows) or np.any(order < 0):
+        raise ValueError('Missing or unexpected extracted row identities.')
+    if any(len(value) != len(actual) for value in arrays.values()):
+        raise ValueError('Extracted outputs do not align with core identities.')
+    return {key:value[order] for key,value in arrays.items()}
+
+
 def extract_rows(model, c: dict, bundle, rows: np.ndarray, *, he: bool = False) -> tuple[dict, dict]:
-    """Gather only necessary outputs with frozen transforms and bounded batches."""
+    """Extract pixel or spatial core outputs with lesion context and frozen order.
+
+    H&E targets are never read when the head is disabled. Spatial context uses
+    the normal supervised tile dataset; only requested core rows emit outputs.
+    """
     from torch.utils.data import DataLoader
+    from dann.config import execution_settings
     from dann.data_loader import SparseAnnDataDataset, sparse_collate
     from dann.execution import PreparedLoader
+    from dann.he import he_settings
+    from dann.tiles import SpatialTileDataset, tile_collate
     from dann.train import move_batch_to_device, _update_he_statistics
-    ds = SparseAnnDataDataset(Path(c['data']['path']), rows, bundle.metadata,
-        **{k:c['data'][k] for k in ('matrix_key','intensity_transform','intensity_clip_max','nonzero_threshold')},
-        resident=next(iter(bundle.datasets.values())).resident, he_reader=bundle.he_reader if he else None)
-    loader = DataLoader(ds, batch_size=2048, shuffle=False, collate_fn=sparse_collate,
+    enabled = bool(he_settings(c))
+    collect_he = he and enabled
+    source = next(iter(bundle.datasets.values()))
+    resident = getattr(source, 'resident', None)
+    reader = bundle.he_reader if collect_he else None
+    if execution_settings(c)['mode'] == 'spatial':
+        ds = SpatialTileDataset(c, rows, bundle.metadata, resident=resident,
+            geometry=getattr(source, 'geometry', None), he_reader=reader)
+        collate = tile_collate
+        batch_size = c['performance'].get('validation_tiles') or c['training']['tiles_per_batch']
+    else:
+        ds = SparseAnnDataDataset(Path(c['data']['path']), rows, bundle.metadata,
+            **{k:c['data'][k] for k in ('matrix_key','intensity_transform','intensity_clip_max','nonzero_threshold')},
+            resident=resident, he_reader=reader)
+        collate, batch_size = sparse_collate, 2048
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=False, collate_fn=collate,
                         generator=torch.Generator().manual_seed(SEED))
     loader = PreparedLoader(loader, c['performance'], c['model'], validation=True)
     collected = {k:[] for k in ('rows','latent','pi_logits','mu','sigma')}
@@ -320,21 +353,20 @@ def extract_rows(model, c: dict, bundle, rows: np.ndarray, *, he: bool = False) 
         with torch.inference_mode():
             for cpu in loader:
                 batch = move_batch_to_device(cpu, device)
-                output = model(batch, grl_strength=0.)
+                output = model(batch, grl_strength=0., predict_he=collect_he)
                 if not all(torch.isfinite(v).all() for v in output.values()):
                     raise FloatingPointError('Nonfinite evaluation outputs.')
                 collected['rows'].append(batch['row_ids'].cpu().numpy())
                 for key in ('latent','pi_logits','mu','sigma'):
                     collected[key].append(output[key].cpu().numpy())
-                if he:
+                if collect_he:
                     _update_he_statistics(statistics, output['he_prediction'], batch['he_targets'])
     finally:
         ds.close()
-    arrays = {k:np.concatenate(v) for k,v in collected.items()}
-    np.testing.assert_array_equal(arrays['rows'], rows)
-    he_metrics = {}
-    if he:
-        he_metrics = dict(mse=float(statistics['he_sum']/statistics['he_count']),
+    arrays = restore_row_order({k:np.concatenate(v) for k,v in collected.items()}, rows)
+    he_metrics = dict(available=False, reason='head_disabled' if not enabled else 'not_requested')
+    if collect_he:
+        he_metrics = dict(available=True, mse=float(statistics['he_sum']/statistics['he_count']),
                           r2=float(1-statistics['he_sum']/statistics['he_target_m2'].sum()))
     return arrays, he_metrics
 
@@ -449,7 +481,7 @@ def evaluate_checkpoint(root: Path, arm: str, path: Path, m: dict, c: dict, bund
     if reusable(stamp,identity):
         return json.loads((out/'metrics.json').read_text())
     print(f'Evaluating {identifier}: {path}',flush=True)
-    model = AdversarialLatentFusion.from_config(checkpoint_config(checkpoint),40,4).cuda().eval()
+    model = AdversarialLatentFusion.from_config(checkpoint_config(checkpoint),len(m['batch_names']),len(c['data']['target_columns'])).cuda().eval()
     model.load_state_dict(checkpoint['model_state'])
     valid, he = extract_rows(model,c,bundle,checkpoint['split_indices']['validation'],he=True)
     record = dict(id=identifier,arm=arm,epoch=checkpoint['epoch']+1,checkpoint=str(path),identity=identity,
@@ -511,7 +543,8 @@ def complete(stamp: Path, identity: dict, result: dict, start: float) -> None:
 
 
 
-def smoke_inputs(root: Path, c: dict) -> None:
+def smoke_inputs(root: Path, c: dict, *, include_he: bool = True, lesion_only: bool = False,
+                 spatial_regions: bool = False) -> None:
     """Copy bounded real arrays without mislabeling a subset as a full cohort.
 
     Schema-3 cohort manifests describe exact original rows and cannot accompany
@@ -529,7 +562,7 @@ def smoke_inputs(root: Path, c: dict) -> None:
     provenance = dict(fixture_only=True, preprocessing_refitted=False,
                       original_preprocessing_fingerprint=c['data'].get('preprocessing_fingerprint'), inputs={})
     slides = None
-    for key, count in [('path',2048),('context_path',512)]:
+    for key, count in ([('path',2048)] if lesion_only else [('path',2048),('context_path',512)]):
         source = Path(c['data'][key])
         destination = directory/f'{key}.h5ad'
         with h5py.File(source,'r') as handle:
@@ -538,7 +571,19 @@ def smoke_inputs(root: Path, c: dict) -> None:
             if slides is None:
                 slides = sorted(obs[c['data']['batch_column']].astype(str).unique())[:2]
             eligible = np.flatnonzero(obs[c['data']['batch_column']].astype(str).isin(slides).to_numpy())
-            rows = np.sort(stratified_cap_indices(eligible,labels,count,SEED))
+            if spatial_regions:
+                # Compact real regions retain neighboring MSI context in bounded
+                # CNN/GATv2 fixtures; selection never depends on target labels.
+                regions = []
+                for slide in slides:
+                    indices_for_slide = eligible[obs.iloc[eligible][c['data']['batch_column']].astype(str).to_numpy() == slide]
+                    xy = obs.iloc[indices_for_slide][[c['data']['x_column'],c['data']['y_column']]].to_numpy(float)
+                    center = xy[np.argmin(np.square(xy-np.median(xy,axis=0)).sum(axis=1))]
+                    order = np.argsort(np.square(xy-center).sum(axis=1),kind='stable')
+                    regions.append(indices_for_slide[order[:count//len(slides)]])
+                rows = np.sort(np.concatenate(regions))
+            else:
+                rows = np.sort(stratified_cap_indices(eligible,labels,count,SEED))
             var = read_elem(handle['var'])
             group = handle['X']
             pointers = group['indptr'][:]
@@ -552,12 +597,13 @@ def smoke_inputs(root: Path, c: dict) -> None:
                 indices[outptr[i]:outptr[i+1]] = group['indices'][left:right]
             matrix = csr_matrix((values,indices,outptr),shape=(len(rows),len(var)))
             he_key = c['data']['he_features_key']
-            features = np.asarray(handle[f'obsm/{he_key}'][rows],dtype=np.float32)
-            obsm = {he_key:features}
+            obsm = {}
+            if include_he:
+                obsm[he_key] = np.asarray(handle[f'obsm/{he_key}'][rows],dtype=np.float32)
             uns = {'alignment_smoke_fixture': True}
             if 'obsm/spatial' in handle:
                 obsm['spatial'] = np.asarray(handle['obsm/spatial'][rows])
-            if 'uns/spatial' in handle:
+            if not lesion_only and 'uns/spatial' in handle:
                 uns['spatial'] = {slide:read_elem(handle['uns/spatial'][slide]) for slide in slides}
             fixture = ad.AnnData(X=matrix,obs=obs.iloc[rows].copy(),var=var.copy(),obsm=obsm,uns=uns)
             with atomic_output(destination) as temporary:
@@ -620,7 +666,7 @@ def execute_stage(root: Path, arm: str, stage: str) -> None:
         elif stage == 'full_umap':
             path = Path(selection['checkpoint'])
             checkpoint = torch.load(path,map_location='cpu',weights_only=False)
-            model = AdversarialLatentFusion.from_config(checkpoint_config(checkpoint),40,4).cuda().eval()
+            model = AdversarialLatentFusion.from_config(checkpoint_config(checkpoint),len(m['batch_names']),len(c['data']['target_columns'])).cuda().eval()
             model.load_state_dict(checkpoint['model_state'])
             bundle = create_data_bundle(c,checkpoint['split_indices'],checkpoint['data_identity'],requested_splits=('validation',))
             out = root/'diagnostics'/selection['id']/'full_validation'

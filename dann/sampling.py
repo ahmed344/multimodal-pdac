@@ -155,11 +155,13 @@ class SamplingEpochAudit:
         self.rows_hash = hashlib.sha256()
         self.boundaries_hash = hashlib.sha256(np.asarray([0], dtype='<i8').tobytes())
         self.processed_rows = 0
+        self.coverage_rows: list[np.ndarray] = []
         self.compositions: list[dict] = []
 
     def update(self, batch: dict[str, torch.Tensor]) -> dict:
         """Record one successfully executed optimizer batch (context is not exposure)."""
         rows = batch['row_ids'].numpy().astype('<i8', copy=False)
+        self.coverage_rows.append(rows.copy())
         self.rows_hash.update(rows.tobytes())
         self.processed_rows += len(rows)
         self.boundaries_hash.update(np.asarray([self.processed_rows], dtype='<i8').tobytes())
@@ -177,7 +179,10 @@ class SamplingEpochAudit:
 
     def summary(self) -> dict:
         """Return independently reproducible row/boundary digests and epoch statistics."""
+        coverage = np.sort(np.concatenate(self.coverage_rows)) if self.coverage_rows else np.array([], dtype="<i8")
         return dict(epoch=self.epoch, processed_rows=self.processed_rows, batches=len(self.compositions),
+                    unique_rows=int(len(np.unique(coverage))),
+                    row_coverage_sha256=hashlib.sha256(coverage.astype("<i8").tobytes()).hexdigest(),
                     complete=self.processed_rows == self.total_rows,
                     row_order_sha256=self.rows_hash.hexdigest(),
                     boundaries_sha256=self.boundaries_hash.hexdigest(),
