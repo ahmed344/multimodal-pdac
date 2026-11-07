@@ -459,7 +459,8 @@ def run_heatmaps(
         progress.close()
         report = dict(settings=settings, effective_workers=workers, memory_estimates=memory,
                       preprocessing=preprocessing,
-                      sources=identities, densities=list(densities), dpi=dpi, logit_epsilon=epsilon,
+                      sources=identities, slides=[str(value) for value in batches],
+                      densities=list(densities), dpi=dpi, logit_epsilon=epsilon,
                       phase_seconds=progress.durations, total_seconds=time.perf_counter() - progress.started,
                       peak_parent_worker_rss_gib=progress.peak_rss / GIB,
                       outputs=sorted(results, key=lambda result: result["path"]))

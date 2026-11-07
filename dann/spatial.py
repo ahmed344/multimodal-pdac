@@ -997,13 +997,12 @@ def _run_inference(
             compression="zstd",
             use_dictionary=["obs_name"],
         )
-        support_writer = None
+        support_writer = pq.ParquetWriter(support_temporary, pa.schema([
+            ("row_position", pa.int64()), ("biology_support", pa.float32()),
+            ("latent_support", pa.float32())]), compression="zstd")
         staged = None
         if model.spatial:
             from dann.tiles import ordered_spatial_predictions
-            support_writer = pq.ParquetWriter(support_temporary, pa.schema([
-                ("row_position", pa.int64()), ("biology_support", pa.float32()),
-                ("latent_support", pa.float32())]), compression="zstd")
             staged = ordered_spatial_predictions(
                 model, loader, selected_rows, device, output_path.parent,
                 output_batch_size=spatial_settings['output_rows'] if optimized else 4096,
@@ -1036,6 +1035,12 @@ def _run_inference(
                     predictions = model(model_batch, grl_strength=0.,
                                         **({'predict_he': export_he} if getattr(model, 'he_output_dim', 0) else {}))
                     latent = predictions["latent"]
+                    # A pointwise model has only the observed center pixel in its
+                    # receptive field. Its radius-zero occupancy support is one.
+                    support_writer.write_table(pa.table({
+                        "row_position": row_positions,
+                        "biology_support": np.ones(len(row_positions), dtype=np.float32),
+                        "latent_support": np.ones(len(row_positions), dtype=np.float32)}))
                 if he_writer is not None:
                     he_writer.write(row_positions, predictions['he_prediction'].cpu().numpy())
                 parameters = {key: predictions[key].cpu().numpy() for key in ("pi", "mu", "sigma")}
@@ -1102,8 +1107,11 @@ def _run_inference(
         provenance_temporary.write_text(json.dumps({
             "he_prediction_identity": _file_identity(he_path) if export_he else None,
             "checkpoint": str(checkpoint_path), "input": str(input_path),
+            "checkpoint_epoch": checkpoint_epoch,
             "architecture": saved_checkpoint.get("architecture"),
-            "support_semantics": "occupancy_fraction_in_enclosing_square_window_not_graph_reachability_or_attention_mass",
+            "support_semantics": ("occupancy_fraction_in_enclosing_square_window_not_graph_reachability_or_attention_mass"
+                                  if model.spatial else "observed_center_pixel_only_radius_zero_occupancy"),
+            "support_identity": {**_file_identity(support_temporary), "path": str(support_path.resolve())},
             "training_data_contract": saved_checkpoint.get("training_data_contract", {"version": 0, "status": "unknown_legacy_provenance"}),
             "selected_rows": selected_rows, "context_rows": total_rows, "edge_exclusions": 0,
             "execution": {**(execution_settings(config) if model.spatial else {"mode": "pixel"}),

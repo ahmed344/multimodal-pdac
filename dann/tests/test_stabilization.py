@@ -199,7 +199,7 @@ def test_warmup_endpoints_plateau_and_resume(epochs, updates):
         rates.append(opt.param_groups[0]['lr'])
         warmup.step()
         if i >= warmup.horizon:
-            step_lr_scheduler(scheduler, dict(supervised_objective=1.))
+            step_lr_scheduler(scheduler, dict(total_loss=1.))
         if i == 1:
             state = cpu_snapshot(training_state(nn.Linear(1, 1), opt, scheduler, warmup))
     assert rates[0] == (.0001 if epochs else .001)
@@ -212,7 +212,7 @@ def test_warmup_endpoints_plateau_and_resume(epochs, updates):
         assert opt2.param_groups[0]['lr'] == rates[i]
         warm2.step()
         if i >= warm2.horizon:
-            step_lr_scheduler(sched2, dict(supervised_objective=1.))
+            step_lr_scheduler(sched2, dict(total_loss=1.))
     assert opt2.param_groups[0]['lr'] >= .001*.01
 
 

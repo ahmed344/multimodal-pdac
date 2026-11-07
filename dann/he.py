@@ -231,6 +231,9 @@ class HEWriter:
 
 def analysis_he_statistics(predictions: Mapping, batch: Mapping) -> dict[str, np.ndarray]:
     """Keep per-row sums/counts, avoiding retention of large feature predictions."""
+    if 'cca_msi' in predictions:
+        # Small paired projections remain row-aligned in the analysis cache.
+        return {key: predictions[key].detach().cpu().numpy() for key in ('cca_msi', 'cca_he')}
     if 'he_prediction' not in predictions:
         return {}
     error = (predictions['he_prediction'].double() - batch['he_targets'].double()).square()
@@ -241,6 +244,20 @@ def analysis_he_statistics(predictions: Mapping, batch: Mapping) -> dict[str, np
 def report_he(extracted: Mapping, directory: Path, split: str, weight: float) -> None:
     """Write exact aggregate analysis MSE even when feature export is disabled."""
     import json
+    if 'cca_msi' in extracted:
+        from dann.deep_cca import SlideCovariance, CCASummary
+        statistics = SlideCovariance(extracted['cca_msi'].shape[1])
+        for start in range(0, len(extracted['cca_msi']), 8192):
+            take = slice(start, start + 8192)
+            statistics.update(*(torch.as_tensor(extracted[k][take]) for k in ('cca_msi', 'cca_he', 'batches')))
+        summary = CCASummary(weight)
+        summary.add(statistics.finish())
+        metrics = summary.finish(strict=False)
+        metrics = {k: (None if isinstance(v, float) and not np.isfinite(v) else v) for k, v in metrics.items()}
+        output = Path(directory) / 'he'
+        output.mkdir(parents=True, exist_ok=True)
+        (output / f'{split}_cca_metrics.json').write_text(json.dumps(metrics, indent=2))
+        return
     if 'he_squared_error' not in extracted:
         return
     count = int(extracted['he_element_count'].sum())
@@ -259,6 +276,8 @@ def extract_with_he(model, loader, device, config: Mapping, directory: Path,
     from contextlib import nullcontext
     from dann.analyze import extract_latent_predictions
     writer = nullcontext(None)
+    if getattr(model, 'he_cca', None) is not None and config['analysis'].get('export_he_predictions', False):
+        raise ValueError('Raw H&E reconstruction export is unavailable with deep_cca.')
     if config['analysis'].get('export_he_predictions', False) and getattr(model, 'he_output_dim', 0):
         writer = HEWriter(Path(directory) / 'he' / f'{split}_predictions.parquet',
                           Path(config['data']['path']), model.he_output_dim, loader.dataset.indices)

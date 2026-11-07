@@ -29,6 +29,7 @@ from dann.lr_scheduler import (create_lr_scheduler, step_lr_scheduler, validate_
                                UpdateWarmup, validate_warmup_checkpoint)
 from dann.initialization import initialize_supervised_heads
 from dann.model import AdversarialLatentFusion
+from dann.deep_cca import (cca_contract, effective_weight, evaluate_cca, SlideCovariance, CCASummary)
 from dann.monitoring import GradientMonitor, StreamingCovariance, freeze_monitoring
 from dann.batch_alignment import (NAMES as ALIGNMENT_NAMES, alignment_settings, alignment_contract,
                                   evaluate_alignment, sample_rows, AlignmentSummary, ValidationSample, AlignmentEvaluationError)
@@ -137,6 +138,8 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
             != requested_config.get('data', {}).get('preprocessing_fingerprint')):
         raise ValueError('Changed MSI preprocessing requires fresh training; cannot resume this checkpoint.')
     from dann.batch_alignment import alignment_contract
+    if cca_contract(saved_config) != cca_contract(requested_config):
+        raise ValueError('Changed CCA objective or schedule requires fresh training.')
     if alignment_contract(saved_config) != alignment_contract(requested_config):
         raise ValueError('Changed alignment objective requires fresh training.')
     if (saved_config.get('model', {}).get('heads', {}).get('discriminator', {}).get('enabled', True)
@@ -150,7 +153,7 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
             keys = ('pool_centering', 'peak_mlp_residual', 'pooling', 'normalization', 'normalization_epsilon')
             if any(group['deep_sets'][key] != requested_group.get('deep_sets', {}).get(key) for key in keys):
                 raise ValueError('Incompatible spectral pooling, normalization, centering or MLP residual settings on resume; use saved settings or fresh training.')
-        elif group['type'] == requested_group.get('type') == 'mlp':
+        elif group['type'] == requested_group.get('type') == 'mlp' and group.get('objective') != 'deep_cca':
             if group['mlp']['residual'] != requested_group['mlp']['residual']:
                 raise ValueError(f'Incompatible {name} MLP residual settings on resume; use saved settings or fresh training.')
     has_he = any(c.get('model', {}).get('heads', {}).get('he', {}).get('enabled', False)
@@ -744,6 +747,8 @@ def _format_epoch_summary(
         ("hurdle objective", "hurdle_weighted_loss", 6),
         ("positive objective (location + scale)", "positive_weighted_loss", 6),
     )
+    if "cca_loss" in train_metrics:
+        loss_parts += (("CCA objective", "cca_weighted_loss", 6), ("CCA correlation", "cca_correlation", 4))
     if "he_mse" in train_metrics:
         loss_parts += (("H&E objective", "he_weighted_loss", 6),)
     if metric != "batch_aware_objective" and "batch_aware_objective" in train_metrics:
@@ -888,6 +893,11 @@ def run_epoch(
     """
 
     training = optimizer is not None
+    cca = getattr(model, 'he_cca', None)
+    cca_weight = effective_weight(he_weight, cca.settings, epoch_index, training) if cca is not None else 0.
+    cca_summary = CCASummary(cca_weight)
+    cca_parts = []
+    cca_validation = SlideCovariance(cca.settings['dimension']) if cca is not None and not training else None
     alignment = alignment_settings({'loss': {'batch_alignment': batch_alignment or {}}})
     alignment_names = [n for n in ALIGNMENT_NAMES if alignment[n]['enabled']]
     alignment_summary = AlignmentSummary(alignment)
@@ -951,6 +961,8 @@ def run_epoch(
             group = cpu_batch.get("accumulation", {})
             if training and group.get('count', 1) > 1 and any(alignment[n]['weight'] > 0 for n in alignment_names):
                 raise ValueError('Direct alignment requires unsplit optimizer batches; pairwise losses cannot be averaged across microbatches.')
+            if training and cca is not None and he_weight > 0 and group.get('count', 1) > 1:
+                raise ValueError('Positive-weight CCA requires unsplit optimizer batches.')
             first = group.get("index", 0) == 0
             last = group.get("index", 0) + 1 == group.get("count", 1)
             if training and first and deadline is not None and perf_counter() >= deadline:
@@ -998,6 +1010,22 @@ def run_epoch(
             bio_scale, class_scale, he_scale = accumulation_scales(batch, biology, ziln_loss, class_weights)
             total = (biology_weight * biology.total * bio_scale
                      + batch_weight * discriminator * class_scale + he_weight * he_loss * he_scale)
+            cca_loss = None
+            if cca is not None:
+                if 'cca_msi' not in outputs:
+                    raise ValueError('CCA training/evaluation requires paired H&E targets.')
+                if training:
+                    projections = (outputs['cca_msi'], outputs['cca_he'], batch['batches'])
+                    cca_parts.append(tuple(x.detach() for x in projections) if group.get('count', 1) > 1 else projections)
+                    if last:
+                        measurement = evaluate_cca(*(torch.cat([p[i] for p in cca_parts]) for i in range(3)))
+                        cca_summary.add(measurement)
+                        cca_loss = measurement.loss
+                        if cca_loss is not None and cca_weight > 0:
+                            total = total + cca_weight * cca_loss
+                        cca_parts.clear()
+                else:
+                    cca_validation.update(outputs['cca_msi'], outputs['cca_he'], batch['batches'])
             alignment_components = {}
             if alignment_names:
                 if not training:
@@ -1044,6 +1072,8 @@ def run_epoch(
                     if 'batch_logits' in outputs and batch_weight > 0:
                         components["batch"] = batch_weight * discriminator * class_scale
                     components.update(alignment_components)
+                    if cca_loss is not None and cca_weight > 0:
+                        components['he'] = cca_weight * cca_loss
                     if 'he_prediction' in outputs and he_weight > 0:
                         components["he"] = he_weight * he_loss * he_scale
                     gradient_monitor.accumulate(components)
@@ -1163,7 +1193,11 @@ def run_epoch(
         error.evidence = dict(alignment=error.evidence, training=training, epoch=epoch_index + 1,
                               completed_metrics=finalized)
         raise
-    finalized['total_loss'] = (finalized['supervised_objective'] + finalized.get('batch_weighted_loss', 0.)
+    if cca is not None:
+        if cca_validation is not None:
+            cca_summary.add(cca_validation.finish())
+        finalized.update(cca_summary.finish())
+    finalized['total_loss'] = (finalized.get('cca_weighted_loss', 0.) + finalized['supervised_objective'] + finalized.get('batch_weighted_loss', 0.)
                                + sum(finalized[f'alignment_{n}_weighted_loss'] for n in alignment_names))
     if gradient_monitor is not None:
         finalized.update(gradient_monitor.finish())
@@ -1257,10 +1291,11 @@ def checkpoint_metadata(
         pyg_version = version("torch-geometric")
     except PackageNotFoundError:
         pyg_version = None
-    validate_checkpoint({"config": saved_config, "architecture": architecture}, config, model)
+    validate_checkpoint({"config": saved_config, "architecture": architecture, "cca_contract": cca_contract(config)}, config, model)
     return {
         "monitoring_definitions": copy.deepcopy(config.get("monitoring_definitions")),
         "objective_contract": alignment_contract(config),
+        "cca_contract": cca_contract(config),
         "validation_alignment_sample": copy.deepcopy(config.get("validation_alignment_sample")),
         "optimization": dict(
             logical_updates_per_epoch=getattr(bundle.loaders["train"].sampler, "logical_updates",
@@ -1482,6 +1517,8 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
         print(json.dumps(dict(data_preparation_seconds=preparation_seconds,
                               resident_spectra_gib=resident.nbytes / 2**30,
                               performance=config.get('performance', {}))), flush=True)
+    if 'model_seed' in training:
+        seed_everything(int(training['model_seed']), bool(training['deterministic_algorithms']))
     model = AdversarialLatentFusion.from_config(
         config,
         num_batches=len(bundle.metadata.batch_names),

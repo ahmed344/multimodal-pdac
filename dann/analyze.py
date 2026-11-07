@@ -160,6 +160,8 @@ def extract_latent_predictions(
         "batches": [],
         "row_ids": [],
     }
+    if getattr(model, 'he_cca', None) is not None and he_writer is not None:
+        raise ValueError('Raw H&E reconstruction export is unavailable with deep_cca.')
     with torch.inference_mode():
         for cpu_batch in loader:
             batch = move_batch_to_device(cpu_batch, device)

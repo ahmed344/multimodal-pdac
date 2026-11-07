@@ -4,6 +4,7 @@ from typing import Any, Mapping
 
 from dann.model_components.layers_gatv2 import GATV2_DEFAULTS, GRAPH_SEMANTICS, gatv2_settings, graph_reach
 from dann.config import component_settings, execution_settings
+from dann.deep_cca import cca_contract
 
 
 def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -15,11 +16,17 @@ def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         if name == 'he':
             selected[name].update(output_dim=group['output_dim'],
                                   target_key=config['data'].get('he_features_key', 'hes_features'),
-                                  target_convention='raw_stored_values')
+                                  target_convention='raw_stored_values', objective=group['objective'])
+            if group['objective'] == 'deep_cca':
+                selected[name]['deep_cca'] = cca_contract(config)
+                selected[name]['target_convention'] = 'frozen_training_standardization'
+                selected[name]['mlp'] = {'msi_hidden_dim': group['deep_cca']['msi_hidden_dim'],
+                                          'he_hidden_dim': group['deep_cca']['he_hidden_dim'],
+                                          'dimension': group['deep_cca']['dimension']}
         if group['type'] == 'gatv2':
             selected[name]['graph_semantics'] = copy.deepcopy(GRAPH_SEMANTICS)
             selected[name]['reach'] = graph_reach(group['gatv2']['depth'], group['gatv2']['neighbor_radius'])
-    return {'version': 9, 'components': selected, 'enabled_heads': sorted(settings['heads']),
+    return {'version': 10, 'components': selected, 'enabled_heads': sorted(settings['heads']),
             'numerics': {key: config['model'][key] for key in
                          ('num_peaks', 'latent_dim', 'activation', 'dropout', 'use_layer_norm', 'sigma_min')},
             'spatial': execution_settings(config)}
@@ -37,8 +44,10 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(checkpoint['config'])
     saved = copy.deepcopy(checkpoint.get('architecture'))
     version = saved['version'] if saved is not None else 2
-    if version not in (2, 3, 4, 5, 6, 7, 8, 9):
+    if version not in (2, 3, 4, 5, 6, 7, 8, 9, 10):
         raise ValueError('Unsupported checkpoint architecture version.')
+    if version < 10 and cca_contract(config) is not None:
+        raise ValueError('Deep CCA requires architecture version 10 and fresh training.')
     if version >= 8 and not {'pooling', 'normalization', 'normalization_epsilon'} <= set(
             saved.get('components', {}).get('spectral_encoder', {}).get('deep_sets', {})):
         raise ValueError('Version 8 checkpoint architecture requires explicit pooling, normalization and normalization_epsilon.')
@@ -100,13 +109,36 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
                 pooling='occurrence_mlp', normalization='count', normalization_epsilon=1.0e-8)
         if version < 9:
             saved['enabled_heads'] = sorted(n for n in ('biology', 'discriminator', 'he') if n in saved['components'])
-        saved['version'] = 9
+        if version < 10 and 'he' in saved['components']:
+            saved['components']['he']['objective'] = 'raw_mse'
+        saved['version'] = 10
         if saved != architecture_contract(config):
             raise ValueError('Checkpoint configuration disagrees with architecture metadata.')
     if checkpoint.get('objective_contract') is not None:
         from dann.batch_alignment import alignment_contract
         if checkpoint['objective_contract'] != alignment_contract(config):
             raise ValueError('Checkpoint configuration disagrees with alignment objective metadata.')
+    contract = cca_contract(config)
+    if contract is not None:
+        if checkpoint.get('cca_contract') != contract:
+            raise ValueError('Missing or incompatible CCA objective/preprocessing contract.')
+        if 'model_state' in checkpoint:
+            import hashlib
+            import numpy as np
+            import torch
+            state = checkpoint['model_state']
+            keys = ('feature_mean', 'feature_scale', 'fit_count', 'fit_rows_sha256')
+            if any('he_cca.' + k not in state for k in keys):
+                raise ValueError('Missing fitted CCA preprocessing buffers.')
+            mean, scale, count, digest = [state['he_cca.' + k] for k in keys]
+            rows = np.sort(np.asarray(checkpoint['split_indices']['train'], dtype='<i8'))
+            expected = hashlib.sha256(rows.tobytes()).digest()
+            if (int(count) != len(rows) or len(rows) < 2 or bytes(digest.cpu().tolist()) != expected
+                    or not torch.isfinite(mean).all() or not torch.isfinite(scale).all()
+                    or not (scale > 0).all()):
+                raise ValueError('CCA preprocessing fitting provenance or statistics are incompatible.')
+    elif checkpoint.get('cca_contract') is not None:
+        raise ValueError('Unexpected CCA contract for a non-CCA checkpoint.')
     return config
 
 
@@ -135,6 +167,8 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
                 message += f' {name.capitalize()} CNN residual setting differs; use residual: {flag} to resume.'
         raise ValueError(message)
     if model is not None:
+        if (getattr(model, 'he_cca', None) is not None) != (cca_contract(config) is not None):
+            raise ValueError('Model CCA objective is incompatible with checkpoint.')
         from dann.model_components.layers import NormalizedResidual
         spectral = requested['components']['spectral_encoder']['deep_sets']
         if any(getattr(model.encoder, key) != spectral[key] for key in
@@ -149,6 +183,12 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
                     raise ValueError(f'Model has disabled head {name}.')
                 continue
             group = requested['components'][name]
+            if name == 'he' and group.get('objective') == 'deep_cca':
+                if getattr(model, 'he_cca', None) is None or model.he_predictor is not None:
+                    raise ValueError('Missing CCA projectors or unexpected raw H&E predictor.')
+                if any(model.he_cca.settings[k] != group['deep_cca'][k] for k in model.he_cca.settings):
+                    raise ValueError('Incompatible CCA projector settings.')
+                continue
             if group['type'] == 'gatv2':
                 from dann.model_components.layers_gatv2 import GATv2Network
                 if (not isinstance(module, GATv2Network) or module.settings != group['gatv2']
@@ -169,6 +209,8 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
                             if group['mlp']['residual'] else 0)
                 if sum(isinstance(m, NormalizedResidual) for m in module.modules()) != expected:
                     raise ValueError(f'Model {name} MLP residual settings are incompatible.')
+    if optimizer and cca_contract(checkpoint['config']) != cca_contract(config):
+        raise ValueError('Changed CCA objective requires fresh training.')
     if optimizer:
         from dann.batch_alignment import alignment_contract
         if alignment_contract(checkpoint['config']) != alignment_contract(config):

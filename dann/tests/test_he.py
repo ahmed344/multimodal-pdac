@@ -28,7 +28,7 @@ from dann.train import load_training_checkpoint, resume_training_config
 def he_config(spatial_config):
     c = spatial_config
     he = copy.deepcopy(c['model']['heads']['biology'])
-    he.update(enabled=True, output_dim=7)
+    he.update(enabled=True, objective='raw_mse', output_dim=7)
     c['model']['heads']['he'] = he
     with h5py.File(c['data']['path'], 'r+') as f:
         n = len(f['X/indptr']) - 1
@@ -138,7 +138,7 @@ def test_checkpoint_roundtrip_disabled_legacy_and_incompatibilities(he_config, t
     c = he_config
     path = checkpoint(c, tmp_path)
     payload = torch.load(path, weights_only=False)
-    assert payload['architecture']['version'] == 9
+    assert payload['architecture']['version'] == 10
     model = AdversarialLatentFusion.from_config(c, 2, 4)
     optimizer = torch.optim.AdamW(model.parameters())
     load_training_checkpoint(path, model, optimizer, torch.device('cpu'), c)

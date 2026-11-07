@@ -98,6 +98,9 @@ def _validate_exports(config: Mapping[str, Any], checkpoint: Mapping[str, Any],
             if not path.is_file():
                 raise FileNotFoundError(f"Required inference artifact is missing: {path}")
         provenance = json.loads(provenance_path.read_text())
+        if ('checkpoint_epoch' in provenance
+                and provenance['checkpoint_epoch'] != int(checkpoint['epoch']) + 1):
+            raise ValueError('Inference provenance checkpoint epoch mismatch')
         identities = [('checkpoint_identity', checkpoint_path), ('source_identity', input_path)]
         if predictions:
             identities.append(('prediction_identity', prediction_path))

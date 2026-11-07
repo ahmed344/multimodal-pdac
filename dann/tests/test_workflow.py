@@ -23,6 +23,7 @@ from dann.targets import target_contract
 @pytest.fixture
 def run(tmp_path):
     config = load_config(Path('dann/config.yaml'))
+    config['model']['heads']['he']['enabled'] = False  # Biology-only synthetic checkpoint.
     config['data'].pop('preprocessing_fingerprint', None)  # Synthetic checkpoint/input contract.
     config['results'].update(root=str(tmp_path / 'requested'), run_name='fit')
     config['model']['aggregation']['type'] = 'mlp'
@@ -373,10 +374,10 @@ def test_training_only_and_resume_early_stopping(tmp_path, monkeypatch):
     monkeypatch.setattr(train, 'create_data_bundle', bundle)
     monkeypatch.setattr(train, 'refresh_loss_curves', Mock())
     monkeypatch.setattr(train, '_format_epoch_summary', lambda *args: 'synthetic epoch')
-    epochs = Mock(side_effect=[{'cd8_loss': 1., 'supervised_objective': 1.},
-                               {'cd8_loss': 1., 'supervised_objective': 1.},
-                               {'cd8_loss': 2., 'supervised_objective': 2.},
-                               {'cd8_loss': 2., 'supervised_objective': 2.}])
+    epochs = Mock(side_effect=[{'cd8_loss': 1., 'supervised_objective': 1., 'total_loss': 1.},
+                               {'cd8_loss': 1., 'supervised_objective': 1., 'total_loss': 1.},
+                               {'cd8_loss': 2., 'supervised_objective': 2., 'total_loss': 2.},
+                               {'cd8_loss': 2., 'supervised_objective': 2., 'total_loss': 2.}])
     monkeypatch.setattr(train, 'run_epoch', epochs)
     downstream = Mock(return_value={})
     monkeypatch.setattr(workflow, 'run_post_training_workflow', downstream)
@@ -418,6 +419,14 @@ def test_generated_inference_provenance_supports_reuse(tmp_path, monkeypatch):
     effective['spatial'] = dict(output=str(output), latents=str(latent))
     workflow._validate_exports(effective, saved, best, Path(config['data']['context_path']),
                                predictions=True, latents=True)
+    provenance_path = output.with_suffix('.provenance.json')
+    provenance = json.loads(provenance_path.read_text())
+    assert provenance['checkpoint_epoch'] == saved['epoch'] + 1
+    provenance['checkpoint_epoch'] += 1
+    provenance_path.write_text(json.dumps(provenance))
+    with pytest.raises(ValueError, match='checkpoint epoch mismatch'):
+        workflow._validate_exports(effective, saved, best, Path(config['data']['context_path']),
+                                   predictions=True, latents=True)
     with pytest.raises(FileExistsError):
         workflow.run_inference(Path(config['data']['context_path']), best, output,
                                latent_output_path=latent, overwrite=False)

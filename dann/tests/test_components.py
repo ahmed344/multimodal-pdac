@@ -43,6 +43,7 @@ def spatial_config(tmp_path):
     config['loss'].pop('batch_alignment', None)
     config['data'].pop('preprocessing_fingerprint', None)  # This fixture supplies unprocessed synthetic inputs.
     # Keep historical tests independent of editable stabilization defaults.
+    config['training']['early_stopping_metric'] = 'supervised_objective'
     config['training']['warmup']['epochs'] = 0
     config['training']['head_initialization']['enabled'] = False
     config['model']['spectral_encoder']['deep_sets'].update(peak_mlp_residual=False, pool_centering='none')

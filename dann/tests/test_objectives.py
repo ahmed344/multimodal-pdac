@@ -148,14 +148,15 @@ def test_weighted_epoch_decomposition_and_unchanged_gradients(reduction, he, bel
 
 def test_selection_config_defaults_and_validation():
     config = load_config(Path('dann/config.yaml'))
-    assert selection_metric(config) == 'supervised_objective'
+    assert selection_metric(config) == 'total_loss'
+    assert resolve_execution(config)['training']['early_stopping_metric'] == 'total_loss'
     config['model']['heads']['discriminator']['enabled'] = True
-    for metric in ('supervised_objective', 'cd8_loss', 'batch_aware_objective'):
+    for metric in ('supervised_objective', 'cd8_loss', 'batch_aware_objective', 'total_loss'):
         config['training']['early_stopping_metric'] = metric
         assert resolve_execution(config)['training']['early_stopping_metric'] == metric
     del config['training']['early_stopping_metric']
     assert resolve_execution(config)['training']['early_stopping_metric'] == 'cd8_loss'
-    config['training']['early_stopping_metric'] = 'total_loss'
+    config['training']['early_stopping_metric'] = 'unknown_loss'
     with pytest.raises(ValueError, match='early_stopping_metric'):
         resolve_execution(config)
 
@@ -221,7 +222,7 @@ def test_batch_aware_score_is_independent_of_instantaneous_grl():
 
 
 @pytest.mark.parametrize('metric, expected_epoch', [('supervised_objective', 2), ('cd8_loss', 3),
-                                                  ('batch_aware_objective', 2)])
+                                                  ('batch_aware_objective', 2), ('total_loss', 3)])
 def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, metric, expected_epoch):
     config = spatial_config
     config['training'].update(epochs=3, early_stopping_patience=1, early_stopping_metric=metric,
@@ -230,7 +231,7 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     monkeypatch.setattr(train, '_format_epoch_summary', lambda *args: 'synthetic epoch')
     # Supervised prefers epoch 2; CD8 and total prefer epoch 3; discriminator prefers epoch 1.
     rows = [dict(cd8_loss=c, supervised_objective=s, batch_weighted_loss=b, total_loss=s+b)
-            for c, s, b in [(3., 5., 0.), (2., 3., 2.), (1., 4., .5)]]
+            for c, s, b in [(3., 5., 0.), (2., 3., 1.8), (1., 4., .5)]]
     if metric == 'batch_aware_objective':
         # Confusion improves enough to outweigh the small supervised regression at epoch 2.
         # Above chance, epoch 3 earns no further reward and uses up patience.
@@ -249,7 +250,7 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     assert latest['selection_metric'] == metric
     assert latest['best_selection_score'] == rows[expected_epoch-1][metric]
     assert 'best_validation_cd8' not in latest and 'best_validation_biology' not in latest
-    assert latest['early_stopping_state']['stale_epochs'] == (0 if metric == 'cd8_loss' else 1)
+    assert latest['early_stopping_state']['stale_epochs'] == (0 if metric in ('cd8_loss', 'total_loss') else 1)
     assert latest['selection_start_epoch'] == 1
 
     requested = copy.deepcopy(config)
@@ -259,7 +260,7 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     history_text = history_path.read_text()
     history_path.unlink()
     requested['training']['early_stopping_min_delta'] = .01
-    if metric != 'cd8_loss':
+    if metric not in ('cd8_loss', 'total_loss'):
         train.train_model(requested)
         assert epoch.call_count == 6
     history_path.write_text(history_text)
@@ -268,7 +269,7 @@ def test_training_selection_roundtrip_and_resume(spatial_config, monkeypatch, me
     with pytest.raises(ValueError, match='at least one additional epoch'):
         train.train_model(requested)
     requested['training']['epochs'] = 4
-    fresh_row = dict(cd8_loss=100., supervised_objective=100., batch_aware_objective=100.)
+    fresh_row = dict(total_loss=100., cd8_loss=100., supervised_objective=100., batch_aware_objective=100.)
     epoch.side_effect = [fresh_row, fresh_row]
     train.train_model(requested)
     switched_payload = torch.load(best, weights_only=False)
@@ -350,10 +351,10 @@ def test_batch_aware_resume_retains_saved_weights_and_class_count(spatial_config
 
 
 @pytest.mark.parametrize('he', [False, True])
-@pytest.mark.parametrize('metric', ['supervised_objective', 'batch_aware_objective'])
+@pytest.mark.parametrize('metric', ['supervised_objective', 'batch_aware_objective', 'total_loss'])
 def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, he, metric):
     config = load_config(Path('dann/config.yaml'))
-    config['model']['heads']['he']['enabled'] = he
+    config['model']['heads']['he'].update(enabled=he, objective='raw_mse')
     config['data']['target_columns'] = TARGETS[::-1]
     config['loss']['target_weights'] = WEIGHTS[::-1]
     rows = []
@@ -386,7 +387,7 @@ def test_four_column_curve_order_gaps_and_selected_epoch(tmp_path, monkeypatch, 
     title = lambda axis: axis.get_title().replace('\n', ' ')
     axes = {title(axis): axis for axis in overall.axes}
     assert all(a.get_visible() for a in overall.axes)
-    assert 'Total objective' in axes
+    assert ('Total objective — early stopping' if metric == 'total_loss' else 'Total objective') in axes
     assert 'Discriminator accuracy' not in axes  # Production defaults disable it.
     assert not any('GRL' in t or 'Batch-aware' in t for t in axes)
     assert ('H&E objective' in axes) == he

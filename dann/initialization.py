@@ -56,6 +56,11 @@ def initialize_supervised_heads(model: nn.Module, bundle: Any,
     """Initialize fresh heads; H&E means stream only selected training source rows."""
     settings = head_initialization_settings(config['training'])
     report = dict(settings, fit_split='train')
+    if getattr(model, 'he_cca', None) is not None:
+        reader = getattr(bundle, 'he_reader', None) or HETargetReader(
+            Path(config['data']['path']), config['data'].get('he_features_key', 'hes_features'),
+            bundle.metadata.num_observations, model.he_output_dim)
+        report['cca_preprocessing'] = model.he_cca.fit(reader, bundle.split_indices['train'], chunk_rows)
     if not settings['enabled']:
         return report
     rows = bundle.split_indices['train']

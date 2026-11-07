@@ -144,13 +144,14 @@ def test_archive_interval_validation(value):
 def test_study_configs_do_not_change_optimizer_architecture_or_sampling(tmp_path):
     c = load_config(Path('dann/config.yaml'))
     assert c['training']['archive_checkpoint_every'] is None
+    original_alignment = copy.deepcopy(c['loss']['batch_alignment'])
     study = make_config(c,tmp_path,'nhsic10',(10.,0.,0.))
     assert study['model'] == c['model'] and study['data'] == c['data']
     assert study['training']['pixel'] == c['training']['pixel']
     assert study['training']['head_initialization'] == c['training']['head_initialization']
     assert study['training']['archive_checkpoint_every'] == 5
     assert all(study['loss']['batch_alignment'][n]['enabled'] for n in ('nhsic','anova','soft_nn'))
-    assert c['loss']['batch_alignment']['nhsic']['weight'] == .1
+    assert c['loss']['batch_alignment'] == original_alignment
 
 
 @pytest.mark.parametrize('asynchronous', [False,True])

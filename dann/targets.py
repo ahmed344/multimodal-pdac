@@ -73,8 +73,10 @@ def checkpoint_analysis_config(config: Mapping[str, Any], checkpoint: Mapping[st
             resolved["training"][key] = saved["training"][key]
     if "results" in resolved:
         from dann.config import resolve_execution
+        analysis_checkpoint = resolved["results"].get("analysis_checkpoint", "best")
         if "results" in saved:
             resolved["results"] = copy.deepcopy(saved["results"])
+        resolved["results"]["analysis_checkpoint"] = analysis_checkpoint
         for key in ("pixel", "spatial"):
             if key in saved.get("training", {}):
                 resolved["training"][key] = copy.deepcopy(saved["training"][key])

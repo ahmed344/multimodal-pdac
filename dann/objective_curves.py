@@ -38,7 +38,7 @@ def weighted_history(history: pd.DataFrame, config: Mapping[str, Any] | None) ->
         supervised = f"{split}_supervised_objective"
         ihc, he = f"{split}_biology_weighted_loss", f"{split}_he_weighted_loss"
         if supervised not in history and ihc in history:
-            if not he_enabled:
+            if not he_enabled or config.get('model', {}).get('heads', {}).get('he', {}).get('objective') == 'deep_cca':
                 history[supervised] = history[ihc]
             elif he in history:
                 history[supervised] = history[ihc] + history[he]
@@ -243,7 +243,7 @@ def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi:
 def objective_layout(history, config=None, metric=None):
     """Build the actual rows shared by plotting and render-memory reservations."""
     he = (config.get('model', {}).get('heads', {}).get('he', {}).get('enabled', False) if config is not None
-          else any('he_weighted_loss' in c or 'he_mse' in c or 'he_r2' in c for c in history))
+          else any('he_weighted_loss' in c or 'he_mse' in c or 'he_r2' in c or 'cca_loss' in c for c in history))
     from dann.batch_alignment import NAMES, alignment_settings
     settings = alignment_settings(config or {})
     alignment = [n for n in NAMES if (settings[n]['enabled'] and any(f'alignment_{n}' in c for c in history) if config is not None else f'train_alignment_{n}' in history)]
@@ -252,18 +252,19 @@ def objective_layout(history, config=None, metric=None):
     active_alignment = [n for n in alignment if (settings[n]['weight'] > 0 if config is not None
                         else f'train_gradient_overall_{n}_norm_mean' in history)]
     overall = ['ihc', *(['he'] if he else []), *(['batch'] if disc else []), *active_alignment]
+    cca = any('cca_loss' in c for c in history)
     gradients = _gradient_panels('gradient_overall', overall, 'Objectives')
     gradients[2]['cmap'] = 'coolwarm'
     rows = [
         [_fit('hurdle_acc', 'IHC balanced hurdle accuracy (macro average)', COLORS['hurdle']),
          _fit('mean_r2', 'IHC positive-logit R² (macro average)', COLORS['positive']),
-         _fit('he_r2', 'H&E R² (variance-weighted features)', COLORS['he']) if he else None,
+         _fit('cca_correlation' if cca else 'he_r2', 'CCA mean correlation' if cca else 'H&E R² (variance-weighted features)', COLORS['he']) if he else None,
          _fit('batch_accuracy', 'Discriminator accuracy', COLORS['batch'])],
         [_fit('hurdle_weighted_loss', 'IHC hurdle objective', COLORS['hurdle']),
          _fit('positive_weighted_loss', 'IHC positive objective (location and scale)', COLORS['positive']),
-         _fit('he_weighted_loss', 'H&E objective', COLORS['he']) if he else None,
+         _fit('cca_weighted_loss' if cca else 'he_weighted_loss', 'CCA objective' if cca else 'H&E objective', COLORS['he']) if he else None,
          _fit('batch_weighted_loss', 'Batch discriminator objective', COLORS['batch'])],
-        [_fit('total_loss', 'Total objective'),
+        [_fit('total_loss', 'Total objective' + (' — early stopping' if metric == 'total_loss' else '')),
          _fit('supervised_objective', 'Supervised objective' + (' — early stopping' if metric == 'supervised_objective' else '')),
          _lines('Actual GRL strength', [('train_gradient_grl_strength_mean', 'All updates', COLORS['batch'], '-'),
                                       ('train_gradient_sampled_grl_strength_mean', 'Sampled updates', 'C4', '--')], legend=True),
@@ -276,6 +277,9 @@ def objective_layout(history, config=None, metric=None):
          _lines('Clipping activity (all updates)', [('train_gradient_clip_multiplier_mean', 'Mean multiplier', '#333333', '-'),
                                                   ('train_gradient_clipped_mean', 'Fraction clipped', 'C3', '-')], legend=True)],
     ]
+    if cca:
+        rows.append([_fit('cca_' + key, 'CCA ' + key.replace('_', ' '), COLORS['he']) for key in
+                     ('variance_penalty', 'coverage', 'msi_rank', 'he_rank')])
     ihc_rows = []
     for key, title in [('hurdle_acc', 'balanced hurdle accuracy'), ('hurdle_weighted_loss', 'hurdle objective'),
                        ('mean_r2', 'positive-logit R²'), ('positive_weighted_loss', 'positive objective (location and scale)')]:

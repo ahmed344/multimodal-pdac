@@ -227,6 +227,15 @@ def test_end_to_end_cache_reuse_and_failure_preserves_outputs(spatial_config, tm
         analyze.run_analysis(config, path, output_override=out)
     assert (out / 'latent.csv').read_bytes() == before
     assert not list(out.glob('.analysis-work-*'))
+    # Selecting a later checkpoint in the same output tree must miss numerical
+    # caches, even when its split, preprocessing, and model shape are identical.
+    latest = path.with_name('latest.pt')
+    later = torch.load(path, weights_only=False)
+    later['epoch'] += 1
+    torch.save(later, latest)
+    with pytest.raises(AssertionError, match='valid cache hit'):
+        analyze.run_analysis(config, latest, output_override=out)
+    assert (out / 'latent.csv').read_bytes() == before
     # Matrix edits with unchanged observation/feature identities still invalidate
     # extraction, since the source file identity is part of every cache key.
     with h5py.File(config['data']['path'], 'r+') as handle:

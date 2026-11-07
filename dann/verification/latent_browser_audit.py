@@ -27,11 +27,12 @@ def audit(root, include_comparisons=True):
             if path.name in ('sample_umap.html','latent_ihc_scatter.html'):
                 page.wait_for_function('window.latentViewer && latentViewer.ready',timeout=120000)
                 assert page.evaluate('latentViewer.metadata.features.length')==len(source.filter(regex='^latent_').columns)
-                for feature in ('latent_0','latent_127','latent_255'):
+                features = list(source.filter(regex='^latent_').columns)
+                for feature in (features[0], features[len(features)//2], features[-1]):
                     if feature not in source:continue
                     values=page.evaluate('(name)=>latentViewer.loadColumn(name).then(v=>[v[0],v[Math.floor(v.length/2)],v[v.length-1]])',feature)
                     np.testing.assert_array_equal(values,source[feature].iloc[[0,len(source)//2,len(source)-1]].to_numpy())
-                page.locator('#color').select_option('latent_255' if 'latent_255' in source else 'latent_0')
+                page.locator('#color').select_option(features[-1])
                 page.wait_for_function('latentViewer.ready',timeout=120000)
                 page.locator('#slide').select_option(index=1)
                 page.wait_for_function('latentViewer.ready',timeout=120000)

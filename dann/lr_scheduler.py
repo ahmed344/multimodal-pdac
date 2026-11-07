@@ -11,6 +11,26 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from dann.config import lr_scheduler_settings
 
 
+class TotalLossPlateau(ReduceLROnPlateau):
+    """Record the monitored objective and migrate historical supervised scores."""
+
+    def state_dict(self) -> dict[str, Any]:
+        """Save the metric alongside the plateau comparison and LR state."""
+        return {**super().state_dict(), "metric": "total_loss"}
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Retain LR progress, resetting comparisons when the objective changes."""
+        state = dict(state_dict)
+        metric = state.pop("metric", "supervised_objective")
+        if metric not in ("supervised_objective", "total_loss"):
+            raise ValueError(f"Cannot resume: unknown LR scheduler metric {metric!r}.")
+        if metric != "total_loss":
+            state.update(best=math.inf, num_bad_epochs=0, cooldown_counter=0)
+        super().load_state_dict(state)
+        if metric != "total_loss":
+            print("LR scheduler changed to total_loss; best score, patience, and cooldown reset.", flush=True)
+
+
 def create_lr_scheduler(
     optimizer: torch.optim.Optimizer, config: Mapping[str, Any],
 ) -> ReduceLROnPlateau | None:
@@ -19,7 +39,7 @@ def create_lr_scheduler(
     settings = lr_scheduler_settings(training)
     if not settings["enabled"]:
         return None
-    return ReduceLROnPlateau(
+    return TotalLossPlateau(
         optimizer, mode="min", threshold_mode="abs",
         min_lr=float(training["learning_rate"]) * settings["min_lr_factor"],
         **{key: settings[key] for key in ("factor", "patience", "cooldown", "threshold", "eps")},
@@ -29,12 +49,12 @@ def create_lr_scheduler(
 def step_lr_scheduler(
     scheduler: ReduceLROnPlateau | None, validation_metrics: Mapping[str, float],
 ) -> None:
-    """Step once per completed validation epoch, independently of selection."""
+    """Minimize validation total loss once per epoch, independently of selection."""
     if scheduler is None:
         return
-    value = validation_metrics["supervised_objective"]
+    value = validation_metrics["total_loss"]
     if not math.isfinite(value):
-        raise ValueError("LR scheduling requires a finite validation supervised_objective.")
+        raise ValueError("LR scheduling requires a finite validation total_loss.")
     scheduler.step(value)
 
 
@@ -51,6 +71,8 @@ def validate_lr_scheduler_checkpoint(checkpoint: Mapping[str, Any]) -> None:
                 "mode", "threshold_mode", "factor", "patience", "cooldown", "threshold", "eps"}
     if not isinstance(state, Mapping) or not required <= state.keys():
         raise ValueError("Cannot resume: lr_scheduler_state is incomplete.")
+    if state.get("metric", "supervised_objective") not in ("supervised_objective", "total_loss"):
+        raise ValueError(f"Cannot resume: unknown LR scheduler metric {state['metric']!r}.")
 
 
 class UpdateWarmup:

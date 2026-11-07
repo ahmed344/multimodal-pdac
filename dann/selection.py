@@ -9,8 +9,9 @@ from typing import Any, Mapping
 def selection_metric(config: Mapping[str, Any]) -> str:
     """Resolve the configured metric, retaining CD8 selection for old YAML files."""
     metric = config.get("training", {}).get("early_stopping_metric", "cd8_loss")
-    if metric not in ("cd8_loss", "supervised_objective", "batch_aware_objective"):
-        raise ValueError("training.early_stopping_metric must be batch_aware_objective, supervised_objective, or cd8_loss.")
+    if metric not in ("cd8_loss", "supervised_objective", "batch_aware_objective", "total_loss"):
+        raise ValueError("training.early_stopping_metric must be batch_aware_objective, "
+                         "supervised_objective, cd8_loss, or total_loss.")
     return metric
 
 

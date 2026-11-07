@@ -387,3 +387,11 @@ def test_streamed_inference_applies_sampling_overrides(tmp_path, monkeypatch, no
         np.testing.assert_array_equal(table[f"density_mean_{target}"], expected[:, index])
     assert table["obs_name"].to_pylist() == ["a", "a", "b"]
     assert "density_mc_samples" not in config["analysis"]
+    support_path = output.with_suffix('.support.parquet')
+    spatial.validate_support_output(support_path, 3)
+    support = pq.read_table(support_path)
+    np.testing.assert_array_equal(support['biology_support'], np.ones(3))
+    np.testing.assert_array_equal(support['latent_support'], np.ones(3))
+    provenance = json.loads(output.with_suffix('.provenance.json').read_text())
+    assert provenance['support_semantics'] == 'observed_center_pixel_only_radius_zero_occupancy'
+    assert provenance['support_identity'] == spatial._file_identity(support_path)

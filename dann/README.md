@@ -11,6 +11,11 @@ deviation `sigma`. The current configuration aligns normalized aggregation laten
 with direct HSIC supervision. An optional discriminator retains the legacy gradient
 reversal path. Neither alignment method guarantees biological preservation.
 
+The main [`config.yaml`](config.yaml) also enables the provisional
+[Deep CCA H&E objective](#deep-cca-he-auxiliary-objective): dimension 16, MSI/H&E
+hidden widths 128/256, and weight 0.015. This is an explicit user choice despite
+the pilot missing its original 1% stromal probe-improvement threshold.
+
 The study configuration uses the linear MSI exports from
 [`msi_preprocess`](../msi_preprocess/README.md), retaining `matrix_key: X` and
 `intensity_transform: log1p`. Preprocessing fits use the uncapped DANN training
@@ -110,9 +115,12 @@ or independent validation of the selected models.
 
 ## Raw H&E auxiliary prediction
 
-`model.heads.he.enabled: true` adds a standard head from the shared MSI latent to
-1,536 stored UNI2-h features. Its `type` and independent `mlp`, `cnn`, and `gatv2`
-blocks follow the biology head interfaces; the initial settings copy biology.
+With `model.heads.he.enabled: true`, selecting `model.heads.he.objective: raw_mse`
+adds a standard head from the shared MSI latent to 1,536 stored UNI2-h features.
+This section describes that historical objective; the main YAML now selects
+[Deep CCA](#deep-cca-he-auxiliary-objective). The `type` and independent `mlp`,
+`cnn`, and `gatv2` blocks configure raw MSE and follow the biology head interfaces;
+CCA instead uses the widths in `model.heads.he.deep_cca` and requires `type: mlp`.
 `output_dim: 1536` must match `obsm[data.he_features_key]` (default
 `hes_features`) in **data.path**, at exactly the MSI observation positions.
 Targets are read lazily with handles local to each read, or from one shared,
@@ -130,13 +138,15 @@ total = biology_weight * IHC_loss + batch_weight * batch_cross_entropy
         + he_weight * mean((he_prediction - raw_he_targets)**2)
 ```
 
-The mean covers selected core pixels and feature dimensions. `loss.he_weight:
-1.0` is the initial baseline, not a tuned optimum. Training and validation history
+The mean covers selected core pixels and feature dimensions. The historical raw-MSE
+baseline started at `loss.he_weight: 1.0`; the current 0.015 is a CCA coefficient,
+not a tuned raw-MSE weight. Training and validation history
 record `he_mse`, `he_weighted_loss`, `he_r2`, and the updated `total_loss`; squared-error
 sums and element counts produce batch-size-independent H&E metrics. Loss plots
 show `he_weighted_loss` as **H&E objective**, without a separate MSE panel.
-The checked-in early-stopping criterion is the validation supervised objective
-(weighted IHC plus H&E). The study split remains 90:10.
+The checked-in early-stopping criterion is validation total loss (weighted IHC,
+H&E, discriminator, and direct alignment terms, when enabled). The study split
+remains 90:10.
 
 Analysis always writes `analysis/he/{split}_metrics.json` for an enabled head.
 `analysis.export_he_predictions: true` additionally streams vectors into
@@ -171,16 +181,17 @@ There are three groups and five selectors, all in `dann/config.yaml`:
 | Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
 | Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
 | Optional discriminator | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `mlp` (disabled) |
-| Optional H&E head | `model.heads.he.type` | `mlp`, `cnn`, `gatv2` | `mlp` (enabled) |
+| Optional H&E head | `model.heads.he.type` | `mlp` for CCA; `mlp`, `cnn`, `gatv2` for raw MSE | `mlp` (CCA enabled) |
 
 All aggregation/head combinations are supported. Selectable neural modules
 live in `dann/model_components/`; `dann/model.py` composes them. The Deep Sets stage uses
 256-dimensional learned peak embeddings, multiplies each by its transformed
-intensity, applies the per-peak MLP with `[512, 512]` hidden widths and
-512 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
-The selectable aggregation produces the **exported 512-dimensional latent**.
-The MLP aggregation uses `[512, 512]` hidden widths; all MLP heads use
-`[256, 128, 64]`. The shared ZILN transformation, weighted four-target objective,
+intensity, applies the per-peak MLP with `[256, 256]` hidden widths and
+256 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
+The selectable aggregation produces the **exported 256-dimensional latent**.
+The MLP aggregation uses `[256, 256]` hidden widths; biology, discriminator, and
+raw-MSE MLP heads use `[256, 128, 64]`. CCA uses separate projectors described below.
+The shared ZILN transformation, weighted four-target objective,
 and optional class-weighted batch cross-entropy retain their definitions.
 Only an enabled discriminator input receives gradient reversal.
 
@@ -460,20 +471,24 @@ counts, then assign the remainder to test. Loading or resuming historical
 checkpoints preserves their saved split membership even if configured fractions
 have changed. H&E-mediated transfer is assessed separately.
 
-Checkpoint selection, early stopping, and LR scheduling use **validation supervised
-objective** in the checked-in YAML. The enabled HSIC objective contributes to
-training with weight 0.1. Legacy discriminator-enabled runs retain these definitions:
+Checkpoint selection, early stopping, and LR scheduling use **validation total
+loss** in the checked-in YAML. This includes the enabled direct alignment objectives
+with their configured weights. The objective definitions are:
 
 ```text
 IHC_weighted = biology_weight * IHC_loss
-HE_weighted = he_weight * he_mse                 # omitted when disabled
+HE_weighted = effective_he_weight * he_objective # CCA loss or raw MSE; omitted when disabled
 Batch_weighted = batch_weight * batch_cross_entropy
-Supervised = IHC_weighted + HE_weighted          # LR scheduling score
-Total = Supervised + Batch_weighted + Alignment_weighted  # enabled terms only
+Supervised = IHC_weighted                       # CCA mode; raw-MSE mode also adds HE_weighted
+Total = IHC_weighted + HE_weighted + Batch_weighted + Alignment_weighted  # enabled terms only
 Batch_chance = ln(K)                            # discriminator output class count
 Batch_selection_penalty = grl_max_lambda * batch_weight * max(0, Batch_chance - batch_cross_entropy)
 Batch_aware = Supervised + Batch_selection_penalty  # optional legacy selection
 ```
+
+For CCA, training uses effective H&E weights `0, 0.0075, 0.015, …` across epochs;
+validation uses 0.015 from the first epoch. Raw MSE uses the configured weight
+throughout. Validation `Total` is the LR scheduling score.
 
 The legacy batch-aware score uses finalized epoch losses and the discriminator's full output width
 for `K`, including classes absent from a particular minibatch or validation split.
@@ -484,11 +499,12 @@ approaches chance cross-entropy and remains zero above chance. Both `batch_weigh
 and `grl_max_lambda` must be finite and nonnegative. Selection starts at the first
 completed validation epoch, with no additional warmup.
 
-`cd8_loss` remains available for comparison; `batch_aware_objective` requires an enabled discriminator. An absent
+`total_loss`, `supervised_objective`, and `cd8_loss` are available for selection;
+`batch_aware_objective` requires an enabled discriminator. An absent
 setting retains legacy `cd8_loss` selection: mean validation CD8 ZILN loss over
 valid CD8 rows. `early_stopping_min_delta` measures units of the selected score.
 The selection policy does not change the optimized loss, gradients, GRL schedule,
-or LR scheduling on `supervised_objective`.
+or LR scheduling on `total_loss`.
 
 New runs enable validation-driven LR reduction through the shared block:
 
@@ -505,7 +521,7 @@ training:
   early_stopping_patience: 20
 ```
 
-`ReduceLROnPlateau` minimizes validation `supervised_objective`, regardless of the
+`ReduceLROnPlateau` minimizes validation `total_loss`, regardless of the
 early-stopping metric. Improvement must exceed the absolute `threshold`; after
 six non-improving epochs (`patience: 5`) the LR halves, followed by two cooldown
 epochs. The scheduler steps once after completed validation, before checkpoint
@@ -550,14 +566,19 @@ and discriminator state. `--smoke-test` cannot be combined with a resume checkpo
 `history.csv` rows are kept and both `loss_curves.png` and `ihc_curves.png` are refreshed from that full history.
 
 Scheduled checkpoints save `lr_scheduler_state` with the optimizer, including the
-best supervised score, counters, cooldown, and original LR floor. Resume restores
-both states without stepping the scheduler or deriving a new floor from the
+`metric: total_loss` marker, best total score, counters, cooldown, and original LR
+floor. Resume restores both states without stepping the scheduler or deriving a new floor from the
 reduced optimizer LR. Saved scheduler settings take precedence over conflicting
 YAML settings, which are reported and ignored. Legacy checkpoints without a
 scheduler block remain fixed-LR even when current YAML enables scheduling.
 Production resume rejects checkpoints that enable scheduling but lack its state.
+Historical scheduler states without a metric marker (or explicitly marked
+`supervised_objective`) switch to total loss on resume: the best score, bad-epoch
+count, and cooldown reset, while the optimizer LR, original floor, scheduler
+settings, and completed-epoch count are retained. The first post-warmup validation
+sets the new total-loss baseline. Unknown scheduler metrics are rejected.
 Changing the early-stopping metric resets only selection state; scheduler state
-continues because its monitored score remains `supervised_objective`.
+continues because its monitored score remains `total_loss`.
 
 `performance.async_artifacts: true` moves checkpoint serialization, history and
 sampling-audit writes, and curve rendering into two persistent CPU workers. One
@@ -2746,7 +2767,7 @@ training modes. Direct pooling, spectral checkpointing, and pass-local inference
 caches share this operation; cached features are already centered. There are no
 batch statistics or fitted preprocessing state. Omission means `none`.
 
-Fresh training can initialize the biology and H&E heads from selected training
+Fresh training can initialize the biology and raw-MSE H&E heads from selected training
 rows using `training.head_initialization`:
 
 ```yaml
@@ -2770,6 +2791,8 @@ are scaled, preserving nonzero upstream gradients; discriminator parameters reta
 their original initialization. Counts, means, scales, and explicit fallbacks are
 saved in `head_initialization.json` and production checkpoint metadata. Omission
 disables initialization, and resume never recomputes these statistics.
+CCA projectors use their separate initialization stream and frozen training-feature
+standardization described in [Deep CCA](#deep-cca-he-auxiliary-objective).
 
 Warmup uses actual logical optimizer updates per epoch, including the final partial
 batch. For N > 1 warmup updates, the first uses `start_factor * configured_lr` and
@@ -2784,7 +2807,7 @@ and completed updates. Enabled-warmup resumes reject missing or inconsistent sta
 Existing epoch-only resume restrictions still apply to partial-epoch checkpoints.
 
 Stabilization settings were introduced in architecture contract version 7;
-new checkpoints use version 8 with explicit spectral pooling and normalization.
+Version 8 added explicit spectral pooling and normalization; current checkpoints use version 10.
 Versions 2–7 reconstruct their historical MLP and pooling behavior. Changing
 pooling, normalization, centering, or residual semantics is
 incompatible with loading those weights as a new architecture; start a fresh fit.
@@ -2847,10 +2870,10 @@ slides with the existing seeded 90%/10% within-slide split. See
 
 `loss.batch_alignment` independently enables `nhsic`, `anova`, and `soft_nn`, each
 with its own nonnegative `weight`. An enabled zero-weight objective is a diagnostic;
-disabled objectives are neither evaluated nor plotted. The current experiment uses
-nHSIC at 0.1 and `model.heads.discriminator.enabled: false` (legacy default: true).
+disabled objectives are neither evaluated nor plotted. The current configuration uses
+nHSIC and `model.heads.discriminator.enabled: false` (legacy default: true).
 Disabling the discriminator removes its parameters, logits, GRL, and spatial halo.
-Both checkpoint selection and LR scheduling use validation `supervised_objective`.
+Both checkpoint selection and LR scheduling use validation `total_loss`.
 
 Alignment compares L2-normalized aggregation latents across all pixels without
 tissue conditioning, giving each represented slide equal total weight. Training
@@ -3023,3 +3046,182 @@ checksummed source snapshot, patch, and parent provenance under `recoveries/`;
 it preserves the original snapshot and completed receipts. The repair mechanism
 rejects changes to scientific functions. Subsequent commands use the latest
 verified recovery snapshot, and new stage receipts identify that revision.
+
+### Promote the two selected no-H&E MLP fits
+
+`dann.verification.promote_alignment` copies the combined-alignment and nHSIC-only
+MLP model directories from `data/verification/alignment_no_he_2026-11-04` into
+`data/PDAC/Results/dann/deep_sets__agg-mlp__bio-mlp__disc-none/`. Both retain epoch
+25 as `best.pt`, epoch 35 as `latest.pt`, all five-epoch archives, and the complete
+training history. Only copied configuration destinations and downstream checkpoint
+selection change. Per-run
+`promotion/provenance.json` records original/promoted hashes and every path edit.
+The original study and paused CNN/GATv2 sweep are never modified or resumed.
+
+```bash
+python -m dann.verification.promote_alignment --prepare
+python -m dann.verification.promote_alignment --run
+# The same command resumes interrupted work and reuses valid completed stages.
+python -m dann.verification.promote_alignment --resume
+python -m dann.verification.promote_alignment --audit
+# Evaluate epoch 35 in independent sibling folders; retain the epoch-25 outputs.
+python -m dann.verification.promote_alignment --checkpoint latest --run
+python -m dann.verification.promote_alignment --checkpoint latest --audit
+```
+
+Offline browser checks require Playwright and Chromium (`python -m pip install
+playwright`, then `python -m playwright install chromium`). On minimal containers,
+invocation-local Chromium libraries under
+`_promotion_alignment/verification/browser_runtime/root/usr/lib/x86_64-linux-gnu/`
+are picked up automatically on resume; package hashes and the environment script
+remain alongside those libraries.
+
+`--checkpoint best|latest` applies to preparation, run/resume, and audit; the
+default is `best`. Latest runs use the suffix `__latest_epoch35` and the separate
+batch `_promotion_alignment_latest_epoch35`. Its manifest records the current
+root configuration hash and preserves the previous batch and outputs. Copied
+configurations set `results.analysis_checkpoint: latest`, so ordinary analysis,
+inference, and audit commands resolve `latest.pt`; omitted settings resolve
+`best.pt`. Reports identify the evaluated epoch separately from supervised-best
+epoch 25, which remains the training-curve marker. Completed-stage receipts and
+numerical caches distinguish checkpoint selections. Each batch has a separate
+runtime/cache; copied installed browsers can live in
+`verification/browser_runtime/ms-playwright`.
+
+The explicit two-run manifest and stage/resource logs live in
+`_promotion_alignment/` under that combination directory. Isolated 256-row
+real-data checks precede full validation analysis, tissue inference, heatmaps,
+variance decomposition, numerical audits, and offline browser checks. Scientific
+settings remain checkpoint-derived, including full validation identities,
+training CD8 thresholds, 1,000 density draws, seeds, and rendering settings.
+Pointwise inference exports radius-zero support (the observed center pixel) with
+its own provenance identity; spatial models retain neighborhood occupancy support.
+Completed runs receive `index.html` links to their principal outputs. Configuration
+or checkpoint conflicts are rejected; training is never invoked.
+
+### Deep CCA H&E auxiliary objective
+
+`model.heads.he.objective` selects `raw_mse` (the historical default when omitted)
+or `deep_cca`. The main [`config.yaml`](config.yaml) enables `deep_cca` with
+dimension 16, MSI/H&E hidden widths 128/256, H&E weight 0.015, one biology-only
+epoch, and a two-epoch ramp. The run name `deep_cca_d16_w0p015_256_provisional`
+keeps outputs separate from existing results. All other main settings, including
+the post-training switches, are preserved. The initial candidate used weight 0.05.
+CCA is enabled by explicit user choice despite missing the original promotion
+threshold of at least 1% improvement in the primary stromal probe error ratio;
+the pilot findings below remain provisional.
+
+CCA uses pointwise MSI `latent_dim → 128 → d` and H&E `output_dim → 256 → d`
+projectors with hidden LayerNorm/GELU, linear outputs, and no dropout. Projector
+initialization uses a separate RNG stream. The biology head still sees the full
+MSI latent. Aggregation and biology may use MLP, CNN or GATv2; CCA projectors use
+`he.type: mlp`. No H&E is needed for MSI inference, and `predict_he=False` skips
+both projectors. The `he.mlp`, `he.cnn`, and `he.gatv2` architecture blocks apply
+only to `raw_mse`; CCA widths come from `he.deep_cca`.
+
+H&E feature means and population standard deviations are fitted only on selected
+training rows. Checkpoint buffers retain those statistics, the fit count and the
+SHA-256 of sorted training identities; the checkpoint records the preprocessing
+and objective contracts. Evaluation and inference never refit them. A standard
+deviation floor of `1e-8` handles constant features.
+
+Each optimizer batch centers paired projections separately within each slide,
+retains slides with at least eight rows, and averages their unbiased covariance
+matrices with equal slide weights. Pooled residual degrees of freedom must be at
+least `d + 1`. For each covariance block, the ridge is
+`1e-3 * trace(C) / d + 1e-8`. Float64 Cholesky solves give the whitened cross
+covariance. The loss is `1 - mean(canonical correlations)` plus `0.1` times the
+mean shortfall of each projection's within-slide standard deviation below one.
+Covariances, solves and singular values all use float64. Validation merges
+per-slide centered moments over the complete pass, independent of physical batch
+boundaries up to ordinary floating-point forward differences.
+
+The `deep_cca` settings are `dimension`, `msi_hidden_dim`, `he_hidden_dim`,
+`biology_only_epochs` and `ramp_epochs`. Defaults are `16, 128, 256, 1, 2`.
+Training CCA coefficients are therefore `0, weight/2, weight, …`; existing nHSIC
+and LR warmup settings remain in force. Validation always uses the full configured
+CCA weight. `supervised_objective` contains biology only in CCA mode; `total_loss`
+adds CCA and any enabled alignment objectives. Unavailable CCA evaluations remain
+missing in history, and a positive-weight epoch with none fails explicitly.
+Positive configured CCA weights reject optimizer microbatch splitting, including
+during the zero-weight initial epoch. Spectral chunking within a complete logical
+batch remains supported.
+
+History and curves include canonical correlations, variance penalties, projector
+ranks, paired-row coverage, effective weights and sampled encoder gradient
+conflicts. Analysis writes `he/<split>_cca_metrics.json`, including after an
+extraction-cache hit. Raw H&E reconstruction export is rejected in CCA mode.
+Architecture version 10 introduces explicit objective/preprocessing contracts;
+versions 2–9 retain their historical loading semantics. Changing objectives or
+CCA schedules requires fresh training. Resume retains fitted buffers and the
+epoch-based ramp. Optional `training.model_seed` changes initialization/dropout
+without changing `training.seed` or split identities; omission preserves the
+existing seed behavior.
+
+Production training is a separate action. When requested, use the main file:
+
+```bash
+python -m dann.train --config dann/config.yaml
+python -m dann.analyze --config dann/config.yaml
+```
+
+The enabled post-training switches still run their configured workflow after
+training; the standalone analysis command can rerun analysis later.
+
+Run the bounded study in a new directory:
+
+```bash
+python -m dann.verification.deep_cca_pilot \
+  --config dann/config.yaml \
+  --output data/PDAC/Results/dann/deep_cca_pilot_NEW \
+  --training-minutes 90 --overall-hours 10
+```
+
+The runner freezes 65,536 training and 16,384 validation rows, source hashes,
+training-derived CD8 thresholds and the stromal median. It compares no H&E,
+raw MSE at the source coefficient (now 0.015; the completed pilot used 10.0),
+and six CCA arms (`d=16,32`; weights
+`0.015,0.05,0.15`). Shared encoder/biology initialization hashes must match within
+each model seed. Early stopping and plateau scheduling are disabled, and paired
+160/320-update checkpoints are retained. Only completed common horizons are
+compared. The primary score averages three tissue-density MSE ratios and four
+CD8 Brier ratios in the upper stromal half, relative to no H&E with denominator
+floor `1e-8`. Existing biological/CD8 preservation bounds, noncollapse, and a
+maximum 0.01 increase in stromal same-slide neighbor excess are required.
+Within the remaining fit budget, the top two eligible candidates and control
+receive a second model seed. Ties within 0.01 use CD8 likelihood, then smaller
+weight and dimension. Twenty deterministic within-slide pairing permutations
+check the leading correlation. Configurations, checkpoints, probe parameters,
+metrics, budget ledger and `comparison.html`/`comparison.csv` stay in the isolated
+study directory. Production training and Visium transfer are separate.
+
+#### Completed 2026-11-07 pilots
+
+The [comparison report](../data/PDAC/Results/dann/deep_cca_pilot_20261107/comparison.html)
+contains all eight arms at 160 and 320 updates, plus second-seed confirmations of
+both eligible CCA arms and the no-H&E control. The main configuration now enables
+**d=16, weight=0.015** by user choice, retaining its provisional status.
+
+Its two-seed mean stromal probe-error ratio was **0.999683**, a **0.0317%**
+improvement against the required 1%. The individual ratios were 1.003168 and
+0.996199. Dimension 32 at the same weight had a slightly better mean ratio
+(0.998847); the specified 0.01 tie tolerance selected dimension 16 on CD8
+likelihood. The selected candidate's mean relative CD8 loss increased 0.1677%,
+within the preservation bound. Same-slide neighbor excess increased 0.00170 and
+0.00282 across the two seeds. Both low-weight candidates passed preservation in
+both seeds. Higher CCA weights and raw MSE failed the neighbor-excess bound;
+their biological/CD8 checks passed. No candidate cleared the 1% promotion gate.
+
+The provisional candidate's first-seed validation CCA correlation was 0.483448,
+versus 0.034997–0.047829 across 20 within-slide pairing permutations (empirical
+p=1/21). This demonstrates pairing-dependent alignment without establishing an
+improvement in the primary biological representation score.
+
+Pilot fitting, including validation, took **25.78 minutes**; **26.32 minutes**
+were charged against the 90-minute budget when the two real-data smoke runs were
+counted conservatively by their full wall time. The pilot runner took 33.89
+minutes including startup and downstream probes. Both repository suites passed
+**1,531 tests**; subsequent focused CCA checks also passed. All requested
+comparisons completed. Production training and Visium transfer were not run.
+Verification logs and the budget audit are in
+`data/PDAC/Results/dann/deep_cca_verification_20261107/`.

@@ -147,13 +147,27 @@ def prepare(roots: list[Path], archive_root: Path, template: Path) -> Path:
     return batch
 
 
+def checkpoint_path(run: dict) -> Path:
+    """Resolve the manifest checkpoint, preserving legacy best-only batches."""
+    selected = run.get('checkpoint', 'best')
+    if selected not in ('best', 'latest'):
+        raise ValueError('Manifest checkpoint must be best or latest.')
+    return Path(run['directory']) / 'model' / f'{selected}.pt'
+
+
+def same_checkpoint(run: dict, stage: dict) -> bool:
+    """Never reuse a completed stage from a different checkpoint selection."""
+    return stage.get('checkpoint', 'best') == run.get('checkpoint', 'best')
+
+
 def commands(run: dict) -> list[tuple[str, list[str]]]:
     """Explicitly route every downstream artifact into its original run."""
     root = Path(run['directory']) / 'analysis'
     config = ['--config', run['config']]
+    checkpoint = ['--checkpoint', str(checkpoint_path(run))]
     return [
-        ('analyze', ['dann.analyze', *config, '--checkpoint', str(root.parent / 'model/best.pt'), '--output-dir', str(root)]),
-        ('spatial', ['dann.spatial', *config, '--output', str(root / 'spatial/spatial_predictions.parquet'),
+        ('analyze', ['dann.analyze', *config, *checkpoint, '--output-dir', str(root)]),
+        ('spatial', ['dann.spatial', *config, *checkpoint, '--output', str(root / 'spatial/spatial_predictions.parquet'),
                      '--latent-output', str(root / 'spatial/spatial_latent.parquet'), '--overwrite']),
         ('spatial_heatmaps', ['dann.spatial_heatmaps', *config, '--output-dir', str(root / 'spatial/heatmaps')]),
         ('latent_variance', ['dann.latent_variance', *config, '--output-dir', str(root / 'latent_variance')]),
@@ -181,13 +195,40 @@ def stage_inventory(root: Path, stage: str) -> dict:
     return {k: v for k, v in files.items() if k == names[stage]}
 
 
+def recover_worker(run: dict, stage: str, previous: dict) -> None:
+    """Stop a surviving invocation-owned worker before retrying an interrupted stage."""
+    import psutil
+    pid = previous.get('pid')
+    if not pid:
+        return
+    try:
+        process = psutil.Process(pid)
+        if previous.get('process_created') != process.create_time():
+            return  # PID was reused, or this historical receipt cannot identify it.
+        evidence = Path(run['config']).parent
+        expected = [sys.executable, '-m', 'dann.verification.production_fits', '--worker',
+                    str(evidence/f'{stage}.{previous["attempt"]}.resources.json'), *previous['command'][2:]]
+        if process.cmdline() != expected or os.getpgid(pid) != pid:
+            raise RuntimeError(f'Cannot safely recover recorded worker {pid}.')
+        os.killpg(pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=20)
+        except psutil.TimeoutExpired:
+            os.killpg(pid, signal.SIGKILL)
+            process.wait(timeout=20)
+    except (psutil.NoSuchProcess, ProcessLookupError):
+        pass
+
+
 def execute(batch: Path, manifest: dict, run: dict, stage: str, arguments: list[str]) -> bool:
     """Run one isolated stage, monitor memory, and terminate children on interruption."""
     import psutil
     evidence = Path(run['config']).parent
     previous = run['stages'].get(stage, {})
+    recover_worker(run, stage, previous)
     attempt = previous.get('attempt', 0) + 1
     entry = dict(state='running', attempt=attempt, command=[sys.executable, '-m', *arguments],
+                 checkpoint=run.get('checkpoint', 'best'),
                  started_utc=datetime.now(timezone.utc).isoformat())
     run['stages'][stage] = entry
     save_json(batch / 'manifest.json', manifest)
@@ -200,6 +241,7 @@ def execute(batch: Path, manifest: dict, run: dict, stage: str, arguments: list[
     with (evidence / f'{stage}.{attempt}.log').open('w') as log:
         process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
         entry['pid'] = process.pid
+        entry['process_created'] = psutil.Process(process.pid).create_time()
         save_json(batch / 'manifest.json', manifest)
         try:
             while process.poll() is None:
@@ -271,7 +313,7 @@ def orchestrate(batch: Path) -> dict:
             stages = commands(run)
             for index, (stage, arguments) in enumerate(stages):
                 previous = run['stages'].get(stage, {})
-                if not invalidate and previous.get('state') == 'completed' and artifacts_valid(
+                if not invalidate and same_checkpoint(run, previous) and previous.get('state') == 'completed' and artifacts_valid(
                         Path(run['directory']) / 'analysis', previous.get('artifacts', {})):
                     continue
                 if not invalidate:
@@ -298,45 +340,166 @@ def orchestrate(batch: Path) -> dict:
         return summary
 
 
-def audit_outputs(config_path: Path) -> dict:
-    """Verify full export coverage, artifact counts, and all trusted PNG files."""
+def validate_html_links(path: Path) -> None:
+    """Validate HTML resource attributes without mistaking embedded JavaScript for markup."""
+    from html.parser import HTMLParser
+    from urllib.parse import unquote, urlsplit
+
+    class Links(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            for key, value in attrs:
+                if key not in ('src', 'href') or not value:
+                    continue
+                parsed = urlsplit(value)
+                if parsed.scheme or parsed.netloc or not parsed.path:
+                    continue
+                if not (path.parent/unquote(parsed.path)).is_file():
+                    raise ValueError(f'Broken report link in {path}: {value}')
+
+    parser = Links()
+    parser.feed(path.read_text())
+    parser.close()
+
+
+def audit_artifact_manifests(root: Path, config: dict, slides: list[str]) -> dict:
+    """Check manifest-owned artifacts and configuration-derived heatmap coverage."""
+    from dann.config import spatial_heatmap_settings
+    counts = {}
+    sections = [(root, 'analysis_execution.json', 'analysis')]
+    if config['analysis'].get('peaks', {}).get('enabled', True):
+        sections.append((root/'peaks', 'peak_run.json', 'peak'))
+    if config['analysis'].get('latent_interactive', False):
+        sections.append((root/'latent', 'latent_run.json', 'latent'))
+    for directory, name, label in sections:
+        report = json.loads((directory/name).read_text())
+        artifacts = report['artifacts']
+        if not artifacts or len(set(artifacts)) != len(artifacts):
+            raise ValueError(f'Empty or duplicate artifact manifest: {name}')
+        for relative in artifacts:
+            path = directory/relative
+            if Path(relative).is_absolute() or '..' in Path(relative).parts or not path.is_file():
+                raise ValueError(f'Missing or unsafe manifest artifact: {path}')
+            if path.suffix == '.html':
+                validate_html_links(path)
+        for suffix in ('.png', '.html'):
+            listed = {relative for relative in artifacts if Path(relative).suffix == suffix}
+            if label != 'analysis':
+                actual = {str(path.relative_to(directory)) for path in directory.rglob('*'+suffix)}
+                if actual != listed:
+                    raise ValueError(f'{label} {suffix} files disagree with generated manifest.')
+            counts[label+suffix.replace('.', '_')] = len(listed)
+        if label == 'peak' and config['analysis']['peaks'].get('spatial', True):
+            settings = json.loads((directory/'settings/cd8_family_comparison_settings.json').read_text())
+            if set(settings['slides']) != set(slides):
+                raise ValueError('Peak spatial viewers omit input slides.')
+            families = settings['family_ids']
+            expected = {f'spatial/families/family_{family:02d}_spatial.png' for family in families}
+            if not expected.issubset(artifacts):
+                raise ValueError('Missing peak family spatial figures.')
+    heatmaps = root/'spatial/heatmaps'
+    report = json.loads((heatmaps/'heatmap_run.json').read_text())
+    settings = spatial_heatmap_settings(config['analysis'].get('spatial_heatmaps'))
+    targets = config['data']['target_columns']
+    expected = {str(heatmaps/region/f'{prefix}_{target}_{region}.png')
+                for region in settings['regions'] for target in targets
+                for prefix in ('spatial_heatmap', 'spatial_heatmap_diagnostics')}
+    actual = {str(Path(item['path'])) for item in report['outputs']}
+    if actual != expected or {str(path) for path in heatmaps.rglob('*.png')} != expected:
+        raise ValueError('Spatial heatmap coverage differs from targets/regions.')
+    # Each target has separate named figures; the CLI's plotting order is not
+    # the model's ordered prediction schema (validated separately above).
+    if (set(report['densities']) != set(targets) or len(report['densities']) != len(targets)
+            or report['settings'] != settings):
+        raise ValueError('Spatial heatmap targets or settings changed.')
+    # New manifests explicitly record slide coverage; old reports predate this field.
+    if 'slides' in report and set(report['slides']) != set(slides):
+        raise ValueError('Spatial heatmaps omit input slides.')
+    from dann.heatmap_execution import validate_png
+    dpi = int(config['analysis']['figure_dpi'])
+    if report['dpi'] != dpi:
+        raise ValueError('Spatial heatmap DPI changed.')
+    for item in report['outputs']:
+        width = 30 if Path(item['path']).name.startswith('spatial_heatmap_diagnostics_') else 36
+        size = [width*dpi, 4*len(slides)*dpi]
+        if item['size'] != size:
+            raise ValueError('Spatial heatmap dimensions disagree with input slide count.')
+        validate_png(item['path'], size)
+    counts['spatial_png'] = len(expected)
+    return counts
+
+
+def audit_outputs(config_path: Path, *, write_report: bool = True) -> dict:
+    """Verify complete identities, finite model exports, manifests, links and images."""
     import h5py
     import numpy as np
-    import pyarrow.parquet as pq
+    import pandas as pd
+    import torch
     from anndata.io import read_elem
     from dann.config import load_config
     from dann.heatmap_execution import validate_png
+    from dann.spatial import validate_support_output, _file_identity
+    from dann.workflow import _validate_exports
     config = load_config(config_path)
     root = Path(config['analysis']['output_dir'])
+    checkpoint_path = Path(config['analysis']['checkpoint'])
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    width = int(checkpoint['config']['model']['latent_dim'])
+    if config['model']['latent_dim'] != width:
+        raise ValueError('Runtime/checkpoint latent dimensions disagree.')
     with h5py.File(config['data']['context_path']) as handle:
         rows = len(read_elem(handle['obs'][handle['obs'].attrs['_index']]))
-    for name in ('spatial_predictions.parquet', 'spatial_latent.parquet'):
-        parquet = pq.ParquetFile(root / 'spatial' / name)
-        assert parquet.metadata.num_rows == rows, name
-        offset = 0
-        for chunk in parquet.iter_batches(columns=['row_position'], batch_size=131072):
-            values = chunk.column(0).to_numpy()
-            np.testing.assert_array_equal(values, np.arange(offset, offset + len(values)))
-            offset += len(values)
-        if 'latent' in name:
-            assert len([v for v in parquet.schema_arrow.names if v.startswith('latent_')]) == 256
-        else:
-            from dann.targets import target_contract
-            assert json.loads(parquet.schema_arrow.metadata[b'dann_target_transform']) == target_contract(config)
-            for target in config['data']['target_columns']:
-                assert any(target in v for v in parquet.schema_arrow.names), target
-    counts = dict(peak_png=len(list((root / 'peaks').rglob('*.png'))),
-                  peak_html=len(list((root / 'peaks').rglob('*.html'))),
-                  latent_html=len(list((root / 'latent').glob('*.html'))),
-                  spatial_png=len(list((root / 'spatial/heatmaps').rglob('*.png'))))
-    assert counts == dict(peak_png=78, peak_html=38, latent_html=5, spatial_png=16), counts
-    assert not list(root.rglob('peptide_similarity_heatmap.png'))
-    assert not (root.parent / 'latent_variance').exists()
-    for name in ('latent_variance_summary.csv', 'pca_variance.csv', 'explained_variance.png'):
-        assert (root / 'latent_variance' / name).is_file()
+        slides = list(map(str, pd.unique(read_elem(handle['obs'][config['data']['batch_column']]))))
+    _validate_exports(config, checkpoint, checkpoint_path, Path(config['data']['context_path']),
+                      predictions=True, latents=True)
+    prediction_path = Path(config['spatial']['output'])
+    support = prediction_path.with_suffix('.support.parquet')
+    provenance = json.loads(prediction_path.with_suffix('.provenance.json').read_text())
+    if 'support_identity' in provenance and provenance['support_identity'] != _file_identity(support):
+        raise ValueError('Support provenance mismatch.')
+    if checkpoint.get('architecture', {}).get('spatial', {}).get('mode') == 'spatial' or support.exists():
+        validate_support_output(support, rows)
+    split = config['analysis']['split']
+    expected = np.asarray(checkpoint['split_indices'][split])
+    if config['analysis']['max_samples'] is not None:
+        raise ValueError('Full batch audit requires uncapped validation analysis.')
+    latent_path = root/'tables/latent_embeddings.csv'
+    latent_columns = [f'latent_{i}' for i in range(width)]
+    observed_columns = pd.read_csv(latent_path, nrows=0).columns.tolist()
+    if [c for c in observed_columns if c.startswith('latent_')] != latent_columns:
+        raise ValueError('Validation latent width/order differs from checkpoint.')
+    identities = []
+    for chunk in pd.read_csv(latent_path, chunksize=8192):
+        identities.append(chunk.row_id.to_numpy())
+        if not np.isfinite(chunk[latent_columns].to_numpy()).all():
+            raise ValueError('Nonfinite validation latent values.')
+    saved_rows = np.concatenate(identities)
+    np.testing.assert_array_equal(saved_rows, expected)
+    prediction_columns = [f'{prefix}_{target}' for target in config['data']['target_columns']
+                          for prefix in ('pi', 'mu', 'sigma', 'density_mean')]
+    numerical_columns = ['umap_1', 'umap_2', *prediction_columns]
+    umap = pd.read_csv(root/'umap/tables/latent_umap.csv', usecols=['row_id', *numerical_columns])
+    np.testing.assert_array_equal(umap.row_id, saved_rows)
+    if not np.isfinite(umap[numerical_columns].to_numpy()).all():
+        raise ValueError('Nonfinite validation UMAP or prediction parameters.')
+    counts = audit_artifact_manifests(root, config, slides)
+    if list(root.rglob('peptide_similarity_heatmap.png')) or (root.parent/'latent_variance').exists():
+        raise ValueError('Unexpected legacy artifact layout.')
+    variance = pd.read_csv(root/'latent_variance/latent_variance_summary.csv').iloc[0]
+    if (variance.latent_width, variance.n_observations, variance.n_slides) != (width, rows, len(slides)):
+        raise ValueError('Variance analysis coverage mismatch.')
+    if len(pd.read_csv(root/'latent_variance/pca_variance.csv')) != width:
+        raise ValueError('Incomplete variance spectrum.')
+    validate_png(root/'latent_variance/explained_variance.png')
     pngs = {str(path.relative_to(root)): validate_png(path) for path in root.rglob('*.png')}
-    report = dict(status='passed', tissue_rows=rows, counts=counts, png_dimensions=pngs)
-    save_json(root / 'artifact_audit.json', report)
+    execution = json.loads((root/'analysis_execution.json').read_text())
+    evaluated_epoch = int(checkpoint['epoch']) + 1
+    if execution['checkpoint_epoch'] != evaluated_epoch or execution['source_identity']['checkpoint'] != digest(checkpoint_path):
+        raise ValueError('Validation analysis checkpoint provenance mismatch.')
+    report = dict(status='passed', tissue_rows=rows, validation_rows=len(saved_rows), latent_width=width,
+                  checkpoint=str(checkpoint_path), evaluated_epoch=evaluated_epoch,
+                  slides=slides, checkpoint_sha256=digest(checkpoint_path), counts=counts, png_dimensions=pngs)
+    if write_report:
+        save_json(root/'artifact_audit.json', report)
     return report
 
 

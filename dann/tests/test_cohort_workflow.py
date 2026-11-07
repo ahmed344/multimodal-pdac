@@ -24,6 +24,7 @@ def test_retained_cohort_complete_workflow(tmp_path):
     apply(fitted, update_dann=True)
     path = Path(preprocessing['dann_config'])
     config = yaml.safe_load(path.read_text())
+    config['model']['heads']['he']['enabled'] = False  # This workflow tests biology-only exports.
     config['results'].update(root=str(tmp_path / 'runs'), run_name='retained_synthetic')
     config['model']['latent_dim'] = 4
     config['model']['spectral_encoder']['deep_sets'].update(embedding_dim=4, peak_hidden_dims=[8], peak_output_dim=8)

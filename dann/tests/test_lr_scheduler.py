@@ -84,7 +84,7 @@ def test_default_patience_cooldown_and_absolute_threshold():
     values = [-10.] + [-10.0005] * 6 + [-10.0005] * 2 + [-10.002] + [-10.002] * 6
     states = []
     for value in values:
-        step_lr_scheduler(scheduler, dict(supervised_objective=value))
+        step_lr_scheduler(scheduler, dict(total_loss=value))
         states.append((optimizer.param_groups[0]["lr"], scheduler.num_bad_epochs,
                        scheduler.cooldown_counter, scheduler.best))
     assert [state[0] for state in states] == [1e-6] * 6 + [5e-7] * 9 + [2.5e-7]
@@ -97,10 +97,10 @@ def test_default_patience_cooldown_and_absolute_threshold():
 def test_threshold_requires_strict_improvement():
     optimizer, scheduler = scheduler_pair(patience=0, threshold=.125, cooldown=0)
     for value in (2., 1.875):  # Exactly threshold-sized improvement does not count.
-        step_lr_scheduler(scheduler, dict(supervised_objective=value))
+        step_lr_scheduler(scheduler, dict(total_loss=value))
     assert optimizer.param_groups[0]["lr"] == 5e-7
     assert scheduler.best == 2.
-    step_lr_scheduler(scheduler, dict(supervised_objective=1.874))
+    step_lr_scheduler(scheduler, dict(total_loss=1.874))
     assert scheduler.best == 1.874
     assert optimizer.param_groups[0]["lr"] == 5e-7
 
@@ -110,7 +110,7 @@ def test_plateaus_reach_exact_original_floor(starting_lr):
     optimizer, scheduler = scheduler_pair(starting_lr)
     rates = []
     for _ in range(100):
-        step_lr_scheduler(scheduler, dict(supervised_objective=1.))
+        step_lr_scheduler(scheduler, dict(total_loss=1.))
         rates.append(optimizer.param_groups[0]["lr"])
     floor = starting_lr * .01
     assert rates[-1] == floor
@@ -122,11 +122,22 @@ def test_plateaus_reach_exact_original_floor(starting_lr):
 def test_nonfinite_validation_does_not_advance_scheduler(value):
     optimizer, scheduler = scheduler_pair()
     before = copy.deepcopy(scheduler.state_dict())
-    with pytest.raises(ValueError, match="finite validation supervised_objective"):
-        step_lr_scheduler(scheduler, dict(supervised_objective=value))
+    with pytest.raises(ValueError, match="finite validation total_loss"):
+        step_lr_scheduler(scheduler, dict(total_loss=value, supervised_objective=1.))
     assert scheduler.state_dict() == before
     assert optimizer.param_groups[0]["lr"] == 1e-6
     step_lr_scheduler(None, {})  # Disabled scheduling does not require a monitor.
+
+
+def test_scheduler_follows_total_when_supervised_moves_in_opposite_direction():
+    optimizer, scheduler = scheduler_pair(patience=0, cooldown=0)
+    step_lr_scheduler(scheduler, dict(total_loss=3., supervised_objective=2.))
+    step_lr_scheduler(scheduler, dict(total_loss=4., supervised_objective=1.))
+    assert optimizer.param_groups[0]["lr"] == 5e-7
+    assert scheduler.best == 3.
+    step_lr_scheduler(scheduler, dict(total_loss=2., supervised_objective=5.))
+    assert optimizer.param_groups[0]["lr"] == 5e-7
+    assert scheduler.best == 2.
 
 
 @pytest.fixture
@@ -152,7 +163,7 @@ def test_checkpoint_resume_matches_uninterrupted(checkpoint_setup, tmp_path, com
     config, bundle, model, optimizer, scheduler = checkpoint_setup
     values = [3.] * 8 + [2.] + [2.] * 35
     for value in values[:completed]:
-        step_lr_scheduler(scheduler, dict(supervised_objective=value))
+        step_lr_scheduler(scheduler, dict(total_loss=value))
     path = tmp_path / "scheduled.pt"
     train.save_checkpoint(path, model, optimizer, completed - 1, config, bundle, 3.,
                           lr_scheduler=scheduler)
@@ -174,7 +185,7 @@ def test_checkpoint_resume_matches_uninterrupted(checkpoint_setup, tmp_path, com
     assert restored_scheduler.state_dict() == scheduler.state_dict()
     for value in values[completed:]:
         for current in (scheduler, restored_scheduler):
-            step_lr_scheduler(current, dict(supervised_objective=value))
+            step_lr_scheduler(current, dict(total_loss=value))
         assert optimizer.param_groups[0]["lr"] == restored_optimizer.param_groups[0]["lr"]
         assert restored_scheduler.state_dict() == scheduler.state_dict()
     assert restored_optimizer.param_groups[0]["lr"] == 1e-8
@@ -184,14 +195,14 @@ def test_checkpoint_resume_matches_uninterrupted(checkpoint_setup, tmp_path, com
 def test_async_scheduler_snapshot_is_frozen(checkpoint_setup, worker, tmp_path):
     config, bundle, model, optimizer, scheduler = checkpoint_setup
     for _ in range(3):  # Save immediately after reduction, with cooldown active.
-        step_lr_scheduler(scheduler, dict(supervised_objective=3.))
+        step_lr_scheduler(scheduler, dict(total_loss=3.))
     path = tmp_path / "sync.pt"
     train.save_checkpoint(path, model, optimizer, 2, config, bundle, 3., lr_scheduler=scheduler)
     frozen = worker.snapshot(model, optimizer, scheduler)
     payload = train.checkpoint_payload(train.checkpoint_metadata(model, config, bundle), frozen, 2, 3.)
     worker.submit_epoch([dict(epoch=3)], ["epoch"], {}, {}, payload, ["latest.pt"])
     for _ in range(8):
-        step_lr_scheduler(scheduler, dict(supervised_objective=3.))
+        step_lr_scheduler(scheduler, dict(total_loss=3.))
     scheduler.min_lrs[0] = .1  # Mutable state lists must also be independent.
     worker.flush()
     saved = torch.load(worker.directory / "latest.pt", weights_only=False)
@@ -200,8 +211,59 @@ def test_async_scheduler_snapshot_is_frozen(checkpoint_setup, worker, tmp_path):
     assert saved["lr_scheduler_state"]["min_lrs"] == [1e-8]
 
 
+@pytest.mark.parametrize("completed", [3, 6])
+@pytest.mark.parametrize("metric", [None, "supervised_objective"])
+def test_supervised_checkpoint_resets_comparisons_but_preserves_lr(
+    checkpoint_setup, tmp_path, completed, metric,
+):
+    config, bundle, model, optimizer, scheduler = checkpoint_setup
+    for _ in range(completed):
+        step_lr_scheduler(scheduler, dict(total_loss=-10.))
+    path = tmp_path / "supervised.pt"
+    train.save_checkpoint(path, model, optimizer, completed - 1, config, bundle, -10.,
+                          lr_scheduler=scheduler)
+    payload = torch.load(path, weights_only=False)
+    state = payload["lr_scheduler_state"]
+    if metric is None:
+        del state["metric"]  # Historical checkpoints did not name the monitored objective.
+    else:
+        state["metric"] = metric
+    torch.save(payload, path)
+
+    restored_optimizer = torch.optim.AdamW(model.parameters(), lr=config["training"]["learning_rate"])
+    restored_scheduler = create_lr_scheduler(restored_optimizer, config)
+    train.load_training_checkpoint(path, model, restored_optimizer, torch.device("cpu"), config,
+                                   lr_scheduler=restored_scheduler)
+    assert_nested_equal(optimizer.state_dict(), restored_optimizer.state_dict())
+    expected = {**state, "metric": "total_loss", "best": float("inf"),
+                "num_bad_epochs": 0, "cooldown_counter": 0}
+    assert restored_scheduler.state_dict() == expected
+    saved_lr = restored_optimizer.param_groups[0]["lr"]
+    step_lr_scheduler(restored_scheduler, dict(total_loss=20., supervised_objective=-10.))
+    assert restored_scheduler.best == 20.
+    assert restored_scheduler.last_epoch == completed + 1
+    assert restored_optimizer.param_groups[0]["lr"] == saved_lr
+
+
+def test_unknown_scheduler_metric_rejected_before_data_preparation(checkpoint_setup, tmp_path, monkeypatch):
+    config, bundle, model, optimizer, scheduler = checkpoint_setup
+    path = tmp_path / "unknown.pt"
+    train.save_checkpoint(path, model, optimizer, 0, config, bundle, 1., lr_scheduler=scheduler)
+    payload = torch.load(path, weights_only=False)
+    payload["lr_scheduler_state"]["metric"] = "unknown_loss"
+    torch.save(payload, path)
+    config["training"].update(resume_checkpoint=str(path), epochs=3)
+    prepare = Mock(side_effect=AssertionError("must reject before preparing data"))
+    monkeypatch.setattr(train, "create_data_bundle", prepare)
+    with pytest.raises(ValueError, match="unknown LR scheduler metric"):
+        train.train_model(config)
+    prepare.assert_not_called()
+    with pytest.raises(ValueError, match="unknown LR scheduler metric"):
+        scheduler.load_state_dict(payload["lr_scheduler_state"])
+
+
 @pytest.mark.parametrize("async_artifacts", [False, True])
-@pytest.mark.parametrize("metric, count", [("supervised_objective", 5), ("cd8_loss", 7),
+@pytest.mark.parametrize("metric, count", [("total_loss", 5), ("supervised_objective", 7), ("cd8_loss", 7),
                                          ("batch_aware_objective", 7)])
 def test_training_history_checkpoint_timing_and_stopping(
     spatial_config, monkeypatch, capsys, async_artifacts, metric, count,
@@ -223,10 +285,10 @@ def test_training_history_checkpoint_timing_and_stopping(
         # Exercise real sparse training and validation, but control plateau scores.
         metrics = real_epoch(**kwargs)
         if kwargs["optimizer"] is None:
-            metrics.update(supervised_objective=10., cd8_loss=10. - kwargs["epoch_index"],
+            metrics.update(supervised_objective=10. - kwargs["epoch_index"], cd8_loss=10. - kwargs["epoch_index"],
                            batch_aware_objective=12. - .1 * kwargs["epoch_index"],
-                           total_loss=20. - kwargs["epoch_index"],
-                           batch_weighted_loss=10. - kwargs["epoch_index"])
+                           total_loss=20.,
+                           batch_weighted_loss=10. + kwargs["epoch_index"])
         else:
             used_rates.append(kwargs["optimizer"].param_groups[0]["lr"])
         return metrics
@@ -310,7 +372,7 @@ def test_production_metric_switch_retains_scheduler_without_history(spatial_conf
     monkeypatch.setattr(train, "refresh_loss_curves", Mock())
     monkeypatch.setattr(train, "_format_epoch_summary", lambda *args: "synthetic epoch")
     monkeypatch.setattr(train, "run_epoch", lambda **kwargs: dict(
-        supervised_objective=10., cd8_loss=10. - kwargs["epoch_index"], batch_aware_objective=10.))
+        total_loss=20., supervised_objective=10., cd8_loss=10. - kwargs["epoch_index"], batch_aware_objective=10.))
     best = train.train_model(config)
     latest_path = best.with_name("latest.pt")
     initial = torch.load(latest_path, weights_only=False)
@@ -325,7 +387,7 @@ def test_production_metric_switch_retains_scheduler_without_history(spatial_conf
     final = torch.load(latest_path, weights_only=False)
     _, expected_scheduler = scheduler_pair(config["training"]["learning_rate"], patience=1, cooldown=2)
     for _ in range(8):
-        step_lr_scheduler(expected_scheduler, dict(supervised_objective=10.))
+        step_lr_scheduler(expected_scheduler, dict(total_loss=20.))
     assert final["lr_scheduler_state"] == expected_scheduler.state_dict()
     assert final["optimizer_state"]["param_groups"][0]["lr"] == expected_scheduler.get_last_lr()[0]
     assert final["config"]["training"]["lr_scheduler"] == config["training"]["lr_scheduler"]
@@ -342,7 +404,7 @@ def test_production_rejects_nonfinite_scheduler_score_before_saving(spatial_conf
     config = spatial_config
     config["training"].update(epochs=1, early_stopping_metric="cd8_loss")
     monkeypatch.setattr(train, "run_epoch", lambda **kwargs: dict(
-        supervised_objective=float("nan"), cd8_loss=1.))
-    with pytest.raises(ValueError, match="finite validation supervised_objective"):
+        total_loss=float("nan"), supervised_objective=1., cd8_loss=1.))
+    with pytest.raises(ValueError, match="finite validation total_loss"):
         train.train_model(config)
     assert not list(Path(config["training"]["output_dir"]).glob("*.pt"))

@@ -123,6 +123,7 @@ class AdversarialLatentFusion(nn.Module):
         self.biology_predictor = biology_predictor
         self.batch_discriminator = batch_discriminator
         self.he_predictor = he_predictor
+        self.he_cca = None
         self.gradient_reversal = GradientReversal() if batch_discriminator is not None else None
         self.spatial = False
         self.peak_budget = 65536
@@ -168,7 +169,7 @@ class AdversarialLatentFusion(nn.Module):
                 values["latent_dim"], num_batches, **disc[disc["type"]])
         he = settings["heads"].get("he")
         he_predictor = None
-        if he is not None:
+        if he is not None and he["objective"] == "raw_mse":
             if he["type"] == "mlp":
                 he_predictor = MLPBiology(values["latent_dim"], he["mlp"]["hidden_dims"], he["output_dim"], residual=he["mlp"]["residual"], **common)
             else:
@@ -180,6 +181,12 @@ class AdversarialLatentFusion(nn.Module):
                 component.tile_budget = values.get("gatv2_tile_budget", 8)
                 component.checkpointing = values.get("gatv2_checkpointing", True)
         model = cls(encoder, biology, discriminator, he_predictor)
+        if he is not None and he['objective'] == 'deep_cca':
+            from dann.deep_cca import CCAProjectors
+            # Independent draws preserve shared encoder/biology initialization.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(config.get('training', {}).get('model_seed', config.get('training', {}).get('seed', 0)) + 104729)
+                model.he_cca = CCAProjectors(values['latent_dim'], he['output_dim'], he['deep_cca'])
         model.he_output_dim = he["output_dim"] if he is not None else 0
         model.num_targets, model.sigma_min = num_targets, values["sigma_min"]
         model.latent_dim = int(values["latent_dim"])
@@ -253,6 +260,8 @@ class AdversarialLatentFusion(nn.Module):
                 outputs["batch_logits"] = self.batch_discriminator(self.gradient_reversal(latent, grl_strength))
             if predict_he and self.he_predictor is not None:
                 outputs["he_prediction"] = self.he_predictor(latent)
+            if predict_he and self.he_cca is not None and 'he_targets' in batch:
+                outputs['cca_msi'], outputs['cca_he'] = self.he_cca(latent, batch['he_targets'])
             return outputs
         grid = self._latent_map(batch)
         mask = batch["occupancy"]
@@ -270,4 +279,6 @@ class AdversarialLatentFusion(nn.Module):
         if predict_he and self.he_predictor is not None:
             outputs["he_prediction"] = (self._select(self._prepared_map(self.he_predictor, grid, mask, batch), batch)
                                         if self.he_predictor.radius else self.he_predictor(latent))
+        if predict_he and self.he_cca is not None and 'he_targets' in batch:
+            outputs['cca_msi'], outputs['cca_he'] = self.he_cca(latent, batch['he_targets'])
         return outputs

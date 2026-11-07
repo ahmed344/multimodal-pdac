@@ -319,7 +319,16 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("model.heads.he must be a mapping.")
     if not isinstance(he.get("enabled", False), bool):
         raise ValueError("model.heads.he.enabled must be boolean.")
+    objective = he.get("objective", "raw_mse")
+    if objective not in {"raw_mse", "deep_cca"}:
+        raise ValueError("model.heads.he.objective must be raw_mse or deep_cca.")
     if he.get("enabled", False):
+        he['objective'] = objective
+        if objective == 'deep_cca':
+            from dann.deep_cca import cca_settings
+            he['deep_cca'] = cca_settings(he)
+            if he.get('type') != 'mlp':
+                raise ValueError('CCA projectors require he.type: mlp; aggregation/biology may be spatial.')
         width = he.get("output_dim")
         if isinstance(width, bool) or not isinstance(width, int) or width <= 0:
             raise ValueError("model.heads.he.output_dim must be a positive integer.")
@@ -445,7 +454,16 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         if mode == 'spatial' and spatial_batching['microbatch_rows'] is not None and spatial_batching['microbatch_rows'] < spatial_batching['supervised_rows_per_batch']:
             raise ValueError('Direct alignment requires unsplit optimizer batches; set microbatch_rows: null.')
     if 'discriminator' not in settings['heads'] and training['early_stopping_metric'] == 'batch_aware_objective':
-        raise ValueError('Discriminator-free training requires supervised_objective or cd8_loss selection.')
+        raise ValueError('Discriminator-free training requires total_loss, supervised_objective, or cd8_loss selection.')
+    model_seed = training.get('model_seed', training['seed'])
+    if isinstance(model_seed, bool) or not isinstance(model_seed, int) or model_seed < 0:
+        raise ValueError('training.model_seed must be a nonnegative integer.')
+    from dann.deep_cca import cca_contract
+    if cca_contract(config) is not None:
+        if config.get('analysis', {}).get('export_he_predictions', False):
+            raise ValueError('Raw H&E reconstruction export is unavailable with deep_cca.')
+        if weight > 0 and mode == 'spatial' and spatial_batching['microbatch_rows'] is not None and spatial_batching['microbatch_rows'] < spatial_batching['supervised_rows_per_batch']:
+            raise ValueError('Positive-weight CCA requires unsplit optimizer batches.')
     training["lr_scheduler"] = lr_scheduler_settings(training)
     training["warmup"] = warmup_settings(training)
     training["head_initialization"] = head_initialization_settings(training)
@@ -511,12 +529,15 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
             evaluation_tiles_per_batch=training["tiles_per_batch"])
     if "results" in config:
         result = config["results"]
+        checkpoint = result.setdefault("analysis_checkpoint", "best")
+        if checkpoint not in ("best", "latest"):
+            raise ValueError("results.analysis_checkpoint must be best or latest.")
         root = Path(result["root"]) / execution["combination"] / result.get("run_name", "fit")
         if result.get("smoke", False):
             root /= "smoke"
         training["output_dir"] = str(root / "model")
         config["analysis"]["output_dir"] = str(root / "analysis")
-        config["analysis"]["checkpoint"] = str(root / "model" / "best.pt")
+        config["analysis"]["checkpoint"] = str(root / "model" / f"{checkpoint}.pt")
         config["spatial"] = {"output": str(root / "analysis/spatial/spatial_predictions.parquet"),
                              "latents": str(root / "analysis/spatial/spatial_latent.parquet")}
         config.setdefault("latent_variance", {}).update(
