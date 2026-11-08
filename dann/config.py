@@ -12,6 +12,7 @@ import torch
 import yaml
 
 from dann.model_components.layers_gatv2 import gatv2_settings, graph_reach
+from dann.selection import OBJECTIVE_METRICS
 from dann.targets import normalization_settings, target_contract
 
 
@@ -71,9 +72,11 @@ def post_training_settings(settings: Mapping[str, Any] | None = None) -> dict[st
     return resolved
 
 
-def lr_scheduler_settings(training: Mapping[str, Any]) -> dict[str, Any]:
+def lr_scheduler_settings(
+    training: Mapping[str, Any], *, discriminator_enabled: bool = True,
+) -> dict[str, Any]:
     """Validate plateau settings; an omitted block preserves fixed learning rates."""
-    defaults = dict(enabled=False, factor=0.5, patience=5, cooldown=2,
+    defaults = dict(enabled=False, metric="total_loss", factor=0.5, patience=5, cooldown=2,
                     threshold=0.001, min_lr_factor=0.01, eps=0.0)
     supplied = training.get("lr_scheduler", {})
     if not isinstance(supplied, Mapping):
@@ -84,6 +87,10 @@ def lr_scheduler_settings(training: Mapping[str, Any]) -> dict[str, Any]:
     resolved = {**defaults, **supplied}
     if not isinstance(resolved["enabled"], bool):
         raise ValueError("training.lr_scheduler.enabled must be a boolean.")
+    if resolved["metric"] not in OBJECTIVE_METRICS:
+        raise ValueError(f"training.lr_scheduler.metric must be one of {OBJECTIVE_METRICS}.")
+    if resolved["enabled"] and resolved["metric"] == "batch_aware_objective" and not discriminator_enabled:
+        raise ValueError("training.lr_scheduler.metric=batch_aware_objective requires an enabled discriminator.")
     for key in ("patience", "cooldown"):
         value = resolved[key]
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -464,7 +471,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
             raise ValueError('Raw H&E reconstruction export is unavailable with deep_cca.')
         if weight > 0 and mode == 'spatial' and spatial_batching['microbatch_rows'] is not None and spatial_batching['microbatch_rows'] < spatial_batching['supervised_rows_per_batch']:
             raise ValueError('Positive-weight CCA requires unsplit optimizer batches.')
-    training["lr_scheduler"] = lr_scheduler_settings(training)
+    training["lr_scheduler"] = lr_scheduler_settings(training, discriminator_enabled='discriminator' in settings['heads'])
     training["warmup"] = warmup_settings(training)
     training["head_initialization"] = head_initialization_settings(training)
     if training["head_initialization"]["enabled"] and training["head_initialization"]["min_positive_sigma"] <= config["model"]["sigma_min"]:

@@ -129,7 +129,7 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
 
     Returns:
         dict[str, Any]: Checkpoint configuration with epochs, workers, prefetch,
-        early-stopping metric, patience, minimum improvement, and the resume path replaced
+        scheduler metric, early-stopping metric, patience, minimum improvement, and the resume path replaced
         by the requested values, plus current post-training switches. The
         checkpoint learning rate stays in place.
     """
@@ -166,6 +166,10 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     training = config.setdefault("training", {})
     training["lr_scheduler"] = lr_scheduler_settings(training)
     requested = requested_config["training"]
+    training["lr_scheduler"]["metric"] = lr_scheduler_settings(requested)["metric"]
+    training["lr_scheduler"] = lr_scheduler_settings(
+        training, discriminator_enabled=config.get("model", {}).get("heads", {}).get("discriminator", {}).get("enabled", True),
+    )
     for key in _RESUME_OVERRIDES:
         if key in requested:
             training[key] = requested[key]
@@ -266,7 +270,11 @@ def ignored_resume_settings(requested_config: Mapping[str, Any], effective_confi
             return []
         return [prefix]
 
-    return walk(requested_config, effective_config, "")
+    def with_scheduler_defaults(config: Mapping[str, Any]) -> dict[str, Any]:
+        training = config.get("training", {})
+        return {**config, "training": {**training, "lr_scheduler": lr_scheduler_settings(training)}}
+
+    return walk(with_scheduler_defaults(requested_config), with_scheduler_defaults(effective_config), "")
 
 
 def _history_row_count(path: Path) -> int:

@@ -51,7 +51,7 @@ model:
 
   # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
-    type: mlp  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
+    type: gatv2  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
       residual: true
       hidden_dims: [256, 256]  # Hidden widths after pooling; final width is latent_dim.
@@ -72,7 +72,7 @@ model:
   # 3. Prediction heads: choices are independent; all consume aggregation latents.
   heads:
     biology:
-      type: mlp  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
+      type: gatv2  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
       mlp:
         residual: true
         hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
@@ -95,7 +95,7 @@ model:
       objective: deep_cca  # Choices: raw_mse, deep_cca. Changing objectives requires fresh training.
       # Enabled by user choice despite missing the pilot's 1% promotion gate.
       deep_cca:
-        dimension: 64
+        dimension: 16
         msi_hidden_dim: 128
         he_hidden_dim: 256
         biology_only_epochs: 1  # CCA weight is zero; existing batch alignment remains active.
@@ -157,8 +157,8 @@ model:
 loss:
   batch_alignment:
     nhsic: {enabled: true, weight: 0.01}  # Initial experimental weight, not an established optimum.
-    anova: {enabled: false, weight: 0.0}
-    soft_nn: {enabled: false, weight: 0.0}
+    anova: {enabled: true, weight: 0.01}
+    soft_nn: {enabled: true, weight: 0.001}
     bandwidths: [0.05, 0.1, 0.2, 0.5]
     temperature: 0.1
     train_per_slide: 32
@@ -191,9 +191,9 @@ training:
     prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
 
   spatial:  # Used when any selected aggregation/head component is a CNN or GATv2.
-    core_size: 8  # Core side length in grid pixels; no edge pixels are discarded.
+    core_size: 16  # Core side length in grid pixels; no edge pixels are discarded.
     sampling_strategy: proportional_slide_tiles  # Independently shuffled slide queues, proportional row interleaving.
-    supervised_rows_per_batch: 2048  # Effective optimizer batch; final epoch batch may be smaller.
+    supervised_rows_per_batch: 4096  # Effective optimizer batch; final epoch batch may be smaller.
     microbatch_rows: null  # One physical batch, benchmarked at radius 1.5; use 16384 for two accumulation steps.
     tiles_per_batch: 8  # Validation/test tile count; also training count with legacy shuffled_tiles.
     learning_rate: 0.001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
@@ -215,12 +215,13 @@ training:
   warmup:
     epochs: 1
     start_factor: 0.1
-  lr_scheduler:  # Validation total_loss; saved settings are retained on resume.
+  lr_scheduler:  # Independent validation objective; only metric follows current YAML on resume.
     enabled: true
+    metric: total_loss  # Also supports supervised_objective, cd8_loss, and batch_aware_objective (requires discriminator).
     factor: 0.5
     patience: 5
     cooldown: 2
-    threshold: 0.001  # Absolute improvement in total-loss units.
+    threshold: 0.001  # Absolute improvement in scheduler-metric units, independent of early stopping.
     min_lr_factor: 0.01  # Floor relative to the selected mode's original starting LR.
     eps: 0.0  # Allow reductions all the way to the floor, including very small LRs.
   gradient_clip_norm: 5.0  # Maximum global gradient norm; null disables clipping.
@@ -233,7 +234,7 @@ training:
   early_stopping_patience: 10  # Epochs without improvement in the validation selection metric.
   early_stopping_min_delta: 0.001  # Minimum improvement in the selected score's units.
   checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
-  resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, and early stopping may override.
+  resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, scheduler metric, and early stopping may override.
   deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
 
   # --smoke-test overrides, recorded in resolved_config.yaml under a separate smoke/ run directory.
@@ -341,7 +342,7 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: "deep_cca_d64_w0p1_256"  # Separate outputs for the provisional CCA choice.
+  run_name: "deep_cca_d16_all_0p01_256"  # Separate outputs for the provisional CCA choice.
 
 # Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
 # Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.

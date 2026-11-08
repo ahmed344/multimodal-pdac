@@ -18,6 +18,7 @@ from dann.lr_scheduler import UpdateWarmup, create_lr_scheduler, step_lr_schedul
 from dann.model import AdversarialLatentFusion
 from dann.model_components.deep_sets import DeepSetsEncoder
 from dann.model_components.layers import NormalizedResidual, build_mlp, without_dropout
+from dann.selection import OBJECTIVE_METRICS
 from dann.tests.test_components import spatial_config
 from dann.tests.test_he import he_config
 from dann.tests.test_execution import enable, epoch
@@ -187,9 +188,10 @@ def test_version_roundtrip_and_new_settings_rejected(spatial_config, version):
 
 
 @pytest.mark.parametrize('epochs, updates', [(0, 4), (1, 1), (1, 4), (2, 4)])
-def test_warmup_endpoints_plateau_and_resume(epochs, updates):
+@pytest.mark.parametrize('metric', OBJECTIVE_METRICS)
+def test_warmup_endpoints_plateau_and_resume(epochs, updates, metric):
     c = dict(training=dict(learning_rate=.001, warmup=dict(epochs=epochs, start_factor=.1),
-                          lr_scheduler=dict(enabled=True, patience=0, cooldown=0)))
+                          lr_scheduler=dict(enabled=True, metric=metric, patience=0, cooldown=0)))
     def pair():
         opt = torch.optim.AdamW([nn.Parameter(torch.ones(1))], lr=.001)
         return opt, create_lr_scheduler(opt, c), UpdateWarmup(opt, c, updates)
@@ -199,7 +201,7 @@ def test_warmup_endpoints_plateau_and_resume(epochs, updates):
         rates.append(opt.param_groups[0]['lr'])
         warmup.step()
         if i >= warmup.horizon:
-            step_lr_scheduler(scheduler, dict(total_loss=1.))
+            step_lr_scheduler(scheduler, {metric: 1.})
         if i == 1:
             state = cpu_snapshot(training_state(nn.Linear(1, 1), opt, scheduler, warmup))
     assert rates[0] == (.0001 if epochs else .001)
@@ -212,7 +214,7 @@ def test_warmup_endpoints_plateau_and_resume(epochs, updates):
         assert opt2.param_groups[0]['lr'] == rates[i]
         warm2.step()
         if i >= warm2.horizon:
-            step_lr_scheduler(sched2, dict(total_loss=1.))
+            step_lr_scheduler(sched2, {metric: 1.})
     assert opt2.param_groups[0]['lr'] >= .001*.01
 
 

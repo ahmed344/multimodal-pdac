@@ -9,52 +9,60 @@ import torch
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from dann.config import lr_scheduler_settings
+from dann.selection import OBJECTIVE_METRICS
 
 
-class TotalLossPlateau(ReduceLROnPlateau):
-    """Record the monitored objective and migrate historical supervised scores."""
+class ObjectivePlateau(ReduceLROnPlateau):
+    """Monitor a configured objective independently of checkpoint selection."""
 
-    def state_dict(self) -> dict[str, Any]:
-        """Save the metric alongside the plateau comparison and LR state."""
-        return {**super().state_dict(), "metric": "total_loss"}
+    def __init__(self, optimizer: torch.optim.Optimizer, *, metric: str, **kwargs: Any) -> None:
+        if metric not in OBJECTIVE_METRICS:
+            raise ValueError(f"Unknown LR scheduler metric {metric!r}.")
+        self.metric = metric
+        super().__init__(optimizer, **kwargs)
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Retain LR progress, resetting comparisons when the objective changes."""
         state = dict(state_dict)
         metric = state.pop("metric", "supervised_objective")
-        if metric not in ("supervised_objective", "total_loss"):
+        if metric not in OBJECTIVE_METRICS:
             raise ValueError(f"Cannot resume: unknown LR scheduler metric {metric!r}.")
-        if metric != "total_loss":
+        if metric != self.metric:
             state.update(best=math.inf, num_bad_epochs=0, cooldown_counter=0)
         super().load_state_dict(state)
-        if metric != "total_loss":
-            print("LR scheduler changed to total_loss; best score, patience, and cooldown reset.", flush=True)
+        if metric != self.metric:
+            print(f"LR scheduler changed from {metric} to {self.metric}; "
+                  "best score, bad-epoch count, and cooldown reset.", flush=True)
 
 
 def create_lr_scheduler(
     optimizer: torch.optim.Optimizer, config: Mapping[str, Any],
-) -> ReduceLROnPlateau | None:
+) -> ObjectivePlateau | None:
     """Build the scheduler using the resolved mode's original starting LR."""
     training = config["training"]
-    settings = lr_scheduler_settings(training)
+    settings = lr_scheduler_settings(
+        training, discriminator_enabled=config.get("model", {}).get("heads", {}).get("discriminator", {}).get("enabled", True),
+    )
     if not settings["enabled"]:
         return None
-    return TotalLossPlateau(
-        optimizer, mode="min", threshold_mode="abs",
+    return ObjectivePlateau(
+        optimizer, metric=settings["metric"], mode="min", threshold_mode="abs",
         min_lr=float(training["learning_rate"]) * settings["min_lr_factor"],
         **{key: settings[key] for key in ("factor", "patience", "cooldown", "threshold", "eps")},
     )
 
 
 def step_lr_scheduler(
-    scheduler: ReduceLROnPlateau | None, validation_metrics: Mapping[str, float],
+    scheduler: ObjectivePlateau | None, validation_metrics: Mapping[str, float],
 ) -> None:
-    """Minimize validation total loss once per epoch, independently of selection."""
+    """Minimize the configured validation score once per epoch, independently of selection."""
     if scheduler is None:
         return
-    value = validation_metrics["total_loss"]
+    if scheduler.metric not in validation_metrics:
+        raise ValueError(f"LR scheduling requires validation {scheduler.metric}; monitored value is missing.")
+    value = validation_metrics[scheduler.metric]
     if not math.isfinite(value):
-        raise ValueError("LR scheduling requires a finite validation total_loss.")
+        raise ValueError(f"LR scheduling requires a finite validation {scheduler.metric}.")
     scheduler.step(value)
 
 
@@ -71,7 +79,7 @@ def validate_lr_scheduler_checkpoint(checkpoint: Mapping[str, Any]) -> None:
                 "mode", "threshold_mode", "factor", "patience", "cooldown", "threshold", "eps"}
     if not isinstance(state, Mapping) or not required <= state.keys():
         raise ValueError("Cannot resume: lr_scheduler_state is incomplete.")
-    if state.get("metric", "supervised_objective") not in ("supervised_objective", "total_loss"):
+    if state.get("metric", "supervised_objective") not in OBJECTIVE_METRICS:
         raise ValueError(f"Cannot resume: unknown LR scheduler metric {state['metric']!r}.")
 
 

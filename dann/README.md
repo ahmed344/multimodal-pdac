@@ -504,7 +504,7 @@ completed validation epoch, with no additional warmup.
 setting retains legacy `cd8_loss` selection: mean validation CD8 ZILN loss over
 valid CD8 rows. `early_stopping_min_delta` measures units of the selected score.
 The selection policy does not change the optimized loss, gradients, GRL schedule,
-or LR scheduling on `total_loss`.
+or the independently configured LR scheduler objective.
 
 New runs enable validation-driven LR reduction through the shared block:
 
@@ -512,6 +512,7 @@ New runs enable validation-driven LR reduction through the shared block:
 training:
   lr_scheduler:
     enabled: true
+    metric: total_loss
     factor: 0.5
     patience: 5
     cooldown: 2
@@ -521,12 +522,19 @@ training:
   early_stopping_patience: 20
 ```
 
-`ReduceLROnPlateau` minimizes validation `total_loss`, regardless of the
-early-stopping metric. Improvement must exceed the absolute `threshold`; after
-six non-improving epochs (`patience: 5`) the LR halves, followed by two cooldown
+`ReduceLROnPlateau` minimizes the validation objective named by
+`training.lr_scheduler.metric`, which defaults to `total_loss` and is independent
+of `early_stopping_metric`. Both
+selectors support `total_loss`, `supervised_objective`, `cd8_loss`, and
+`batch_aware_objective`. An enabled scheduler using `batch_aware_objective`
+requires an enabled discriminator. Improvement must exceed the absolute
+`threshold` in the scheduler metric's units, independently of
+`early_stopping_min_delta`; after six non-improving epochs (`patience: 5`) the LR
+halves, followed by two cooldown
 epochs. The scheduler steps once after completed validation, before checkpoint
-snapshots. Nonfinite monitored scores are rejected. LR reductions do not reset
-early-stopping patience or change GRL/optimizer-update accounting.
+snapshots. Missing or nonfinite monitored scores are rejected before advancing
+scheduler state. LR reductions do not reset early-stopping patience or change
+GRL/optimizer-update accounting.
 
 The floor is computed once as `min_lr_factor ×` the selected execution mode's
 starting LR. With the checked-in spatial LR `0.0001` the floor is `0.000001`;
@@ -557,7 +565,8 @@ rejected. Unknown legacy selection rules also start a new selection period.
 
 Training resume copies the checkpoint configuration, then applies only the current
 YAML values for `epochs`, `num_workers`, `prefetch_factor`,
-`early_stopping_metric`, `early_stopping_patience`, and `early_stopping_min_delta`,
+`lr_scheduler.metric`, `early_stopping_metric`, `early_stopping_patience`, and
+`early_stopping_min_delta`,
 plus the documented performance, post-training, and monitoring overrides. The checkpoint learning
 rate and other training settings stay in place; differing YAML values are reported
 and ignored. Batch-aware selection uses the saved loss weights and maximum GRL
@@ -566,19 +575,21 @@ and discriminator state. `--smoke-test` cannot be combined with a resume checkpo
 `history.csv` rows are kept and both `loss_curves.png` and `ihc_curves.png` are refreshed from that full history.
 
 Scheduled checkpoints save `lr_scheduler_state` with the optimizer, including the
-`metric: total_loss` marker, best total score, counters, cooldown, and original LR
+selected `metric` marker, best score, counters, cooldown, and original LR
 floor. Resume restores both states without stepping the scheduler or deriving a new floor from the
-reduced optimizer LR. Saved scheduler settings take precedence over conflicting
-YAML settings, which are reported and ignored. Legacy checkpoints without a
-scheduler block remain fixed-LR even when current YAML enables scheduling.
+reduced optimizer LR. The scheduler metric comes from the current YAML, defaulting
+to `total_loss` when omitted. All other saved scheduler settings take precedence
+over conflicting YAML settings, which are reported and ignored. Legacy checkpoints
+without a scheduler block remain fixed-LR even when current YAML enables scheduling.
 Production resume rejects checkpoints that enable scheduling but lack its state.
-Historical scheduler states without a metric marker (or explicitly marked
-`supervised_objective`) switch to total loss on resume: the best score, bad-epoch
-count, and cooldown reset, while the optimizer LR, original floor, scheduler
-settings, and completed-epoch count are retained. The first post-warmup validation
-sets the new total-loss baseline. Unknown scheduler metrics are rejected.
-Changing the early-stopping metric resets only selection state; scheduler state
-continues because its monitored score remains `total_loss`.
+Matching saved and requested scheduler metrics restore scheduler state exactly.
+When they differ, the switch is reported and the best score, bad-epoch count, and
+cooldown reset, while the optimizer LR, original floor, other scheduler settings,
+and completed-epoch count are retained. The first post-warmup validation sets the
+new baseline; no history CSV is needed. Historical scheduler states without a
+metric marker are interpreted as `supervised_objective`. Unknown scheduler metrics
+are rejected. Changing only the scheduler metric preserves early-stopping state;
+changing only the early-stopping metric preserves scheduler state.
 
 `performance.async_artifacts: true` moves checkpoint serialization, history and
 sampling-audit writes, and curve rendering into two persistent CPU workers. One
@@ -2873,7 +2884,8 @@ with its own nonnegative `weight`. An enabled zero-weight objective is a diagnos
 disabled objectives are neither evaluated nor plotted. The current configuration uses
 nHSIC and `model.heads.discriminator.enabled: false` (legacy default: true).
 Disabling the discriminator removes its parameters, logits, GRL, and spatial halo.
-Both checkpoint selection and LR scheduling use validation `total_loss`.
+Both checkpoint selection and LR scheduling default to validation `total_loss`
+in the checked-in YAML and can select their objectives independently.
 
 Alignment compares L2-normalized aggregation latents across all pixels without
 tissue conditioning, giving each represented slide equal total weight. Training
