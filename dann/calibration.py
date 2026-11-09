@@ -547,45 +547,54 @@ def run_calibration(
         Path: Directory containing the written report.
     """
 
+    from dann.config import analysis_feature_settings
+    flags = analysis_feature_settings(config)['calibration']
+    if not flags['enabled']:
+        return Path(output_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     coverage_levels = tuple(
         float(value)
         for value in config.get("calibration_coverage_levels", DEFAULT_COVERAGE_LEVELS)
     )
-    metrics = build_metrics_frame(
-        extracted, target_columns, split, epsilon, coverage_levels
-    )
-    metrics.to_csv(output_dir / "calibration_metrics.csv", index=False)
-    build_batch_metrics_frame(
-        extracted, target_columns, batch_names, split, epsilon, coverage_levels
-    ).to_csv(output_dir / "calibration_metrics_by_batch.csv", index=False)
+    if flags['tables']:
+        metrics = build_metrics_frame(
+            extracted, target_columns, split, epsilon, coverage_levels
+        )
+        metrics.to_csv(output_dir / "calibration_metrics.csv", index=False)
+        build_batch_metrics_frame(
+            extracted, target_columns, batch_names, split, epsilon, coverage_levels
+        ).to_csv(output_dir / "calibration_metrics_by_batch.csv", index=False)
     display_columns = [
         target_label(column, extracted.get("target_transform"))
         for column in target_columns
     ]
     render = renderer or (lambda function, *args, **kwargs: function(*args, **kwargs))
-    render(plot_pit,
-        extracted,
-        display_columns,
-        epsilon,
-        output_dir / "calibration_pit.png",
-        config,
-    )
-    render(plot_hurdle_reliability,
-        extracted,
-        display_columns,
-        output_dir / "calibration_hurdle_reliability.png",
-        config,
-    )
-    render(plot_interval_coverage,
-        extracted,
-        display_columns,
-        epsilon,
-        output_dir / "calibration_interval_coverage.png",
-        config,
-    )
-    print(metrics.to_string(index=False), flush=True)
+    if flags['pit']:
+        render(plot_pit,
+            extracted,
+            display_columns,
+            epsilon,
+            output_dir / "calibration_pit.png",
+            config,
+        )
+    if flags['hurdle']:
+        render(plot_hurdle_reliability,
+            extracted,
+            display_columns,
+            output_dir / "calibration_hurdle_reliability.png",
+            config,
+        )
+    if flags['coverage']:
+        render(plot_interval_coverage,
+            extracted,
+            display_columns,
+            epsilon,
+            output_dir / "calibration_interval_coverage.png",
+            config,
+        )
+    if flags['tables']:
+        print(metrics.to_string(index=False), flush=True)
     return output_dir
 
 
@@ -705,6 +714,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parse_args(argv)
     config = load_config(args.config)
+    from dann.config import analysis_feature_settings
+    if not analysis_feature_settings(config['analysis'])['calibration']['enabled']:
+        return 0
     analysis = config["analysis"]
     from dann.artifact_layout import analysis_file
     input_path = args.input or analysis_file(Path(analysis["output_dir"]), "umap/latent_umap.csv")

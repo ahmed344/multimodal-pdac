@@ -739,9 +739,9 @@ def recommendation_workflow(root: Path, selected: dict) -> None:
     c['analysis'].update(output_dir=str(directory/'analysis'),checkpoint=str(path),max_samples=None)
     c['spatial'] = dict(output=str(directory/'analysis/spatial/spatial_predictions.parquet'),
                         latents=str(directory/'analysis/spatial/spatial_latent.parquet'))
-    c['latent_variance']['output_dir'] = str(directory/'analysis/latent_variance')
+    c['analysis'].setdefault('features', {})['variance'] = {'enabled': True}
     c['post_training'].update(enabled=True,run_analysis=True,run_inference=True,
-                             run_spatial_heatmaps=True,run_latent_variance=True,overwrite_inference=True)
+                             run_spatial_heatmaps=True,overwrite_inference=True)
     stamp = root/'stages'/'recommendation-workflow.json'
     identity = dict(checkpoint_sha256=digest_file(path),manifest_sha256=digest_file(root/'manifest.json'),config=fingerprint(c))
     if reusable(stamp,identity):

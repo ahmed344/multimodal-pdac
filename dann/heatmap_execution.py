@@ -156,9 +156,11 @@ def prepare_grids(
     """Persist one set of numerical grids shared by all figure tasks."""
     from dann.spatial_heatmaps import add_logit_columns, add_residual_columns, add_interval_width_columns
     add_logit_columns(adata, densities, epsilon)
-    add_logit_columns(adata, [f"density_mean_{d}" for d in densities], epsilon)
-    add_residual_columns(adata, densities)
-    add_interval_width_columns(adata, densities)
+    if settings.get("parameters", True):
+        add_logit_columns(adata, [f"density_mean_{d}" for d in densities], epsilon)
+    if settings.get('diagnostics', True):
+        add_residual_columns(adata, densities)
+        add_interval_width_columns(adata, densities)
     manifest = {"slides": [], "contract": adata.uns.get("dann_target_transform"), "bytes": 0, "cmap": settings["cmap"]}
 
     def save(name, values):
@@ -203,6 +205,9 @@ def prepare_grids(
                        f"logit_mean_{density}", f"residual_{density}", f"interval_width_{density}"]
             grids = np.full((8, *shape), np.nan, dtype=np.float32)
             for k, column in enumerate(columns):
+                if (k >= 5 and not settings.get('diagnostics', True) or
+                        k in (1, 2, 3, 4) and not settings.get('parameters', True)):
+                    continue
                 values = frame[column].to_numpy(dtype=np.float32, copy=True)
                 if k in (0, 5, 6, 7):
                     values[~positive] = np.nan
@@ -374,6 +379,8 @@ def run_heatmaps(
     from dann.config import spatial_heatmap_settings
     global _WORKER_DATA, _THREAD_LIMIT
     settings = spatial_heatmap_settings(settings)
+    if not settings['enabled'] or not (settings['parameters'] or settings['diagnostics']):
+        return output_dir
     if not densities or len(set(densities)) != len(densities):
         raise ValueError("Select at least one distinct density.")
     if not 0 < epsilon < .5 or isinstance(dpi, bool) or not isinstance(dpi, int) or dpi <= 0:
@@ -405,6 +412,8 @@ def run_heatmaps(
             tasks = []
             for density in densities:
                 for kind in ("parameters", "diagnostics"):
+                    if not settings[kind]:
+                        continue
                     for region in settings["regions"]:
                         prefix = "spatial_heatmap_diagnostics" if kind == "diagnostics" else "spatial_heatmap"
                         name = f"{prefix}_{density}_{region}.png"

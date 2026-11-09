@@ -1,155 +1,121 @@
-"""Numerical and artifact contracts for standalone latent variance diagnostics."""
-
+"""Lesion-only covariance, complete PCA spectra and explicit Scanpy graph inputs."""
 from pathlib import Path
-
-import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
-import yaml
-from scipy import sparse
+from anndata.io import write_elem
 
-from dann.config import latent_variance_settings, load_config, read_config
-from dann.latent_variance import compute_latent_variance, latent_columns, main
-
-
-def write_inputs(tmp_path, values, labels, extra_rows=0):
-    """Create sparse source metadata and numerically reordered latent columns."""
-    count, width = values.shape
-    names = ["duplicate"] * (count + extra_rows)
-    adata = ad.AnnData(sparse.csr_matrix((len(names), 2)))
-    adata.obs_names = names
-    adata.obs["batch"] = pd.Categorical([*labels, *(["unused"] * extra_rows)])
-    input_path = tmp_path / "input.h5ad"
-    adata.write_h5ad(input_path)
-    frame = pd.DataFrame({"row_position": np.arange(count, dtype=np.int64), "obs_name": names[:count]})
-    for i in reversed(range(width)):
-        frame[f"latent_{i}"] = values[:, i].astype(np.float64)
-    latent_path = tmp_path / "latent.parquet"
-    frame.to_parquet(latent_path, index=False)
-    return latent_path, input_path
+from dann.analysis_latents import (covariance_pca, variance_from_pca, select_pc_count,
+    select_sample_rows, fit_pca_umap, cached_pca, plot_explained_variance)
+from dann.analysis_execution import StageCache
+from dann.spatial_execution import InferenceProgress
 
 
-@pytest.mark.parametrize("chunk_size", [1, 2, 10])
-def test_known_spectrum_and_chunk_invariance(tmp_path, chunk_size):
-    values = np.array([[3, 0], [-3, 0], [0, 1], [0, -1]], dtype=float)
-    paths = write_inputs(tmp_path, values, ["a", "a", "b", "b"])
-    summary, spectrum = compute_latent_variance(*paths, chunk_size=chunk_size)
-    np.testing.assert_allclose(spectrum.eigenvalue, [6, 2 / 3])
-    np.testing.assert_allclose(spectrum.explained_variance_fraction, [0.9, 0.1])
-    assert summary["participation_ratio"] == pytest.approx(1 / 0.82)
-    assert [summary[k] for k in ("pcs_90", "pcs_99", "pcs_99_9", "pcs_99_99", "pcs_99_999")] == [1, 2, 2, 2, 2]
-    assert summary["variance_explained_by_slide_means"] == 0
-    assert summary["latent_width"] == 2
+def test_covariance_full_spectrum_and_pixel_weighted_slides():
+    rng = np.random.default_rng(19)
+    values = rng.normal(size=(37, 9)) + 1e8
+    slides = np.array(['a']*5 + ['b']*32)
+    pca = covariance_pca(values)
+    summary, spectrum = variance_from_pca(values, slides, pca)
+    expected = np.linalg.eigvalsh(np.cov(values, rowvar=False))[::-1]
+    np.testing.assert_allclose(spectrum.eigenvalue, expected, rtol=1e-12, atol=1e-12)
+    centered = values - values[0]
+    grand = centered.mean(axis=0)
+    between = sum(np.sum(slides == s) * np.sum((centered[slides == s].mean(axis=0)-grand)**2) for s in np.unique(slides))
+    assert summary['variance_explained_by_slide_means'] == pytest.approx(between / np.sum((centered-grand)**2))
+    assert summary['participation_ratio'] == pytest.approx(expected.sum()**2 / np.sum(expected**2))
+    assert len(spectrum) == values.shape[1]
 
 
-@pytest.mark.parametrize("chunk_size", [1, 3, 8])
-def test_pixel_weighted_slide_means_and_large_offset(tmp_path, chunk_size):
-    values = np.array([[0, 2], [2, 0], [4, 1], [8, 3]], dtype=float) + 1e9
-    labels = np.array(["a", "a", "a", "b"])
-    paths = write_inputs(tmp_path, values, labels)
-    summary, spectrum = compute_latent_variance(*paths, chunk_size=chunk_size)
-    mean = values.mean(axis=0)
-    total = np.sum((values - mean) ** 2)
-    between = sum(np.sum(labels == s) * np.sum((values[labels == s].mean(axis=0) - mean) ** 2)
-                  for s in np.unique(labels))
-    assert summary["variance_explained_by_slide_means"] == pytest.approx(between / total)
-    np.testing.assert_allclose(spectrum.eigenvalue, np.linalg.eigvalsh(np.cov(values.T))[::-1], rtol=1e-7)
+def test_constant_and_rank_deficient_latents(tmp_path):
+    values = np.full((10, 13), 1e15)
+    pca = covariance_pca(values)
+    summary, spectrum = variance_from_pca(values, ['a']*10, pca)
+    assert summary['total_variance'] == 0
+    assert summary['pcs_99'] is None
+    assert summary['participation_ratio'] is None
+    assert len(spectrum) == 13
+    assert spectrum.eigenvalue.eq(0).all()
+    plot_explained_variance(spectrum, summary, tmp_path/'constant.png', 20)
+    cache = StageCache(tmp_path/'cache', 'reuse', InferenceProgress())
+    assert fit_pca_umap(values, pca, cache)[1]['skipped'] == 'zero total variance'
+    assert fit_pca_umap(values[:3], None, cache)[1]['skipped'] == 'fewer than four observations'
+    rank_one = np.arange(5.)[:, None] * np.ones((1, 30))
+    pca = covariance_pca(rank_one)
+    assert len(pca['eigenvalues']) == 30
+    assert select_pc_count(pca['eigenvalues'])[0] == 1
 
 
-@pytest.mark.parametrize("constant", [False, True])
-def test_single_slide_and_constant_latents(tmp_path, constant):
-    values = np.full((3, 2), 0.1) if constant else np.arange(6).reshape(3, 2)
-    summary, spectrum = compute_latent_variance(*write_inputs(tmp_path, values, ["a"] * 3))
-    if constant:
-        assert summary["total_variance"] == 0
-        assert summary["participation_ratio"] is None
-        assert summary["pcs_90"] is None
-        assert summary["variance_explained_by_slide_means"] is None
-        assert spectrum.explained_variance_fraction.isna().all()
-    else:
-        assert summary["variance_explained_by_slide_means"] == 0
-        assert summary["participation_ratio"] == pytest.approx(1)
+def test_pc_selection_reaches_99_percent_without_cap():
+    count, fraction = select_pc_count(np.ones(128))
+    assert count == 127 and fraction >= .99
+    # Do not round a value just below the threshold into an acceptable component count.
+    assert select_pc_count(np.array([.99 - 1e-14, .01 + 1e-14]))[0] == 2
+    assert select_pc_count(np.array([99., 1.])) == (1, .99)
 
 
-def test_prefix_and_duplicate_names(tmp_path):
-    paths = write_inputs(tmp_path, np.arange(36).reshape(3, 12), ["a", "b", "b"], extra_rows=2)
-    summary, _ = compute_latent_variance(*paths)
-    assert summary["inference_coverage_fraction"] == 0.6
-    assert summary["is_prefix"]
-    assert summary["n_slides"] == 2
-    assert latent_columns(pq.read_schema(paths[0])) == [f"latent_{i}" for i in range(12)]
+def test_saved_row_selection_preserves_order_and_alignment(tmp_path):
+    path = tmp_path/'source.h5ad'
+    with h5py.File(path, 'w') as h:
+        obs = h.create_group('obs')
+        write_elem(obs, 'batch', np.array(['a','b','a','b'], dtype=object))
+        write_elem(obs, 'Lesion', np.array([True, False, True, True]))
+    c = dict(data=dict(path=str(path), batch_column='batch'), analysis=dict(split='validation', features={'variance':{'enabled':True}}))
+    values = dict(row_ids=np.array([3,1,2]), batches=np.array([1,1,0]), latent=np.arange(6.).reshape(3,2))
+    subset, slides, info = select_sample_rows(values, c, ['a','b'])
+    np.testing.assert_array_equal(subset['row_ids'], [3,2])
+    np.testing.assert_array_equal(subset['latent'], values['latent'][[0,2]])
+    assert info['scope'] == 'lesion' and info['split'] == 'validation'
+    assert slides.tolist() == ['b','a']
+    values['batches'][0] = 0
+    with pytest.raises(ValueError, match='batch identities'):
+        select_sample_rows(values, c, ['a','b'])
+    values['row_ids'][0] = 99
+    with pytest.raises(ValueError, match='outside'):
+        select_sample_rows(values, c, ['a','b'])
 
 
-@pytest.mark.parametrize("problem,match", [
-    ("positions", "row_position"), ("names", "obs_name order"),
-    ("nan", "finite"), ("infinity", "finite"), ("gap", "contiguous latent"),
-    ("null", "null"), ("dtype", "floating-point"),
-])
-def test_invalid_parquet(tmp_path, problem, match):
-    paths = write_inputs(tmp_path, np.arange(6).reshape(3, 2), ["a"] * 3)
-    frame = pd.read_parquet(paths[0])
-    if problem == "positions":
-        frame.loc[1, "row_position"] = 0
-    elif problem == "names":
-        frame.loc[1, "obs_name"] = "wrong"
-    elif problem in ("nan", "infinity"):
-        frame.loc[1, "latent_0"] = np.nan if problem == "nan" else np.inf
-    elif problem == "gap":
-        frame = frame.rename(columns={"latent_1": "latent_2"})
-    elif problem == "null":
-        frame.loc[1, "obs_name"] = None
-    else:
-        frame["latent_0"] = frame.latent_0.astype(int)
-    # Preserve IEEE NaN rather than converting it into an Arrow null.
-    table = pa.table({key: pa.array(frame[key].to_numpy(), from_pandas=(key == "obs_name")) for key in frame})
-    pq.write_table(table, paths[0])
-    with pytest.raises(ValueError, match=match):
-        compute_latent_variance(*paths)
+def test_scanpy_explicit_scores_and_separate_caches(tmp_path, monkeypatch):
+    import scanpy as sc
+    from scipy.sparse import eye
+    values = np.random.default_rng(3).normal(size=(140, 70))
+    progress = InferenceProgress()
+    cache = StageCache(tmp_path, 'reuse', progress)
+    pca = cached_pca(values, cache)
+    calls = []
+    def neighbors(adata, **kwargs):
+        calls.append('neighbors')
+        assert kwargs == dict(n_neighbors=15, use_rep='X_pca', metric='euclidean', random_state=0, knn=True, method='umap')
+        count, _ = select_pc_count(pca['eigenvalues'])
+        assert count > 50 and adata.obsm['X_pca'].shape == (140, count)
+        adata.obsp['distances'] = eye(140, format='csr')
+        adata.obsp['connectivities'] = eye(140, format='csr')
+        adata.uns['neighbors'] = dict(connectivities_key='connectivities', distances_key='distances')
+    def umap(adata, **kwargs):
+        calls.append('umap')
+        assert kwargs == dict(min_dist=.5, spread=1., n_components=2, init_pos='spectral', random_state=0)
+        adata.obsm['X_umap'] = np.ones((140, 2))
+    monkeypatch.setattr(sc.pp, 'neighbors', neighbors)
+    monkeypatch.setattr(sc.tl, 'umap', umap)
+    coordinates, info = fit_pca_umap(values, pca, cache)
+    fit_pca_umap(values, cached_pca(values, cache), cache)
+    assert calls == ['neighbors','umap']
+    assert set(progress.details['cache_hits']) >= {'sample-pca','sample-pca-neighbors','sample-pca-umap'}
+    assert info['achieved_variance'] >= .99
+    assert cached_pca(values + np.eye(140,70), cache)['eigenvalues'][0] != pca['eigenvalues'][0]
 
 
-def test_missing_labels_and_inputs(tmp_path):
-    paths = write_inputs(tmp_path, np.arange(6).reshape(3, 2), ["a", None, "b"])
-    with pytest.raises(ValueError, match="Slide labels"):
-        compute_latent_variance(*paths)
-    with pytest.raises(ValueError, match="missing slide column"):
-        compute_latent_variance(*paths, slide_column="absent")
-    with pytest.raises(FileNotFoundError, match="dann.spatial"):
-        compute_latent_variance(tmp_path / "missing", paths[1])
-
-
-def test_too_few_rows(tmp_path):
-    paths = write_inputs(tmp_path, np.ones((1, 2)), ["a"])
-    with pytest.raises(ValueError, match="At least two"):
-        compute_latent_variance(*paths)
-
-
-@pytest.mark.parametrize("key,value", [("chunk_size", 0), ("chunk_size", True),
-    ("figure_dpi", 1.5), ("slide_column", ""), ("latents", None)])
-def test_config_validation(key, value):
-    with pytest.raises(ValueError, match=f"latent_variance.{key}"):
-        latent_variance_settings({key: value})
-
-
-@pytest.mark.parametrize("constant", [False, True])
-def test_cli_and_legacy_config(tmp_path, constant):
-    values = np.ones((3, 2)) if constant else np.arange(6).reshape(3, 2)
-    paths = write_inputs(tmp_path, values, ["a", "a", "b"])
-    config = read_config(Path("dann/config.yaml"))
-    config.pop("latent_variance")
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.safe_dump(config))
-    assert load_config(config_path)["latent_variance"]["chunk_size"] == 8192
-    output = tmp_path / "results"
-    assert main(["--config", str(config_path), "--latents", str(paths[0]),
-                 "--input", str(paths[1]), "--output-dir", str(output)]) == 0
-    assert {p.name for p in output.iterdir()} == {
-        "explained_variance.png", "latent_variance_summary.csv", "pca_variance.csv"}
-    assert (output / "explained_variance.png").stat().st_size > 1000
-    summary = pd.read_csv(output / "latent_variance_summary.csv")
-    assert summary.latent_width.iloc[0] == 2
-    assert summary.n_observations.iloc[0] == 3
-    if constant:
-        assert pd.isna(summary.participation_ratio.iloc[0])
+def test_legacy_split_keeps_repeated_training_samples(tmp_path):
+    path=tmp_path/'labels.h5ad'
+    with h5py.File(path,'w') as h:
+        obs=h.create_group('obs')
+        write_elem(obs,'batch',np.array(['a','a'],dtype=object))
+        write_elem(obs,'Lesion',np.ones(2,dtype=bool))
+    c=dict(data=dict(path=str(path),batch_column='batch'),analysis=dict(split='train'))
+    sample=dict(row_ids=np.array([1,0,1]),batches=np.zeros(3,dtype=int),latent=np.arange(6.).reshape(3,2))
+    selected,_,_=select_sample_rows(sample,c,['a'])
+    np.testing.assert_array_equal(selected['latent'],sample['latent'])
+    c['analysis']['sample_scope']='lesion'
+    with pytest.raises(ValueError,match='unique'):
+        select_sample_rows(sample,c,['a'])

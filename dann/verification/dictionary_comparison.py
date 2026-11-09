@@ -271,7 +271,7 @@ def downstream(root: Path, arm: str, c: dict, manifest: dict, stage: str) -> dic
     effective['analysis']['output_dir'] = c['analysis']['output_dir']
     effective['spatial'] = dict(output=str(Path(c['analysis']['output_dir'])/'spatial/spatial_predictions.parquet'),
                                latents=str(Path(c['analysis']['output_dir'])/'spatial/spatial_latent.parquet'))
-    effective['latent_variance']['output_dir'] = str(Path(c['analysis']['output_dir'])/'latent_variance')
+    effective['analysis'].setdefault('features', {})['variance'] = {'enabled': True}
     if arm == 'baseline':
         original = checkpoint_config(checkpoint)
         if stage == 'inference':
@@ -313,7 +313,7 @@ def downstream(root: Path, arm: str, c: dict, manifest: dict, stage: str) -> dic
                 link.symlink_to(directory, target_is_directory=True)
             return dict(reused=True, path=str(directory), images=len(report['outputs']))
     effective['post_training'].update(enabled=True, overwrite_inference=True,
-        **{f'run_{s}':s == stage for s in ('analysis','inference','spatial_heatmaps','latent_variance')})
+        **{f'run_{s}':s == stage for s in ('analysis','inference','spatial_heatmaps')})
     outputs = run_post_training_workflow(effective, path)
     if stage == 'inference':
         _validate_exports(effective, checkpoint, path, Path(c['data']['context_path']), predictions=True, latents=True)
@@ -402,7 +402,7 @@ def run_all(root: Path) -> None:
     """Execute isolated stages sequentially, then assemble the comparison report."""
     # Training remains sequential; diagnostics and exports use the selected weights.
     stages = [(a, 'smoke') for a in ('l1','l2')] + [(a, 'train') for a in ('l1','l2')]
-    stages += [(a, s) for a in ARMS for s in ('analysis','inference','spatial_heatmaps','latent_variance','diagnostics')]
+    stages += [(a, s) for a in ARMS for s in ('analysis','inference','spatial_heatmaps','diagnostics')]
     for arm, stage in stages:
         with (root/'logs'/f'{arm}-{stage}.log').open('a') as log:
             print(f'Starting {arm} {stage}', flush=True)
@@ -421,7 +421,7 @@ def main() -> None:
     parser.add_argument('--prepare', action='store_true')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--arm', choices=ARMS)
-    parser.add_argument('--stage', choices=('smoke','train','analysis','inference','spatial_heatmaps','latent_variance','diagnostics'))
+    parser.add_argument('--stage', choices=('smoke','train','analysis','inference','spatial_heatmaps','diagnostics'))
     args = parser.parse_args()
     torch.set_num_threads(4)
     root = args.output.resolve()

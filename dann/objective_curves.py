@@ -45,6 +45,56 @@ def weighted_history(history: pd.DataFrame, config: Mapping[str, Any] | None) ->
     return history
 
 
+def effective_loss_weights(history: pd.DataFrame, key: str, config=None) -> np.ndarray:
+    """Recover activation from saved coefficients or the checkpoint's epoch schedule."""
+    split, component = key.split('_', 1)
+    branch = component.split('_weighted_loss', 1)[0]
+    explicit = f'{split}_{branch}_effective_weight'
+    weights = np.full(len(history), np.nan)
+    if explicit in history:
+        weights = _values(history, explicit).copy()
+    if config is not None:
+        loss = config.get('loss', {})
+        if branch == 'cca':
+            from dann.deep_cca import effective_weight, cca_settings
+            settings = cca_settings(config.get('model', {}).get('heads', {}).get('he', {}))
+            fallback = np.array([effective_weight(float(loss.get('he_weight', 1.)), settings,
+                int(epoch)-1, split == 'train') for epoch in history['epoch']])
+        elif branch.startswith('alignment_'):
+            from dann.batch_alignment import alignment_settings
+            settings = alignment_settings(config)
+            name = branch.removeprefix('alignment_')
+            fallback = float(settings[name]['weight']) if settings[name]['enabled'] else 0.
+        else:
+            name = {'hurdle': 'biology', 'positive': 'biology'}.get(branch, branch)
+            fallback = float(loss.get(name + '_weight', 1.))
+            suffix = component.split('_weighted_loss', 1)[1].lstrip('_')
+            if suffix and suffix in TARGET_ORDER:
+                targets = config.get('data', {}).get('target_columns', [])
+                target_weights = loss.get('target_weights', [1.] * len(targets))
+                for target, weight in zip(targets, target_weights):
+                    if target.lower().removeprefix('density_') == suffix:
+                        fallback *= weight
+        weights = np.where(np.isfinite(weights), weights, fallback)
+    # Unknown historical activation stays visible; never infer it from loss values.
+    return weights
+
+
+def active_weighted_history(history: pd.DataFrame, config=None) -> pd.DataFrame:
+    """Mask only inactive component losses in a plotting copy, leaving scores intact."""
+    result = history.copy()
+    if config is not None:
+        for split in ('train', 'validation'):
+            destination, source = f'{split}_cca_weighted_loss', f'{split}_cca_loss'
+            if destination not in result and source in result:
+                result[destination] = result[source] * effective_loss_weights(result, destination, config)
+    for key in result:
+        if key.startswith(('train_', 'validation_')) and '_weighted_loss' in key:
+            weights = effective_loss_weights(result, key, config)
+            result.loc[weights == 0, key] = np.nan
+    return result
+
+
 # Target colors are stable across figures; branch and adversarial colors differ.
 COLORS = dict(ihc='C0', he='C2', batch='C5', cd8='C0', tumor='C1', collagen='C2',
               stroma='C4', hurdle='#333333', positive='C3', nhsic='C6', anova='C7', soft_nn='C8')
@@ -57,10 +107,11 @@ TARGET_ORDER = ('cd8', 'tumor', 'collagen', 'stroma')
 def plot_loss_curves(history_path: Path, output_path: Path, figure_dpi: int,
                      best_epoch: int | float | None = None, *,
                      config: Mapping[str, Any] | None = None,
-                     selection: Mapping[str, Any] | None = None) -> None:
+                     selection: Mapping[str, Any] | None = None,
+                     overall: bool = True, ihc: bool = True) -> None:
     """Read history once and regenerate both overall and IHC figures."""
     plot_objective_history(pd.read_csv(history_path), output_path, figure_dpi,
-                           best_epoch=best_epoch, config=config, selection=selection)
+                           best_epoch=best_epoch, config=config, selection=selection, overall=overall, ihc=ihc)
 
 
 def _values(history, key):
@@ -107,7 +158,7 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
     from matplotlib.ticker import PercentFormatter
     width, height = figure_size(kind, len(rows))
     figure = plt.figure(figsize=(width, height))
-    grid = figure.add_gridspec(max(len(rows), 1), 4, left=.075, right=.985,
+    grid = figure.add_gridspec(max(len(rows), 1), 4, left=.12, right=.985,
                               bottom=FOOTER_HEIGHT/height, top=1-HEADER_HEIGHT/height,
                               hspace=.65, wspace=.48)
     figure.suptitle(title, y=1-.18/height)
@@ -137,6 +188,9 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
         column = 0
         for panel in panels:
             span = panel.get('span', 1) if panel is not None else 1
+            if panel is not None and panel['kind'] == 'empty':
+                column += span
+                continue
             axis = figure.add_subplot(grid[row_index, column:column+span])
             column += span
             if panel is None:
@@ -212,7 +266,8 @@ def _render_snapshot(history, rows, output_path, dpi, kind, title, best_epoch, m
 def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi: int,
                            best_epoch: int | float | None = None, *,
                            config: Mapping[str, Any] | None = None,
-                           selection: Mapping[str, Any] | None = None) -> None:
+                           selection: Mapping[str, Any] | None = None,
+                     overall: bool = True, ihc: bool = True) -> None:
     """Render both figures from the same immutable snapshot, including old histories.
 
     Used by synchronous training, the asynchronous artifact worker, and analysis.
@@ -220,7 +275,7 @@ def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi:
     wraps the overall destination in an atomic temporary filename.
     """
     from dann.training_artifacts import atomic_output
-    history = weighted_history(history, config)
+    history = active_weighted_history(weighted_history(history, config), config)
     if selection is not None:
         best_epoch = selection.get('best_epoch') if best_epoch is None else best_epoch
         metric = selection.get('selection_metric')
@@ -229,15 +284,18 @@ def plot_objective_history(history: pd.DataFrame, output_path: Path, figure_dpi:
         if best_epoch is None and 'selected_epoch' in history:
             selected = history['selected_epoch'].dropna()
             best_epoch = float(selected.iloc[-1]) if len(selected) else None
-    rows, ihc_rows, overall, alignment = objective_layout(history, config, metric)
+    rows, ihc_rows, components, alignment = objective_layout(history, config, metric)
     output_path = Path(output_path)
-    with atomic_output(output_path.with_name('ihc_curves.png')) as temporary:
-        _render(history, ihc_rows, temporary, figure_dpi, 'ihc',
-                'IHC target fit, weighted objectives, and gradient composition', best_epoch, metric,
-                [*TARGET_ORDER, 'hurdle', 'positive'])
-    _render(history, rows, output_path, figure_dpi, 'loss',
-            'Overall objectives, shared gradients, and latent diversity', best_epoch, metric,
-            [*dict.fromkeys([*overall, *alignment]), 'hurdle', 'positive'])
+    if ihc:
+        with atomic_output(output_path.with_name('ihc_curves.png')) as temporary:
+            _render(history, ihc_rows, temporary, figure_dpi, 'ihc',
+                    'IHC target fit, weighted objectives, and gradient composition', best_epoch, metric,
+                    [*TARGET_ORDER, 'hurdle', 'positive'])
+    if overall:
+        _render(history, rows, output_path, figure_dpi, 'loss',
+                'Overall objectives, shared gradients, and latent diversity', best_epoch, metric,
+                [*dict.fromkeys([*components, *alignment]), 'hurdle', 'positive'])
+
 
 
 def objective_layout(history, config=None, metric=None):
@@ -252,7 +310,7 @@ def objective_layout(history, config=None, metric=None):
     active_alignment = [n for n in alignment if (settings[n]['weight'] > 0 if config is not None
                         else f'train_gradient_overall_{n}_norm_mean' in history)]
     overall = ['ihc', *(['he'] if he else []), *(['batch'] if disc else []), *active_alignment]
-    cca = any('cca_loss' in c for c in history)
+    cca = he and (config.get('model', {}).get('heads', {}).get('he', {}).get('objective') == 'deep_cca' if config is not None else any('cca_loss' in c for c in history))
     gradients = _gradient_panels('gradient_overall', overall, 'Objectives')
     gradients[2]['cmap'] = 'coolwarm'
     rows = [
@@ -305,21 +363,36 @@ def objective_layout(history, config=None, metric=None):
         if name == 'nhsic':
             rows.append([_fit(prefix+'_'+key, f'nHSIC {key.replace("_", " ")}', COLORS[name])
                          for key in ('numerator', 'denominator', 'latent_kernel_norm', 'label_kernel_norm')])
+    def available(panel):
+        if panel is None:
+            return None
+        series = [s for s in panel['series'] if s[0] in history
+                  and (disc or not any(token in s[0] for token in ('batch_', 'grl_strength')))
+                  and (he or not any(token in s[0] for token in ('_he_', '_cca_')))]
+        return dict(panel, series=series, span=1) if series else None
+
+    def spans(panels):
+        widths = {1: [4], 2: [2, 2], 3: [2, 1, 1], 4: [1, 1, 1, 1]}[len(panels)]
+        return [dict(panel, span=width) for panel, width in zip(panels, widths)]
+
     def compact(layout):
-        panels = []
-        for row in layout:
-            for panel in row:
-                if panel is None:
-                    continue
-                series = [s for s in panel['series'] if s[0] in history
-                          and (disc or not any(token in s[0] for token in ('batch_', 'grl_strength')))]
-                if series:
-                    panels.append(dict(panel, series=series, span=1))
-        packed = [panels[i:i+4] for i in range(0, len(panels), 4)]
-        if packed and len(packed[-1]) < 4:
-            # Fill the final row without allocating hidden axes or blank panel slots.
-            spans = {1: [4], 2: [2, 2], 3: [2, 1, 1]}[len(packed[-1])]
-            packed[-1] = [dict(p, span=s) for p, s in zip(packed[-1], spans)]
+        panels = [p for row in layout for panel in row if (p := available(panel)) is not None]
+        return [spans(panels[i:i+4]) for i in range(0, len(panels), 4)]
+
+    def paired(scores, losses):
+        # Each score/loss pair is a single packing unit. Sparse histories retain
+        # their available member without disturbing the columns of other pairs.
+        pairs = [(available(score), available(loss)) for score, loss in zip(scores, losses)]
+        pairs = [(score, loss) for score, loss in pairs if score is not None or loss is not None]
+        packed = []
+        for start in range(0, len(pairs), 4):
+            group = pairs[start:start+4]
+            for member in (0, 1):
+                if any(pair[member] is not None for pair in group):
+                    packed.append(spans([pair[member] or dict(kind='empty', title='', series=[])
+                                         for pair in group]))
         return packed
-    rows, ihc_rows = compact(rows), compact(ihc_rows)
+
+    rows = paired(rows[0], rows[1]) + compact(rows[2:])
+    ihc_rows = paired(ihc_rows[0], ihc_rows[1]) + paired(ihc_rows[2], ihc_rows[3]) + compact(ihc_rows[4:])
     return rows, ihc_rows, overall, alignment

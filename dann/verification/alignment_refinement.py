@@ -47,7 +47,7 @@ STAGES = ('smoke', 'pilot', 'pilot_evaluate', 'train', 'evaluate', 'full_umap')
 def no_exports(config: dict) -> dict:
     """Disable every downstream workflow switch, including in smoke configs."""
     config['post_training'].update(enabled=False, run_analysis=False, run_inference=False,
-        run_spatial_heatmaps=False, run_latent_variance=False, overwrite_inference=False)
+        run_spatial_heatmaps=False, overwrite_inference=False)
     return config
 
 

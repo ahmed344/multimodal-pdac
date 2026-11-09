@@ -28,40 +28,68 @@ def density_sampling_settings(analysis: Mapping[str, Any]) -> tuple[int, int]:
     return count, seed
 
 
-def latent_variance_settings(settings: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Resolve standalone latent-variance defaults and validate their types."""
-    root = "/workspaces/multimodal-pdac/data/PDAC"
-    defaults = {
-        "input": f"{root}/Raw/adata_assembled_tissue.h5ad",
-        "latents": f"{root}/Results/dann/analysis/spatial/spatial_latent.parquet",
-        "output_dir": f"{root}/Results/dann/analysis/latent_variance",
-        "slide_column": "batch",
-        "chunk_size": 8192,
-        "figure_dpi": 300,
-    }
-    if settings is not None and not isinstance(settings, Mapping):
-        raise ValueError("latent_variance must be a mapping.")
-    resolved = {**defaults, **(settings or {})}
-    for key in ("input", "latents", "output_dir", "slide_column"):
-        if key == "input" and resolved[key] is None:
-            continue  # Training configurations need no independent inference input.
-        if not isinstance(resolved[key], str) or not resolved[key].strip():
-            raise ValueError(f"latent_variance.{key} must be a nonempty string.")
-    for key in ("chunk_size", "figure_dpi"):
-        value = resolved[key]
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"latent_variance.{key} must be a positive integer.")
-    return resolved
+# Omitted switches preserve the established analysis outputs. New analyses opt in.
+ANALYSIS_FEATURE_DEFAULTS = {
+    'latent_exports': dict(enabled=True, tables=True),
+    'variance': dict(enabled=False, tables=True, explained_variance=True),
+    'direct_umap': dict(enabled=True, tables=True, batch=True, densities=True,
+                        logit_densities=True, density_means=True, parameters=True,
+                        diagnostics=True, interactive=False),
+    'pca_umap': dict(enabled=False, tables=True, batch=True, densities=True,
+                     logit_densities=True, density_means=True, parameters=True,
+                     diagnostics=True, interactive=False),
+    'prediction_scatter': dict(enabled=True, tables=True, plot=True, interactive=False),
+    'latent_interpretation': dict(enabled=False, tables=True, correlations=True,
+                                  feature_umap=True, ihc_scatter=True),
+    'calibration': dict(enabled=True, tables=True, pit=True, hurdle=True, coverage=True),
+    'density_diagnostics': dict(enabled=True, errors=True, support=True, contrasts=True),
+    'he_metrics': dict(enabled=True, tables=True),
+    'loss_curves': dict(enabled=True, overall=True, ihc=True),
+}
+
+
+def analysis_feature_settings(analysis: Mapping[str, Any]) -> dict[str, dict[str, bool]]:
+    """Validate output families; a disabled family overrides every child switch."""
+    if not isinstance(analysis.get('enabled', True), bool):
+        raise ValueError('analysis.enabled must be boolean.')
+    supplied = analysis.get('features', {})
+    if not isinstance(supplied, Mapping) or supplied.keys() - ANALYSIS_FEATURE_DEFAULTS.keys():
+        raise ValueError('Unknown or invalid analysis.features.')
+    defaults = copy.deepcopy(ANALYSIS_FEATURE_DEFAULTS)
+    if analysis.get('latent_interactive', False):
+        defaults['direct_umap']['interactive'] = True
+        defaults['prediction_scatter']['interactive'] = True
+        defaults['latent_interpretation']['enabled'] = True
+    result = {}
+    for name, default in defaults.items():
+        group = supplied.get(name, {})
+        if not isinstance(group, Mapping) or group.keys() - default.keys():
+            raise ValueError(f'Unknown or invalid analysis.features.{name}.')
+        values = {**default, **group}
+        if any(not isinstance(value, bool) for value in values.values()):
+            raise ValueError(f'analysis.features.{name} switches must be boolean.')
+        enabled = analysis.get('enabled', True) and values['enabled']
+        result[name] = {key: enabled and value for key, value in values.items()}
+        result[name]['enabled'] = enabled and any(v for k, v in values.items() if k != 'enabled')
+    if analysis.get('sample_scope', 'lesion') not in ('lesion', 'split'):
+        raise ValueError('analysis.sample_scope must be lesion or split.')
+    if analysis.get('sample_scope') == 'split' and any(result[n]['enabled'] for n in ('variance', 'pca_umap')):
+        raise ValueError('Variance and PCA UMAP require analysis.sample_scope: lesion.')
+    for key in ('lesion_column', 'slide_column'):
+        if key in analysis and (not isinstance(analysis[key], str) or not analysis[key].strip()):
+            raise ValueError(f'analysis.{key} must be a nonempty string.')
+    return result
 
 
 def post_training_settings(settings: Mapping[str, Any] | None = None) -> dict[str, bool]:
     """Resolve automatic workflow switches, rejecting typos and non-booleans."""
     defaults = dict(enabled=True, run_analysis=True, run_inference=True,
-                    run_spatial_heatmaps=True, run_latent_variance=True,
+                    run_spatial_heatmaps=True,
                     overwrite_inference=True)
     if settings is not None and not isinstance(settings, Mapping):
         raise ValueError("post_training must be a mapping.")
     supplied = dict(settings or {})
+    supplied.pop('run_latent_variance', None)  # Retired checkpoint setting; variance is an analysis feature.
     unknown = supplied.keys() - defaults.keys()
     if unknown:
         raise ValueError(f"Unknown post_training settings: {sorted(unknown)}")
@@ -252,7 +280,8 @@ def load_config(path: Path) -> dict[str, Any]:
     if "post_training" in config and not isinstance(config["post_training"], Mapping):
         raise ValueError("post_training must be a mapping.")
     config["post_training"] = post_training_settings(config.get("post_training"))
-    config["latent_variance"] = latent_variance_settings(config.get("latent_variance"))
+    config.pop("latent_variance", None)  # Accepted, retired spatial-export diagnostic.
+    analysis_feature_settings(config["analysis"])
     config["data"]["cd8_normalization"] = normalization_settings(config["data"].get("cd8_normalization"))
     target_contract(config)
     return resolve_execution(config)
@@ -590,9 +619,7 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
         config["analysis"]["checkpoint"] = str(root / "model" / f"{checkpoint}.pt")
         config["spatial"] = {"output": str(root / "analysis/spatial/spatial_predictions.parquet"),
                              "latents": str(root / "analysis/spatial/spatial_latent.parquet")}
-        config.setdefault("latent_variance", {}).update(
-            input=config["data"].get("context_path"),
-            latents=config["spatial"]["latents"], output_dir=str(root / "analysis/latent_variance"))
+
         result["run_dir"] = str(root)
     return config
 
@@ -705,6 +732,7 @@ def spatial_execution_settings(supplied: Mapping[str, Any] | None = None) -> dic
 
 
 SPATIAL_HEATMAP_DEFAULTS = dict(
+    enabled=True, parameters=True, diagnostics=True,
     regions=["tissue", "lesion"], lesion_column="Lesion", workers=16,
     host_budget_gib=192.0, png_compress_level=1, cmap="turbo",
 )
@@ -717,6 +745,9 @@ def spatial_heatmap_settings(supplied: Mapping[str, Any] | None = None) -> dict[
     settings = {**copy.deepcopy(SPATIAL_HEATMAP_DEFAULTS), **(supplied or {})}
     if set(settings) != set(SPATIAL_HEATMAP_DEFAULTS):
         raise ValueError("Unknown analysis.spatial_heatmaps setting.")
+    for key in ('enabled', 'parameters', 'diagnostics'):
+        if not isinstance(settings[key], bool):
+            raise ValueError(f'analysis.spatial_heatmaps.{key} must be boolean.')
     regions = settings["regions"]
     if (not isinstance(regions, (list, tuple)) or not regions
             or any(region not in ("tissue", "lesion") for region in regions)
@@ -740,7 +771,9 @@ def spatial_heatmap_settings(supplied: Mapping[str, Any] | None = None) -> dict[
 
 
 PEAK_ANALYSIS_DEFAULTS = dict(
-    enabled=False, spatial=True, lesion_column="Lesion", block_rows=4096,
+    enabled=False, spatial=True, tables=True, plots=True, interactive=True,
+    umap=True, similarity=True, correlations=True, prevalence=True,
+    spatial_families=True, spatial_cd8=True, lesion_column="Lesion", block_rows=4096,
     correlation_block_peaks=64, min_observations=20, umap_neighbors=30,
     umap_min_dist=0.30, umap_metric="cosine", umap_random_state=20260719,
     signal_percentile=99.0, slides_per_page=6,  # Accepted legacy field; no pagination.
@@ -756,7 +789,8 @@ def peak_analysis_settings(supplied: Mapping[str, Any] | None = None) -> dict[st
     settings = {**PEAK_ANALYSIS_DEFAULTS, **(supplied or {})}
     if set(settings) != set(PEAK_ANALYSIS_DEFAULTS):
         raise ValueError("Unknown analysis.peaks setting.")
-    for key in ("enabled", "spatial"):
+    for key in ("enabled", "spatial", "tables", "plots", "interactive", "umap", "similarity",
+                "correlations", "prevalence", "spatial_families", "spatial_cd8"):
         if not isinstance(settings[key], bool):
             raise ValueError(f"analysis.peaks.{key} must be boolean.")
     for key in ("block_rows", "correlation_block_peaks", "min_observations", "umap_neighbors",
@@ -780,3 +814,12 @@ def peak_analysis_settings(supplied: Mapping[str, Any] | None = None) -> dict[st
     if not isinstance(settings['lesion_column'], str) or not settings['lesion_column'].strip():
         raise ValueError("analysis.peaks.lesion_column must be nonempty.")
     return settings
+
+
+def peak_analysis_requested(settings: Mapping[str, Any]) -> bool:
+    """Whether any peak output is requested, after family and renderer switches."""
+    return bool(settings['enabled'] and (settings['tables'] or
+        (settings['plots'] or settings['interactive']) and
+        (any(settings[k] for k in ('umap', 'similarity', 'prevalence')) or
+         settings['plots'] and settings['correlations'] or
+         settings['spatial'] and (settings['plots'] and settings['spatial_families'] or settings['spatial_cd8']))))

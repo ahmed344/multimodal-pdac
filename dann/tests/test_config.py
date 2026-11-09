@@ -62,7 +62,7 @@ def test_fragment_edits_control_runtime_and_smoke(linked_config):
     config = load_config(linked_config)
     assert config["training"]["epochs"] == 17
     assert config["analysis"]["max_samples"] == 23
-    assert not config["post_training"]["run_latent_variance"]
+    assert "run_latent_variance" not in config["post_training"]
     smoke = apply_smoke_overrides(config)
     assert smoke["training"]["epochs"] == 2
     assert not smoke["post_training"]["enabled"]

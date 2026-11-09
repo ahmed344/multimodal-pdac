@@ -340,42 +340,56 @@ def queue_peak_plots(queue: Any, output: Path, frame: Any, coordinates: np.ndarr
     per_slide = [dict(label=f'{name}: prevalence (%)', kind='prevalence', cmap=settings['sequential_cmap'], values=prevalence[i]) for i, name in enumerate(slides)]
     x, y = coordinates.T
     for logarithmic, prefix in ((False, 'peak_umap'), (True, 'prevalence_intensity')):
+        if not settings['prevalence' if logarithmic else 'umap']:
+            continue
         if logarithmic:
             x, y = frame.lesion_prevalence_percent.to_numpy(), frame.mean_detected_intensity.to_numpy()
-        for name, panels, columns in (('annotations', variants, 3), ('ihc', associations, 2), ('slides', per_slide, 6)):
-            queue.submit(plot_peak_scatter, x, y, panels, output/f'{prefix}_{name}.png', analysis, count,
-                         logarithmic=logarithmic, columns=columns)
-        queue.canvas_bytes = max(queue.canvas_bytes, 36*5*((len(per_slide)+5)//6)*int(analysis['figure_dpi'])**2*4)
-        queue.submit(plot_interactive_scatter, x, y, frame.mz.to_numpy(), tree['families'],
-                     variants+associations+per_slide, output/f'{prefix}.html', logarithmic=logarithmic)
+        if settings['plots']:
+            for name, panels, columns in (('annotations', variants, 3), ('ihc', associations, 2), ('slides', per_slide, 6)):
+                queue.submit(plot_peak_scatter, x, y, panels, output/f'{prefix}_{name}.png', analysis, count,
+                             logarithmic=logarithmic, columns=columns)
+            queue.canvas_bytes = max(queue.canvas_bytes, 36*5*((len(per_slide)+5)//6)*int(analysis['figure_dpi'])**2*4)
+        if settings['interactive']:
+            queue.submit(plot_interactive_scatter, x, y, frame.mz.to_numpy(), tree['families'],
+                         variants+associations+per_slide, output/f'{prefix}.html', logarithmic=logarithmic)
     annotations = [variants[0], *variants[2:], *associations]
     common = (frame.mz.to_numpy(), tree['families'], annotations)
-    queue.submit(plot_peak_heatmap, weights, tree['order'], *common, output/'embedding_matrix.png', analysis,
-                 title='All peak embeddings', kind='embedding')
-    queue.submit(plot_peak_heatmap, tree['similarity'], tree['order'], *common,
-                 output/'full_similarity.png', analysis, title='All peak-pair cosine similarities', linkage=tree['linkage'])
-    queue.submit(plot_full_similarity, tree['similarity'], tree['order'], frame.mz.to_numpy(), annotations,
-                 tree['linkage'], output/'full_similarity.html')
+    if settings['similarity'] and settings['plots']:
+        queue.submit(plot_peak_heatmap, weights, tree['order'], *common, output/'embedding_matrix.png', analysis,
+                     title='All peak embeddings', kind='embedding')
+    if settings['similarity'] and settings['plots']:
+        queue.submit(plot_peak_heatmap, tree['similarity'], tree['order'], *common,
+                     output/'full_similarity.png', analysis, title='All peak-pair cosine similarities', linkage=tree['linkage'])
+    if settings['similarity'] and settings['interactive']:
+        queue.submit(plot_full_similarity, tree['similarity'], tree['order'], frame.mz.to_numpy(), annotations,
+                     tree['linkage'], output/'full_similarity.html')
     top_count = min(int(analysis['heatmap_top_peaks']), len(frame))
     active = np.argpartition(frame.occurrence_count.to_numpy(), -top_count)[-top_count:]
     top = tree['order'][np.isin(tree['order'], active)]
-    frame.iloc[top][['peak_index', 'mz', 'family', 'occurrence_count']].to_csv(output/'top_similarity_membership.csv', index=False)
-    queue.submit(plot_peak_heatmap, tree['similarity'], top, *common, output/f'top_{top_count}_similarity.png', analysis,
-                 title=f'{top_count} most frequent peaks (all labeled rows)', linkage=tree['linkage'])
-    queue.submit(plot_interactive_heatmap, tree['similarity'], top, frame.mz.to_numpy(), annotations,
-                 output/f'top_{top_count}_similarity.html', f'{top_count} most frequent peaks', linkage=tree['linkage'])
-    queue.submit(plot_peak_heatmap, prevalence.T, tree['order'], *common, output/'batch_prevalence.png', analysis,
-                 title='Peak prevalence by slide (lesion pixels)', kind='prevalence', column_labels=slides.tolist())
+    if settings['tables'] and settings['similarity']:
+        frame.iloc[top][['peak_index', 'mz', 'family', 'occurrence_count']].to_csv(output/'top_similarity_membership.csv', index=False)
+    if settings['similarity'] and settings['plots']:
+        queue.submit(plot_peak_heatmap, tree['similarity'], top, *common, output/f'top_{top_count}_similarity.png', analysis,
+                     title=f'{top_count} most frequent peaks (all labeled rows)', linkage=tree['linkage'])
+    if settings['similarity'] and settings['interactive']:
+        queue.submit(plot_interactive_heatmap, tree['similarity'], top, frame.mz.to_numpy(), annotations,
+                     output/f'top_{top_count}_similarity.html', f'{top_count} most frequent peaks', linkage=tree['linkage'])
+    if settings['similarity'] and settings['plots']:
+        queue.submit(plot_peak_heatmap, prevalence.T, tree['order'], *common, output/'batch_prevalence.png', analysis,
+                     title='Peak prevalence by slide (lesion pixels)', kind='prevalence', column_labels=slides.tolist())
     unique = np.unique(tree['families'])
-    queue.submit(plot_family_summary, family_similarity(tree['similarity'], tree['families']), unique,
-                 output/'family_similarity.png', analysis)
+    if settings['similarity'] and settings['plots']:
+        queue.submit(plot_family_summary, family_similarity(tree['similarity'], tree['families']), unique,
+                     output/'family_similarity.png', analysis)
     for family in unique:
         members = tree['order'][tree['families'][tree['order']] == family]
-        queue.submit(plot_peak_heatmap, tree['similarity'], members, *common,
-                     output/f'family_{family:02d}_similarity.png', analysis,
-                     title=f'Family {family}: all {len(members)} peaks', mz_ticks=True)
-        queue.submit(plot_interactive_heatmap, tree['similarity'], members, frame.mz.to_numpy(), annotations,
-                     output/f'family_{family:02d}_similarity.html', f'Family {family}: all {len(members)} peaks')
+        if settings['similarity'] and settings['plots']:
+            queue.submit(plot_peak_heatmap, tree['similarity'], members, *common,
+                         output/f'family_{family:02d}_similarity.png', analysis,
+                         title=f'Family {family}: all {len(members)} peaks', mz_ticks=True)
+        if settings['similarity'] and settings['interactive']:
+            queue.submit(plot_interactive_heatmap, tree['similarity'], members, frame.mz.to_numpy(), annotations,
+                         output/f'family_{family:02d}_similarity.html', f'Family {family}: all {len(members)} peaks')
 
 
 def plot_family_spatial(slides: list[dict], signal: np.ndarray, detection: np.ndarray, family: int,
@@ -452,6 +466,13 @@ def plot_cd8_family_comparison(slides: list[dict], cd8: np.ndarray, signal: np.n
                                config: Mapping[str, Any]) -> None:
     """Compare observed CD8 and all family signals with shared column scales."""
     from dann.peak_analysis import spatial_grid
+    from dann.config import peak_analysis_settings
+    flags = peak_analysis_settings(config.get('peaks'))
+    if not flags['plots']:
+        if flags['interactive']:
+            from dann.cd8_viewer import write_cd8_viewer
+            write_cd8_viewer(slides, cd8, signal, families, limits, cd8_limit, cd8_label, region, path.with_suffix('.html'))
+        return
     columns = len(families)+1
     scale = min(1., 8000/(4*max(columns, len(slides))*int(config['figure_dpi'])))
     figure, axes = plt.subplots(len(slides), columns, figsize=(4*columns*scale, 4*len(slides)*scale), squeeze=False)
@@ -479,9 +500,13 @@ def plot_cd8_family_comparison(slides: list[dict], cd8: np.ndarray, signal: np.n
         colorbar.ax.tick_params(labelsize=max(2, 10*scale))
         colorbar.set_label('Observed density' if col == 0 else 'Mean signal', size=max(2, 10*scale))
     figure.suptitle(f'Observed CD8 and mean family signal — {region}; common column scales across slides and regions', fontsize=max(3, 18*scale), y=.998)
-    _save(figure, path, config)
-    from dann.cd8_viewer import write_cd8_viewer
-    write_cd8_viewer(slides, cd8, signal, families, limits, cd8_limit, cd8_label, region, path.with_suffix('.html'))
+    if flags['plots']:
+        _save(figure, path, config)
+    else:
+        plt.close(figure)
+    if flags['interactive']:
+        from dann.cd8_viewer import write_cd8_viewer
+        write_cd8_viewer(slides, cd8, signal, families, limits, cd8_limit, cd8_label, region, path.with_suffix('.html'))
 
 
 def queue_cd8_comparisons(queue: Any, output: Path, slides: list[dict], cd8: np.ndarray,

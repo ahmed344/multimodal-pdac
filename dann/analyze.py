@@ -136,7 +136,7 @@ def extract_latent_predictions(
     model: AdversarialLatentFusion,
     loader: torch.utils.data.DataLoader[dict[str, torch.Tensor]],
     device: torch.device,
-    *, he_writer=None,
+    *, he_writer=None, collect_he: bool = True,
 ) -> dict[str, np.ndarray]:
     """Stream latent vectors and ZILN parameters from sparse MSI rows.
 
@@ -165,9 +165,9 @@ def extract_latent_predictions(
     with torch.inference_mode():
         for cpu_batch in loader:
             batch = move_batch_to_device(cpu_batch, device)
-            predictions = model(batch, grl_strength=0.0)
+            predictions = model(batch, grl_strength=0.0, **({'predict_he': False} if not collect_he and he_writer is None else {}))
             from dann.he import analysis_he_statistics
-            for key, value in analysis_he_statistics(predictions, batch).items():
+            for key, value in (analysis_he_statistics(predictions, batch) if collect_he else {}).items():
                 outputs.setdefault(key, []).append(value)
             if he_writer is not None:
                 he_writer.write(cpu_batch['row_ids'].numpy(), predictions['he_prediction'].cpu().numpy())
@@ -346,7 +346,7 @@ def build_latent_umap_frame(
         frame[f"pi_{column}"] = pi[:, index]
         frame[f"mu_{column}"] = mu[:, index]
         frame[f"sigma_{column}"] = sigma[:, index]
-        frame[f"density_mean_{column}"] = extracted["density_mean"][:, index]
+        frame[f"density_mean_{column}"] = extracted.get("density_mean", np.full_like(mu, np.nan))[:, index]
     return frame
 
 
@@ -446,7 +446,7 @@ def build_ziln_scatter_frame(
                     "predicted_mu": mu_positive,
                     "predicted_pi": pi[positive, index],
                     "predicted_sigma": sigma_positive,
-                    "predicted_density_mean": extracted["density_mean"][positive, index],
+                    "predicted_density_mean": extracted.get("density_mean", np.full_like(mu, np.nan))[positive, index],
                 }
             )
         )
@@ -1082,283 +1082,59 @@ def run_analysis(config: Mapping[str, Any], checkpoint_override: Path | None,
                  *, execution_overrides: Mapping[str, Any] | None = None,
                  output_override: Path | None = None, peaks_only: bool = False,
                  peak_spatial_input: Path | None = None) -> Path:
-    """Analyze a checkpoint with optional execution-only and destination overrides."""
-    from dann.config import analysis_execution_settings
+    """Run requested features with shared numerics/exports in either execution mode."""
+    from dann.config import analysis_execution_settings, peak_analysis_settings, peak_analysis_requested
+    from dann.analysis_outputs import analysis_needs, write_loss_artifacts
+    from dann.analysis_execution import load_checkpoint_snapshot
     settings = analysis_execution_settings(config['analysis'].get('execution'))
     if execution_overrides is not None:
         settings = analysis_execution_settings({**settings, **execution_overrides,
             'performance': {**settings['performance'], **execution_overrides.get('performance', {})}})
-    from dann.config import peak_analysis_settings
+    needs = analysis_needs(config['analysis'])
     peaks = peak_analysis_settings(config['analysis'].get('peaks'))
-    if peaks_only:
-        from dann.peak_analysis import run_peak_analysis
-        output = run_peak_analysis(config, checkpoint_override, settings, output_override, peak_spatial_input).parent
-        from dann.artifact_layout import remove_retired_similarity_heatmap
-        remove_retired_similarity_heatmap(output)
-        return output
-    if settings['enabled']:
-        from dann.analysis_execution import run_optimized_analysis
-        output = run_optimized_analysis(config, checkpoint_override, settings, output_override)
+    output = Path(output_override or config['analysis']['output_dir']).resolve()
+    peak_enabled = config['analysis'].get('enabled', True) and peak_analysis_requested(peaks)
+    if not peaks_only and needs['inference']:
+        if settings['enabled']:
+            from dann.analysis_execution import run_optimized_analysis
+            output = run_optimized_analysis(config, checkpoint_override, settings, output_override)
+        else:
+            output = _run_legacy_analysis(config, checkpoint_override, output_override=output_override)
     else:
-        output = _run_legacy_analysis(config, checkpoint_override, output_override=output_override)
-    from dann.artifact_layout import organize_analysis
-    organize_analysis(output)
-    if config['analysis'].get('latent_interactive', False):
-        from dann.latent_analysis import run_latent_analysis
-        run_latent_analysis(config, output)
-    if peaks["enabled"]:
+        output.mkdir(parents=True, exist_ok=True)
+        produced = []
+        if not peaks_only and needs['features']['loss_curves']['enabled']:
+            import tempfile
+            import os
+            checkpoint_path = Path(checkpoint_override or config['analysis'].get('checkpoint') or Path(config['training']['output_dir']) / 'best.pt')
+            checkpoint, _ = load_checkpoint_snapshot(checkpoint_path)
+            with tempfile.TemporaryDirectory(prefix='.curves-', dir=output) as temporary:
+                staged = Path(temporary)
+                write_loss_artifacts(config, checkpoint_path, checkpoint, staged, lambda fn, *args, **kw: fn(*args, **kw))
+                for path in staged.iterdir():
+                    produced.append(path.name)
+                    os.replace(path, output / path.name)
+        (output / 'analysis_execution.json').write_text(json.dumps(dict(artifacts=produced,
+            skipped='no sample analysis requested', inference=False), indent=2))
+    if peak_enabled:
         from dann.peak_analysis import run_peak_analysis
-        run_peak_analysis(config, checkpoint_override, settings, output, peak_spatial_input)
+        destination = run_peak_analysis(config, checkpoint_override, settings, output, peak_spatial_input)
+        report_path = output / 'analysis_execution.json'
+        report = json.loads(report_path.read_text())
+        peak_report = json.loads((destination / 'peak_run.json').read_text())
+        report['artifacts'] += ['peaks/' + p for p in peak_report['artifacts']] + ['peaks/peak_run.json']
+        report_path.write_text(json.dumps(report, indent=2))
     return output
 
 
 def _run_legacy_analysis(config: Mapping[str, Any], checkpoint_override: Path | None,
                          *, output_override: Path | None = None) -> Path:
-    """Run all checkpoint interpretation exports and required visualizations.
-
-    Args:
-        config (Mapping[str, Any]): Effective DANN configuration.
-        checkpoint_override (Path | None): Optional CLI checkpoint path.
-
-    Returns:
-        Path: Analysis output directory.
-    """
-
-    config = _analysis_config(config)
-    seed_everything(int(config["training"]["seed"]))
-    device = resolve_device(str(config["training"]["device"]))
-    configured_checkpoint = config["analysis"].get("checkpoint")
-    checkpoint_path = checkpoint_override or (
-        Path(configured_checkpoint)
-        if configured_checkpoint
-        else Path(config["training"]["output_dir"]) / "best.pt"
-    )
-    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    config = checkpoint_analysis_config(config, checkpoint)
-    if output_override is not None:
-        config['analysis']['output_dir'] = str(output_override)
-    from dann.checkpoints import validate_training_data_contract
-    validate_training_data_contract(checkpoint, config)
-    bundle = create_data_bundle(config, checkpoint.get("split_indices"), checkpoint.get("data_identity"))
-    if tuple(checkpoint["batch_names"]) != bundle.metadata.batch_names:
-        raise ValueError("Analysis batch order differs from checkpoint.")
-    model, checkpoint_epoch = load_model(checkpoint_path, config, bundle, device, checkpoint=checkpoint)
-    split = str(config["analysis"]["split"])
-    print(
-        f"Analyzing checkpoint epoch {checkpoint_epoch} on {device}; "
-        f"extracting {len(bundle.split_indices[split]):,} {split} rows.",
-        flush=True,
-    )
-    mc_samples, mc_seed = density_sampling_settings(config["analysis"])
-    density_rng = np.random.default_rng(mc_seed)
-    from dann.he import extract_with_he
-    output_dir = Path(config["analysis"]["output_dir"])
-    extracted = extract_with_he(model, bundle.loaders[split], device, config, output_dir, split)
-    extracted["target_transform"] = target_contract(config)
-    extracted["density_mean"] = ziln.sampled_density_mean(
-        extracted["pi"], extracted["mu"], extracted["sigma"],
-        num_samples=mc_samples, rng=density_rng,
-    )
-    output_dir = Path(config["analysis"]["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "target_transform.json").write_text(
-        json.dumps(target_contract(config), indent=2), encoding="utf-8"
-    )
-    umap_dir = output_dir / "umap"
-    umap_dir.mkdir(parents=True, exist_ok=True)
-    model_dir = Path(config["training"]["output_dir"])
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    target_columns = list(config["data"]["target_columns"])
-    display_columns = [
-        target_label(column, target_contract(config)) for column in target_columns
-    ]
-    batch_names = bundle.metadata.batch_names
-    print(f"Fitting UMAP for {len(extracted['row_ids']):,} {split} rows.", flush=True)
-    umap_coordinates = fit_latent_umap(extracted["latent"], config["analysis"])
-    print("Writing latent tables and UMAP figures.", flush=True)
-    build_latent_umap_frame(
-        extracted,
-        umap_coordinates,
-        target_columns,
-        batch_names,
-        split,
-    ).to_csv(umap_dir / "latent_umap.csv", index=False, float_format="%.17g")
-    build_latent_embeddings_frame(
-        extracted,
-        batch_names,
-        split,
-    ).to_csv(output_dir / "latent_embeddings.csv", index=False)
-    plot_latent_umap_batch(
-        umap_coordinates,
-        extracted["batches"],
-        batch_names,
-        umap_dir / "latent_umap_batch.png",
-        config["analysis"],
-    )
-    plot_latent_umap_densities(
-        umap_coordinates,
-        extracted["targets"],
-        display_columns,
-        umap_dir / "latent_umap_densities.png",
-        config["analysis"],
-    )
-    logit_epsilon = float(config["loss"]["logit_epsilon"])
-    plot_latent_umap_densities(
-        umap_coordinates,
-        extracted["targets"],
-        display_columns,
-        umap_dir / "latent_umap_densities_logit.png",
-        config["analysis"],
-        logit_epsilon=logit_epsilon,
-    )
-    plot_latent_umap_densities(
-        umap_coordinates, extracted["density_mean"], display_columns,
-        umap_dir / "latent_umap_density_means.png", config["analysis"],
-        logit_epsilon=logit_epsilon, sampled_means=True,
-    )
-    for index, column in enumerate(target_columns):
-        plot_latent_umap_ziln_per_target(
-            umap_coordinates,
-            extracted["targets"][:, index],
-            extracted["pi"][:, index],
-            extracted["mu"][:, index],
-            extracted["sigma"][:, index],
-            extracted["batches"],
-            batch_names,
-            display_columns[index],
-            umap_dir / f"latent_umap_ziln_{column}.png",
-            config["analysis"],
-            logit_epsilon,
-            extracted["density_mean"][:, index],
-        )
-        plot_latent_umap_ziln_diagnostics_per_target(
-            umap_coordinates,
-            extracted["targets"][:, index],
-            extracted["pi"][:, index],
-            extracted["mu"][:, index],
-            extracted["sigma"][:, index],
-            extracted["batches"],
-            batch_names,
-            display_columns[index],
-            umap_dir / f"latent_umap_ziln_diagnostics_{column}.png",
-            config["analysis"],
-            logit_epsilon,
-        )
-    run_calibration(
-        extracted=extracted,
-        target_columns=target_columns,
-        batch_names=batch_names,
-        split=split,
-        output_dir=output_dir / "calibration",
-        config=config["analysis"],
-        epsilon=logit_epsilon,
-    )
-    scatter_split = str(config["analysis"]["ziln_scatter_split"])
-    print(
-        f"Analyzing {len(bundle.split_indices[scatter_split]):,} {scatter_split} "
-        "rows for the prediction scatter and calibration.",
-        flush=True,
-    )
-    scatter_data = (
-        extracted
-        if scatter_split == split
-        else extract_with_he(model, bundle.loaders[scatter_split], device, config, output_dir, scatter_split)
-    )
-    scatter_data["target_transform"] = target_contract(config)
-    if scatter_split != split:
-        scatter_data["density_mean"] = ziln.sampled_density_mean(
-            scatter_data["pi"], scatter_data["mu"], scatter_data["sigma"],
-            num_samples=mc_samples, rng=density_rng,
-        )
-        run_calibration(
-            extracted=scatter_data,
-            target_columns=target_columns,
-            batch_names=batch_names,
-            split=scatter_split,
-            output_dir=output_dir / "calibration" / scatter_split,
-            config=config["analysis"],
-            epsilon=logit_epsilon,
-        )
-    build_ziln_scatter_frame(
-        scatter_data,
-        target_columns,
-        batch_names,
-        scatter_split,
-        logit_epsilon,
-    ).to_csv(output_dir / "ziln_density_scatter.csv", index=False, float_format="%.17g")
-    plot_ziln_density_scatter(
-        scatter_data["mu"],
-        scatter_data["targets"],
-        display_columns,
-        logit_epsilon,
-        output_dir / "ziln_density_scatter.png",
-        config["analysis"],
-    )
-
-    print("Computing peptide families and peak activity.", flush=True)
-    embedding_weights = model.encoder.embedding.weight.detach().cpu().numpy()
-    similarity, families, hierarchy_order = embedding_cosine_families(
-        embedding_weights,
-        int(config["analysis"]["family_count"]),
-        str(config["analysis"]["clustering_linkage"]),
-    )
-    np.save(output_dir / "embedding_cosine_similarity.npy", similarity)
-    activity, intensity_sums = compute_peak_activity(
-        Path(config["data"]["path"]),
-        str(config["data"]["matrix_key"]),
-        bundle.metadata.num_peaks,
-        int(config["analysis"]["activity_chunk_size"]),
-        config["analysis"].get("activity_max_nonzeros"),
-    )
-    # Preserve the exported top-peak membership used by peaks/similarity/.
-    top_count = min(int(config["analysis"]["heatmap_top_peaks"]), activity.size)
-    displayed = np.argpartition(activity, -top_count)[-top_count:]
-    family_table = pd.DataFrame(
-        {
-            "peak_index": np.arange(bundle.metadata.num_peaks),
-            "mz": bundle.metadata.mz_values,
-            "family": families,
-            "occurrence_count": activity,
-            "intensity_sum": intensity_sums,
-            "embedding_norm": np.linalg.norm(embedding_weights, axis=1),
-            "shown_in_heatmap": np.isin(
-                np.arange(bundle.metadata.num_peaks), displayed
-            ),
-        }
-    )
-    family_table.to_csv(output_dir / "peptide_families.csv", index=False)
-    history_path = model_dir / "history.csv"
-    from dann.selection import checkpoint_selection
-    curve_checkpoint = checkpoint
-    best_checkpoint_path = model_dir / "best.pt"
-    if checkpoint_path.resolve() == best_checkpoint_path.resolve():
-        best_epoch = checkpoint_epoch
-    elif best_checkpoint_path.is_file():
-        best_payload = torch.load(
-            best_checkpoint_path, map_location="cpu", weights_only=False
-        )
-        curve_checkpoint = best_payload
-        best_epoch = int(best_payload["epoch"]) + 1
-    else:
-        best_epoch = checkpoint_selection(checkpoint)["best_epoch"]
-    plot_loss_curves(
-        history_path,
-        (output_dir if output_override is not None else model_dir) / "loss_curves.png",
-        int(config["analysis"]["figure_dpi"]),
-        best_epoch=best_epoch,
-        config=curve_checkpoint["config"],
-        selection=checkpoint_selection(curve_checkpoint),
-    )
-    from dann.diagnostics import write_density_diagnostics
-    write_density_diagnostics(extracted, config, output_dir, split)
-    if scatter_split != split:
-        write_density_diagnostics(scatter_data, config, output_dir, scatter_split)
-    for dataset in bundle.datasets.values():
-        dataset.close()
-    from dann.preprocessing import analysis_provenance
-    analysis_provenance(output_dir, config['data'], write=True)
-    return output_dir
+    """Use legacy inference loaders with the same feature planning and rendering."""
+    from dann.config import analysis_execution_settings
+    from dann.analysis_execution import run_optimized_analysis
+    settings = analysis_execution_settings(config['analysis'].get('execution'))
+    settings.update(enabled=False, render_workers=0, sampling_workers=0, feature_cache=False)
+    return run_optimized_analysis(config, checkpoint_override, settings, output_override)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

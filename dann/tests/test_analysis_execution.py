@@ -211,7 +211,7 @@ def test_end_to_end_cache_reuse_and_failure_preserves_outputs(spatial_config, tm
     analyze.run_analysis(config, path, output_override=out)
     assert (out / 'latent.csv').read_bytes() == before
     assert set(json.loads((out / 'analysis_execution.json').read_text())['cache_hits']) == {
-        'extracted-validation', 'density-validation', 'umap', 'peptides', 'activity'
+        'extracted-validation', 'density-validation', 'umap'
     } | ({'extracted-test', 'density-test'} if split == 'test' else set())
     for a, b in zip(*calls):
         np.testing.assert_array_equal(a, b)
@@ -284,7 +284,7 @@ def test_legacy_dispatch_and_cli_overrides(monkeypatch, tmp_path):
     from dann import analysis_execution
     monkeypatch.setattr(analyze, '_run_legacy_analysis', lambda *args, **kwargs: 'legacy')
     for section in ({}, {'execution': None}, {'execution': {'enabled': False}}):
-        assert analyze.run_analysis({'analysis': section}, None) == 'legacy'
+        assert analyze.run_analysis({'analysis': dict(section, output_dir=str(tmp_path))}, None) == 'legacy'
     seen = []
     monkeypatch.setattr(analysis_execution, 'run_optimized_analysis',
                         lambda config, checkpoint, settings, output: seen.append((settings, output)))

@@ -315,10 +315,10 @@ class TrainingArtifacts:
                      payload: Mapping[str, Any] | None = None, destinations: Sequence[str] = (),
                      summary: str | None = None) -> None:
         """Keep complete history but replace pending plots and superseded saves."""
-        from dann.objective_curves import objective_layout, weighted_history
+        from dann.objective_curves import objective_layout, weighted_history, active_weighted_history
         from dann.curve_layout import render_reservation_bytes
         import pandas as pd
-        layout = objective_layout(weighted_history(pd.DataFrame(rows), self.config), self.config,
+        layout = objective_layout(active_weighted_history(weighted_history(pd.DataFrame(rows), self.config), self.config), self.config,
                                   selection.get('selection_metric'))
         actual_reserve = render_reservation_bytes(int(self.config['analysis']['figure_dpi']),
                                                  {'loss': len(layout[0]), 'ihc': len(layout[1])})

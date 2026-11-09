@@ -186,7 +186,7 @@ def test_pipeline_cache_exports_and_failure_cleanup(spatial_config, tmp_path, mo
     assert len(table) == 156
     assert not table.filter(like='mean_signal').iloc[0].any()
     original = (peak_file(out, 'peak_embeddings.csv')).read_bytes()
-    # A successful rerun removes obsolete owned plots but preserves unrelated files.
+    # A rerun preserves disabled/stale files; the new manifest lists only current outputs.
     (out/'old_owned.png').write_text('previous artifact')
     (out/'user_note.txt').write_text('preserve')
     report['artifacts'].append('old_owned.png')
@@ -198,7 +198,8 @@ def test_pipeline_cache_exports_and_failure_cleanup(spatial_config, tmp_path, mo
     config['analysis']['heatmap_top_peaks'] = 3
     run_peak_analysis(config, saved, execution, tmp_path/'out')
     assert (peak_file(out, 'peak_embeddings.csv')).read_bytes() == original
-    assert not (out/'old_owned.png').exists()
+    assert (out/'old_owned.png').read_text() == 'previous artifact'
+    assert 'old_owned.png' not in json.loads((out/'peak_run.json').read_text())['artifacts']
     assert (out/'user_note.txt').read_text() == 'preserve'
     report = json.loads((out/'peak_run.json').read_text())
     assert set(report['cache_hits']) == {'peak-hierarchy', 'peak-statistics', 'peak-correlations', 'peak-umap', 'peak-spatial', 'family-correlations'}
@@ -465,3 +466,18 @@ def test_artifact_organization_and_safe_manifest_cleanup(tmp_path):
     remove_owned(tmp_path, {'umap/parameters/latent_umap_ziln_Density_CD8.png', '../outside.txt'})
     assert outside.exists() and (tmp_path/'notes.txt').exists()
     assert not (tmp_path/'umap/parameters').exists()
+
+
+def test_peak_viewer_without_csv_or_static_plots(spatial_config, tmp_path, monkeypatch):
+    from dann import peak_analysis as peaks
+    import umap
+    config = peak_fixture(spatial_config)
+    config['analysis']['peaks'].update(tables=False, plots=False, interactive=True,
+        umap=True, spatial=False, similarity=False, correlations=False, prevalence=False)
+    path = checkpoint(config,tmp_path)
+    monkeypatch.setattr(umap.UMAP, 'fit_transform', lambda self, x: x[:, :2])
+    monkeypatch.setattr(peaks, 'family_correlations', lambda *a,**kw: pytest.fail('unused family correlations'))
+    output=run_peak_analysis(config,path,analysis_execution_settings({'render_workers':0}),tmp_path/'viewer')
+    assert (output/'umap/peak_umap.html').is_file()
+    assert not list(output.rglob('*.csv'))
+    assert not list(output.rglob('*.png'))

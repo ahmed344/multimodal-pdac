@@ -38,10 +38,11 @@ def test_retained_cohort_complete_workflow(tmp_path):
     config['analysis'].update(max_samples=24, figure_dpi=20, density_mc_samples=4, num_workers=0,
                               batch_size=64, umap_neighbors=3, heatmap_top_peaks=4, family_count=2)
     config['analysis']['peaks'].update(enabled=True, spatial=True, min_observations=2, umap_neighbors=3)
-    config['analysis']['execution'].update(render_workers=0, sampling_workers=0)
+    config['analysis']['execution'].update(render_workers=0, sampling_workers=0, feature_cache=False)
     config['analysis']['execution']['performance'].update(ram_cache=False, preparation_workers=0)
-    config['analysis']['spatial_heatmaps']['workers'] = 1
-    config['analysis']['spatial_execution']['density_workers'] = 1
+    config['analysis']['spatial_heatmaps'].update(workers=1, enabled=True)
+    config['post_training'].update(run_inference=True, run_spatial_heatmaps=True)
+    config['analysis']['spatial_execution'].update(density_workers=1, feature_cache=False)
     path.write_text(yaml.safe_dump(config))
     config = load_config(path)
     checkpoint = train_model(config)
@@ -68,7 +69,7 @@ def test_retained_cohort_complete_workflow(tmp_path):
     assert set(spatial['batch']) == {'b', 'd'}
     latent = pd.read_csv(analysis_file(outputs['analysis'], 'latent_embeddings.csv'))
     assert set(latent['batch']) == {'b', 'd'}
-    summary = pd.read_csv(outputs['latent_variance'] / 'latent_variance_summary.csv')
+    summary = pd.read_csv((outputs['analysis'] / 'latent_variance') / 'latent_variance_summary.csv')
     assert summary.n_slides.tolist() == [2]
     assert (outputs['analysis'] / 'preprocessing.json').is_file()
     # Reject incompatible measured-peak input even when dimensions/names match.

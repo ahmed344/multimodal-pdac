@@ -529,6 +529,7 @@ def run_spatial_heatmaps(
     host_budget_gib: float = 192.0,
     png_compress_level: int = 1,
     cmap: str = "turbo",
+    enabled: bool = True, parameters: bool = True, diagnostics: bool = True,
 ) -> Path:
     """Load only plotting inputs and write tissue/lesion figures in parallel.
 
@@ -540,6 +541,7 @@ def run_spatial_heatmaps(
     return run_heatmaps(
         Path(input_path), Path(predictions_path), Path(output_dir), densities,
         logit_epsilon, dpi, batch_column, dict(
+            enabled=enabled, parameters=parameters, diagnostics=diagnostics,
             regions=list(regions), lesion_column=lesion_column, workers=workers,
             host_budget_gib=host_budget_gib, png_compress_level=png_compress_level, cmap=cmap,
         ),
@@ -561,8 +563,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     from dann.config import load_config, spatial_heatmap_settings
     config = load_config(args.config)
     settings = spatial_heatmap_settings(config["analysis"].get("spatial_heatmaps"))
+    if not config['analysis'].get('enabled', True) or not settings['enabled']:
+        return 0
     for key in settings:
-        value = getattr(args, key)
+        value = getattr(args, key, None)
         if value is not None:
             settings[key] = value
     settings = spatial_heatmap_settings(settings)

@@ -281,10 +281,8 @@ def test_optimized_analysis_cache_retains_mse_and_exports_on_request(he_config, 
     c['analysis'].update(split='validation', ziln_scatter_split='validation',
                          execution={'enabled': True, 'render_workers': 0})
     path = checkpoint(c, tmp_path)
-    monkeypatch.setattr(analyze, 'fit_latent_umap', lambda latent, config: latent[:, :2].copy())
-    def artifacts(*args, **kwargs):
-        (args[9] / 'complete.json').write_text('{}')
-    monkeypatch.setattr(analysis_execution, 'write_artifacts', artifacts)
+    from dann.config import ANALYSIS_FEATURE_DEFAULTS
+    c['analysis']['features'] = {name: {'enabled': name == 'he_metrics'} for name in ANALYSIS_FEATURE_DEFAULTS}
     output = tmp_path/'analysis'
     for repeat in range(2):
         analyze.run_analysis(c, path, output_override=output)
@@ -307,3 +305,19 @@ def test_he_memory_estimate_tracks_optional_outputs(he_config):
     no = preflight(Path(c['data']['path']), c, 100, performance, predict_he=False)
     assert yes['he_staging_bytes'] == 100 * 7 * 4
     assert no['he_staging_bytes'] == 0
+
+
+def test_disabled_he_analysis_skips_head_statistics_and_reports(he_config, tmp_path, monkeypatch):
+    from dann.config import ANALYSIS_FEATURE_DEFAULTS
+    from dann import he
+    c=he_config
+    c['analysis']['features']={name:{'enabled':name=='latent_exports'} for name in ANALYSIS_FEATURE_DEFAULTS}
+    bundle=create_data_bundle(c)
+    model=AdversarialLatentFusion.from_config(c,2,4).eval()
+    monkeypatch.setattr(model.he_predictor,'forward',lambda *a,**kw:pytest.fail('disabled H&E head'))
+    monkeypatch.setattr(he,'analysis_he_statistics',lambda *a,**kw:pytest.fail('disabled statistics'))
+    with torch.inference_mode():
+        result=extract_with_he(model,bundle.loaders['validation'],torch.device('cpu'),c,tmp_path,'validation')
+    assert not any(k.startswith('he_') for k in result)
+    assert not (tmp_path/'he').exists()
+    for dataset in bundle.datasets.values(): dataset.close()

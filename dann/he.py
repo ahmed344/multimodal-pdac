@@ -249,7 +249,7 @@ def report_he(extracted: Mapping, directory: Path, split: str, weight: float) ->
         statistics = SlideCovariance(extracted['cca_msi'].shape[1])
         for start in range(0, len(extracted['cca_msi']), 8192):
             take = slice(start, start + 8192)
-            statistics.update(*(torch.as_tensor(extracted[k][take]) for k in ('cca_msi', 'cca_he', 'batches')))
+            statistics.update(*(torch.tensor(extracted[k][take]) for k in ('cca_msi', 'cca_he', 'batches')))
         summary = CCASummary(weight)
         summary.add(statistics.finish())
         metrics = summary.finish(strict=False)
@@ -271,8 +271,8 @@ def report_he(extracted: Mapping, directory: Path, split: str, weight: float) ->
 
 
 def extract_with_he(model, loader, device, config: Mapping, directory: Path,
-                    split: str, extractor=None) -> dict:
-    """Run bounded extraction with optional H&E streaming and unconditional metrics."""
+                    split: str, extractor=None, *, report_metrics: bool = True) -> dict:
+    """Run bounded extraction with optional H&E streaming and requested metrics."""
     from contextlib import nullcontext
     from dann.analyze import extract_latent_predictions
     writer = nullcontext(None)
@@ -281,8 +281,12 @@ def extract_with_he(model, loader, device, config: Mapping, directory: Path,
     if config['analysis'].get('export_he_predictions', False) and getattr(model, 'he_output_dim', 0):
         writer = HEWriter(Path(directory) / 'he' / f'{split}_predictions.parquet',
                           Path(config['data']['path']), model.he_output_dim, loader.dataset.indices)
+    from dann.config import analysis_feature_settings
+    collect_he = analysis_feature_settings(config['analysis'])['he_metrics']['enabled']
     with writer as stream:
         values = (extractor or extract_latent_predictions)(model, loader, device,
-                                                               **({"he_writer": stream} if stream is not None else {}))
-    report_he(values, directory, split, config['loss'].get('he_weight', 1.0))
+                                                               **({"he_writer": stream} if stream is not None else {}),
+                                                               **({"collect_he": False} if not collect_he else {}))
+    if report_metrics and collect_he:
+        report_he(values, directory, split, config['loss'].get('he_weight', 1.0))
     return values

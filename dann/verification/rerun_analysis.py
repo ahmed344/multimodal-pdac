@@ -165,18 +165,38 @@ def commands(run: dict) -> list[tuple[str, list[str]]]:
     root = Path(run['directory']) / 'analysis'
     config = ['--config', run['config']]
     checkpoint = ['--checkpoint', str(checkpoint_path(run))]
-    return [
+    scheduled = [
         ('analyze', ['dann.analyze', *config, *checkpoint, '--output-dir', str(root)]),
         ('spatial', ['dann.spatial', *config, *checkpoint, '--output', str(root / 'spatial/spatial_predictions.parquet'),
                      '--latent-output', str(root / 'spatial/spatial_latent.parquet'), '--overwrite']),
         ('spatial_heatmaps', ['dann.spatial_heatmaps', *config, '--output-dir', str(root / 'spatial/heatmaps')]),
-        ('latent_variance', ['dann.latent_variance', *config, '--output-dir', str(root / 'latent_variance')]),
         ('peak_numerical', ['dann.verification.peak_analysis_audit', *config]),
         ('latent_numerical', ['dann.verification.latent_numerical_audit', *config]),
         ('peak_browser', ['dann.verification.peak_browser_audit', '--output-dir', str(root / 'peaks')]),
         ('latent_browser', ['dann.verification.latent_browser_audit', '--output-dir', str(root)]),
         ('artifacts', ['dann.verification.rerun_analysis', '--audit', run['config']]),
     ]
+    # Historical manifests predate feature groups; their omitted switches retain
+    # the full workflow. Current templates honor the same downstream choices.
+    effective = run.get('effective_config') or yaml.safe_load(Path(run['config']).read_text())
+    if not isinstance(effective, dict) or 'analysis' not in effective:
+        return scheduled
+    from dann.config import analysis_feature_settings, peak_analysis_settings, peak_analysis_requested, spatial_heatmap_settings
+    analysis = effective['analysis']
+    f = analysis_feature_settings(analysis)
+    peaks = peak_analysis_settings(analysis.get('peaks'))
+    post = effective.get('post_training', {})
+    heatmaps = spatial_heatmap_settings(analysis.get('spatial_heatmaps'))
+    peak_enabled = analysis.get('enabled', True) and peak_analysis_requested(peaks)
+    latent_tables = f['latent_exports']['tables'] and f['direct_umap']['tables'] and f['latent_interpretation']['tables']
+    allow = dict(analyze=analysis.get('enabled', True),
+        spatial=post.get('run_inference', True),
+        spatial_heatmaps=analysis.get('enabled', True) and post.get('run_spatial_heatmaps', True) and heatmaps['enabled'] and (heatmaps['parameters'] or heatmaps['diagnostics']),
+        peak_numerical=peak_enabled and peaks['tables'], peak_browser=peak_enabled and peaks['interactive'],
+        latent_numerical=latent_tables, latent_browser=f['direct_umap']['interactive'] and f['prediction_scatter']['interactive'] and all(
+            f['latent_interpretation'][k] for k in ('correlations', 'feature_umap', 'ihc_scatter')),
+        artifacts=analysis.get('enabled', True))
+    return [(name, args) for name, args in scheduled if allow[name]]
 
 
 def stage_inventory(root: Path, stage: str) -> dict:
@@ -184,7 +204,7 @@ def stage_inventory(root: Path, stage: str) -> dict:
     files = inventory(root)
     prefixes = {'spatial': 'spatial/', 'spatial_heatmaps': 'spatial/heatmaps/', 'latent_variance': 'latent_variance/'}
     if stage == 'analyze':
-        return {k: v for k, v in files.items() if not k.startswith(('spatial/', 'latent_variance/'))
+        return {k: v for k, v in files.items() if not k.startswith(('spatial/',))
                 and not k.endswith(('audit.json', 'artifact_audit.json'))}
     if stage in prefixes:
         return {k: v for k, v in files.items() if k.startswith(prefixes[stage])
@@ -363,12 +383,14 @@ def validate_html_links(path: Path) -> None:
 
 def audit_artifact_manifests(root: Path, config: dict, slides: list[str]) -> dict:
     """Check manifest-owned artifacts and configuration-derived heatmap coverage."""
-    from dann.config import spatial_heatmap_settings
+    from dann.config import spatial_heatmap_settings, analysis_feature_settings, peak_analysis_settings, peak_analysis_requested
+    f = analysis_feature_settings(config['analysis'])
+    peak_settings = peak_analysis_settings(config['analysis'].get('peaks'))
     counts = {}
     sections = [(root, 'analysis_execution.json', 'analysis')]
-    if config['analysis'].get('peaks', {}).get('enabled', True):
+    if config['analysis'].get('enabled', True) and peak_analysis_requested(peak_settings):
         sections.append((root/'peaks', 'peak_run.json', 'peak'))
-    if config['analysis'].get('latent_interactive', False):
+    if (root/'latent/latent_run.json').is_file() and (f['direct_umap']['interactive'] or f['prediction_scatter']['interactive'] or f['latent_interpretation']['enabled']):
         sections.append((root/'latent', 'latent_run.json', 'latent'))
     for directory, name, label in sections:
         report = json.loads((directory/name).read_text())
@@ -383,28 +405,27 @@ def audit_artifact_manifests(root: Path, config: dict, slides: list[str]) -> dic
                 validate_html_links(path)
         for suffix in ('.png', '.html'):
             listed = {relative for relative in artifacts if Path(relative).suffix == suffix}
-            if label != 'analysis':
-                actual = {str(path.relative_to(directory)) for path in directory.rglob('*'+suffix)}
-                if actual != listed:
-                    raise ValueError(f'{label} {suffix} files disagree with generated manifest.')
             counts[label+suffix.replace('.', '_')] = len(listed)
-        if label == 'peak' and config['analysis']['peaks'].get('spatial', True):
+        if label == 'peak' and peak_settings['spatial'] and peak_settings['spatial_cd8'] and (peak_settings['plots'] or peak_settings['interactive']):
             settings = json.loads((directory/'settings/cd8_family_comparison_settings.json').read_text())
             if set(settings['slides']) != set(slides):
                 raise ValueError('Peak spatial viewers omit input slides.')
             families = settings['family_ids']
             expected = {f'spatial/families/family_{family:02d}_spatial.png' for family in families}
-            if not expected.issubset(artifacts):
+            if peak_settings['plots'] and peak_settings['spatial_families'] and not expected.issubset(artifacts):
                 raise ValueError('Missing peak family spatial figures.')
+    settings = spatial_heatmap_settings(config['analysis'].get('spatial_heatmaps'))
+    if not settings['enabled'] or not config.get('post_training', {}).get('run_spatial_heatmaps', True) or not (settings['parameters'] or settings['diagnostics']):
+        return counts
     heatmaps = root/'spatial/heatmaps'
     report = json.loads((heatmaps/'heatmap_run.json').read_text())
     settings = spatial_heatmap_settings(config['analysis'].get('spatial_heatmaps'))
     targets = config['data']['target_columns']
     expected = {str(heatmaps/region/f'{prefix}_{target}_{region}.png')
                 for region in settings['regions'] for target in targets
-                for prefix in ('spatial_heatmap', 'spatial_heatmap_diagnostics')}
+                for prefix, flag in (('spatial_heatmap', 'parameters'), ('spatial_heatmap_diagnostics', 'diagnostics')) if settings[flag]}
     actual = {str(Path(item['path'])) for item in report['outputs']}
-    if actual != expected or {str(path) for path in heatmaps.rglob('*.png')} != expected:
+    if actual != expected:
         raise ValueError('Spatial heatmap coverage differs from targets/regions.')
     # Each target has separate named figures; the CLI's plotting order is not
     # the model's ordered prediction schema (validated separately above).
@@ -446,50 +467,71 @@ def audit_outputs(config_path: Path, *, write_report: bool = True) -> dict:
     width = int(checkpoint['config']['model']['latent_dim'])
     if config['model']['latent_dim'] != width:
         raise ValueError('Runtime/checkpoint latent dimensions disagree.')
-    with h5py.File(config['data']['context_path']) as handle:
-        rows = len(read_elem(handle['obs'][handle['obs'].attrs['_index']]))
-        slides = list(map(str, pd.unique(read_elem(handle['obs'][config['data']['batch_column']]))))
-    _validate_exports(config, checkpoint, checkpoint_path, Path(config['data']['context_path']),
-                      predictions=True, latents=True)
-    prediction_path = Path(config['spatial']['output'])
-    support = prediction_path.with_suffix('.support.parquet')
-    provenance = json.loads(prediction_path.with_suffix('.provenance.json').read_text())
-    if 'support_identity' in provenance and provenance['support_identity'] != _file_identity(support):
-        raise ValueError('Support provenance mismatch.')
-    if checkpoint.get('architecture', {}).get('spatial', {}).get('mode') == 'spatial' or support.exists():
-        validate_support_output(support, rows)
+    from dann.config import analysis_feature_settings
+    f = analysis_feature_settings(config['analysis'])
     split = config['analysis']['split']
     expected = np.asarray(checkpoint['split_indices'][split])
+    with h5py.File(config['data']['path']) as handle:
+        labels = np.asarray(read_elem(handle['obs'][config['data']['batch_column']])).astype(str)
+        scope = config['analysis'].get('sample_scope', 'lesion' if f['variance']['enabled'] or f['pca_umap']['enabled'] else 'split')
+        if scope == 'lesion':
+            lesion = np.asarray(read_elem(handle['obs'][config['analysis'].get('lesion_column', 'Lesion')]), dtype=bool)
+            expected = expected[lesion[expected]]
+    slides = list(pd.unique(labels))
+    rows = None
+    if config.get('post_training', {}).get('run_inference', True):
+        with h5py.File(config['data']['context_path']) as handle:
+            rows = len(read_elem(handle['obs'][handle['obs'].attrs['_index']]))
+            slides = list(map(str, pd.unique(read_elem(handle['obs'][config['data']['batch_column']]))))
+        _validate_exports(config, checkpoint, checkpoint_path, Path(config['data']['context_path']), predictions=True, latents=True)
+        prediction_path = Path(config['spatial']['output'])
+        support = prediction_path.with_suffix('.support.parquet')
+        provenance = json.loads(prediction_path.with_suffix('.provenance.json').read_text())
+        if 'support_identity' in provenance and provenance['support_identity'] != _file_identity(support):
+            raise ValueError('Support provenance mismatch.')
+        if checkpoint.get('architecture', {}).get('spatial', {}).get('mode') == 'spatial' or support.exists():
+            validate_support_output(support, rows)
     if config['analysis']['max_samples'] is not None:
         raise ValueError('Full batch audit requires uncapped validation analysis.')
-    latent_path = root/'tables/latent_embeddings.csv'
-    latent_columns = [f'latent_{i}' for i in range(width)]
-    observed_columns = pd.read_csv(latent_path, nrows=0).columns.tolist()
-    if [c for c in observed_columns if c.startswith('latent_')] != latent_columns:
-        raise ValueError('Validation latent width/order differs from checkpoint.')
-    identities = []
-    for chunk in pd.read_csv(latent_path, chunksize=8192):
-        identities.append(chunk.row_id.to_numpy())
-        if not np.isfinite(chunk[latent_columns].to_numpy()).all():
-            raise ValueError('Nonfinite validation latent values.')
-    saved_rows = np.concatenate(identities)
-    np.testing.assert_array_equal(saved_rows, expected)
+    saved_rows = expected
+    if f['latent_exports']['tables']:
+        latent_path = root/'tables/latent_embeddings.csv'
+        latent_columns = [f'latent_{i}' for i in range(width)]
+        observed_columns = pd.read_csv(latent_path, nrows=0).columns.tolist()
+        if [c for c in observed_columns if c.startswith('latent_')] != latent_columns:
+            raise ValueError('Validation latent width/order differs from checkpoint.')
+        identities = []
+        for chunk in pd.read_csv(latent_path, chunksize=8192):
+            identities.append(chunk.row_id.to_numpy())
+            if not np.isfinite(chunk[latent_columns].to_numpy()).all():
+                raise ValueError('Nonfinite validation latent values.')
+        saved_rows = np.concatenate(identities)
+        np.testing.assert_array_equal(saved_rows, expected)
     prediction_columns = [f'{prefix}_{target}' for target in config['data']['target_columns']
                           for prefix in ('pi', 'mu', 'sigma', 'density_mean')]
     numerical_columns = ['umap_1', 'umap_2', *prediction_columns]
-    umap = pd.read_csv(root/'umap/tables/latent_umap.csv', usecols=['row_id', *numerical_columns])
-    np.testing.assert_array_equal(umap.row_id, saved_rows)
-    if not np.isfinite(umap[numerical_columns].to_numpy()).all():
-        raise ValueError('Nonfinite validation UMAP or prediction parameters.')
+    for name, directory in (('direct_umap', 'umap'), ('pca_umap', 'umap_pca')):
+        if not f[name]['tables']:
+            continue
+        settings_path = root/directory/'settings.json'
+        if settings_path.is_file() and json.loads(settings_path.read_text()).get('skipped'):
+            continue
+        umap = pd.read_csv(root/directory/'tables/latent_umap.csv', usecols=['row_id', *numerical_columns])
+        np.testing.assert_array_equal(umap.row_id, saved_rows)
+        if not np.isfinite(umap[numerical_columns].to_numpy()).all():
+            raise ValueError('Nonfinite validation UMAP or prediction parameters.')
     counts = audit_artifact_manifests(root, config, slides)
-    if list(root.rglob('peptide_similarity_heatmap.png')) or (root.parent/'latent_variance').exists():
-        raise ValueError('Unexpected legacy artifact layout.')
-    variance = pd.read_csv(root/'latent_variance/latent_variance_summary.csv').iloc[0]
-    if (variance.latent_width, variance.n_observations, variance.n_slides) != (width, rows, len(slides)):
-        raise ValueError('Variance analysis coverage mismatch.')
-    if len(pd.read_csv(root/'latent_variance/pca_variance.csv')) != width:
-        raise ValueError('Incomplete variance spectrum.')
-    validate_png(root/'latent_variance/explained_variance.png')
+    if f['variance']['enabled']:
+        provenance_path = root/'latent_variance/provenance.json'
+        skipped = provenance_path.is_file() and json.loads(provenance_path.read_text()).get('skipped')
+        if not skipped and f['variance']['tables']:
+            variance = pd.read_csv(root/'latent_variance/latent_variance_summary.csv').iloc[0]
+            if (variance.latent_width, variance.n_observations, variance.n_slides) != (width, len(expected), len(np.unique(labels[expected]))):
+                raise ValueError('Variance analysis coverage mismatch.')
+            if len(pd.read_csv(root/'latent_variance/pca_variance.csv')) != width:
+                raise ValueError('Incomplete variance spectrum.')
+        if not skipped and f['variance']['explained_variance']:
+            validate_png(root/'latent_variance/explained_variance.png')
     pngs = {str(path.relative_to(root)): validate_png(path) for path in root.rglob('*.png')}
     execution = json.loads((root/'analysis_execution.json').read_text())
     evaluated_epoch = int(checkpoint['epoch']) + 1

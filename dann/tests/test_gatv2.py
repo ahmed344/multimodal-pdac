@@ -194,7 +194,6 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     from dann.train import train_model
     from dann.analyze import run_analysis
     from dann.spatial import run_inference
-    from dann.latent_variance import main as variance_main
     from dann.spatial_heatmaps import run_spatial_heatmaps
     c = spatial_config
     import anndata as ad
@@ -211,7 +210,10 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     c['model']['latent_dim'] = 256  # Production export contract.
     c['training'].update(epochs=1, checkpoint_every=1)
     c['analysis'].update(figure_dpi=20, umap_neighbors=3, heatmap_top_peaks=5, family_count=2)
-    c['latent_variance']['figure_dpi'] = 20
+    c['analysis']['features'] = {'variance': {'enabled': True}}
+    labels = ad.read_h5ad(c['data']['path'])
+    labels.obs['Lesion'] = True
+    labels.write_h5ad(c['data']['path'])
     resolve_execution(c)
     path = train_model(c)
     payload = torch.load(path, weights_only=False)
@@ -240,8 +242,7 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     assert np.isfinite(prediction_frame.select_dtypes('number')).all().all()
     config_path = tmp_path/'consumer.yaml'
     config_path.write_text(yaml.safe_dump(c))
-    assert variance_main(['--config', str(config_path)]) == 0
-    assert (Path(c['latent_variance']['output_dir'])/'explained_variance.png').is_file()
+    assert (analysis_dir/'latent_variance/explained_variance.png').is_file()
     heatmaps = run_spatial_heatmaps(input_path, predictions, tmp_path/'heatmaps',
                                    c['data']['target_columns'], c['loss']['logit_epsilon'], 20, workers=1)
     assert len(list(heatmaps.rglob('*.png'))) == 16

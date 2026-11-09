@@ -32,6 +32,8 @@ def run(tmp_path):
     config['model'].update(num_peaks=2, latent_dim=2)
     config['training']['device'] = 'cpu'
     resolve_execution(config)
+    config['post_training'] = post_training_settings()
+    config['analysis']['spatial_heatmaps'].update(enabled=True, parameters=True, diagnostics=True)
     tissue = tmp_path / 'tissue.h5ad'
     adata = ad.AnnData(sparse.csr_matrix(np.ones((3, 2), dtype=np.float32)))
     adata.obs['batch'] = ['a', 'b', 'a']
@@ -55,13 +57,11 @@ def run(tmp_path):
 def stages(monkeypatch):
     calls = []
     mocks = {}
-    for name in ('analysis', 'inference', 'spatial_heatmaps', 'latent_variance'):
+    for name in ('analysis', 'inference', 'spatial_heatmaps'):
         def stage(*args, _name=name, **kwargs):
             calls.append(_name)
             if _name == 'analysis':
                 return kwargs['output_override']
-            if _name == 'latent_variance':
-                return Path(args[0]['latent_variance']['output_dir'])
             return kwargs['output_path' if _name == 'inference' else 'output_dir']
         mocks[name] = Mock(side_effect=stage)
         monkeypatch.setattr(workflow, f'run_{name}', mocks[name])
@@ -76,7 +76,9 @@ def test_settings_defaults_partial_and_smoke():
     smoke = apply_smoke_overrides(config)
     assert not smoke['post_training']['enabled']
     assert config['post_training']['enabled']
-    assert config['analysis']['peaks']['enabled'] and config['analysis']['latent_interactive']
+    assert not config['analysis']['peaks']['enabled']
+    assert config['analysis']['features']['variance']['enabled']
+    assert config['analysis']['features']['pca_umap']['enabled']
 
 
 @pytest.mark.parametrize('supplied', [False, [], 'yes', {'oops': True},
@@ -114,20 +116,20 @@ def test_order_current_settings_frozen_contracts_and_resumed_paths(run, stages):
     config['training']['resume_checkpoint'] = str(best.with_name('latest.pt'))
     calls, mocks = stages
     outputs = workflow.run_post_training_workflow(config, best)
-    assert calls == ['analysis', 'inference', 'spatial_heatmaps', 'latent_variance']
+    assert calls == ['analysis', 'inference', 'spatial_heatmaps']
     effective, actual_checkpoint = mocks['analysis'].call_args.args
     assert actual_checkpoint == best
     assert effective['data']['path'] == checkpoint['config']['data']['path']
     assert effective['data']['intensity_transform'] == checkpoint['config']['data']['intensity_transform']
     assert effective['model']['latent_dim'] == 2
     assert effective['data']['target_columns'] == checkpoint['target_columns']
-    assert effective['analysis']['latent_interactive']
-    assert effective['analysis']['peaks']['enabled']
+    assert effective['analysis']['features']['direct_umap']['interactive']
+    assert not effective['analysis']['peaks']['enabled']
     assert config['analysis'] == original['analysis']
     root = best.parent.parent / 'analysis'
     assert outputs == dict(analysis=root, inference=root / 'spatial/spatial_predictions.parquet',
                           latents=root / 'spatial/spatial_latent.parquet',
-                          spatial_heatmaps=root / 'spatial/heatmaps', latent_variance=root / 'latent_variance')
+                          spatial_heatmaps=root / 'spatial/heatmaps')
     inference = mocks['inference'].call_args.kwargs
     assert inference['checkpoint_path'] == best
     assert inference['input_path'] == Path(config['data']['context_path'])
@@ -136,7 +138,6 @@ def test_order_current_settings_frozen_contracts_and_resumed_paths(run, stages):
     assert inference['execution_overrides']['spatial_execution'] == config['analysis']['spatial_execution']
     assert inference['overwrite']
     assert mocks['spatial_heatmaps'].call_args.kwargs['workers'] == config['analysis']['spatial_heatmaps']['workers']
-    assert mocks['latent_variance'].call_args.args[0]['latent_variance']['latents'] == str(outputs['latents'])
 
 
 @pytest.mark.parametrize('saved_kind', ['mlp', 'cnn', 'gatv2'])
@@ -163,17 +164,17 @@ def test_inference_batch_units_follow_checkpoint(run, stages, saved_kind, curren
 
 
 @pytest.mark.parametrize('switch', ['enabled', 'run_analysis', 'run_inference',
-                                    'run_spatial_heatmaps', 'run_latent_variance'])
+                                    'run_spatial_heatmaps'])
 def test_individual_switches(run, stages, monkeypatch, switch):
     config, best, _ = run
     config['post_training'][switch] = False
     validation = Mock()
     monkeypatch.setattr(workflow, '_validate_exports', validation)
     workflow.run_post_training_workflow(config, best)
-    expected = ['analysis', 'inference', 'spatial_heatmaps', 'latent_variance']
+    expected = ['analysis', 'inference', 'spatial_heatmaps']
     expected = [] if switch == 'enabled' else [s for s in expected if f'run_{s}' != switch]
     assert stages[0] == expected
-    assert validation.call_count == (2 if switch == 'run_inference' else 0)
+    assert validation.call_count == (1 if switch == 'run_inference' else 0)
 
 
 def test_disabled_needs_no_checkpoint_or_tissue(stages):
@@ -183,7 +184,7 @@ def test_disabled_needs_no_checkpoint_or_tissue(stages):
     assert not stages[0]
 
 
-@pytest.mark.parametrize('failed_stage', ['analysis', 'inference', 'spatial_heatmaps', 'latent_variance'])
+@pytest.mark.parametrize('failed_stage', ['analysis', 'inference', 'spatial_heatmaps'])
 def test_immediate_failure_preserves_checkpoint(run, stages, failed_stage):
     config, best, _ = run
     calls, mocks = stages
@@ -232,23 +233,19 @@ def write_exports(config, best, checkpoint):
     return predictions, latents, provenance_path, provenance
 
 
-@pytest.mark.parametrize('consumer', ['both', 'spatial_heatmaps', 'latent_variance'])
-def test_reuse_valid_exports(run, stages, consumer):
+def test_reuse_valid_exports(run, stages):
     config, best, checkpoint = run
     predictions, latents, _, _ = write_exports(config, best, checkpoint)
     config['post_training'].update(run_analysis=False, run_inference=False)
-    if consumer != 'both':
-        other = 'latent_variance' if consumer == 'spatial_heatmaps' else 'spatial_heatmaps'
-        config['post_training'][f'run_{other}'] = False
-        (latents if other == 'latent_variance' else predictions).unlink()
+    latents.unlink()  # Heatmaps only need predictions; lesion variance uses split latents.
     outputs = workflow.run_post_training_workflow(config, best)
-    assert set(outputs) == ({'spatial_heatmaps', 'latent_variance'} if consumer == 'both' else {consumer})
+    assert set(outputs) == {'spatial_heatmaps'}
     stages[1]['inference'].assert_not_called()
 
 
-@pytest.mark.parametrize('problem', ['missing_predictions', 'missing_latents', 'missing_provenance',
-    'checkpoint_identity', 'source_identity', 'prediction_identity', 'latent_identity', 'density_mc_seed',
-    'prefix', 'prediction_schema', 'latent_schema', 'prediction_order', 'latent_order', 'target_transform'])
+@pytest.mark.parametrize('problem', ['missing_predictions', 'missing_provenance',
+    'checkpoint_identity', 'source_identity', 'prediction_identity', 'density_mc_seed',
+    'prefix', 'prediction_schema', 'prediction_order', 'target_transform'])
 def test_reuse_rejects_missing_incompatible_or_misaligned_exports(run, stages, problem):
     config, best, checkpoint = run
     predictions, latents, provenance_path, provenance = write_exports(config, best, checkpoint)
@@ -276,7 +273,6 @@ def test_reuse_rejects_missing_incompatible_or_misaligned_exports(run, stages, p
     with pytest.raises(workflow.PostTrainingError, match='Regenerate them.*run_inference: true'):
         workflow.run_post_training_workflow(config, best)
     stages[1]['inference'].assert_not_called()
-    stages[1]['latent_variance'].assert_not_called()
 
 
 def test_missing_runtime_input_names_failed_stage(run, stages):
@@ -336,9 +332,8 @@ def test_analysis_nested_reports_execute_once(run, monkeypatch):
     monkeypatch.setattr(workflow, 'run_analysis', analyze.run_analysis)
     assert workflow.run_post_training_workflow(config, best) == {'analysis': output}
     numeric.assert_called_once()
-    interactive.assert_called_once()
-    peaks.assert_called_once()
-    assert peaks.call_args.args[1] == best
+    interactive.assert_not_called()  # Integrated writer receives in-memory arrays.
+    peaks.assert_not_called()
 
 
 def test_configured_destinations_are_rebased(run, stages):
@@ -347,12 +342,11 @@ def test_configured_destinations_are_rebased(run, stages):
     config['analysis']['output_dir'] = str(root / 'reports')
     config['spatial'] = dict(output=str(root / 'exports/predictions.parquet'),
                              latents=str(root / 'exports/embeddings.parquet'))
-    config['latent_variance']['output_dir'] = str(root / 'variance')
     outputs = workflow.run_post_training_workflow(config, best)
     actual = best.parent.parent
     assert outputs == dict(analysis=actual / 'reports', inference=actual / 'exports/predictions.parquet',
                           latents=actual / 'exports/embeddings.parquet',
-                          spatial_heatmaps=actual / 'reports/spatial/heatmaps', latent_variance=actual / 'variance')
+                          spatial_heatmaps=actual / 'reports/spatial/heatmaps')
 
 
 def test_training_only_and_resume_early_stopping(tmp_path, monkeypatch):
@@ -444,7 +438,6 @@ def test_smoke_cli_runs_no_stages(run, stages, monkeypatch):
 def test_legacy_run_paths(run, stages):
     config, best, checkpoint = run
     config.pop('results')
-    config.pop('latent_variance')
     config.pop('spatial')
     requested = best.parent / 'requested'
     config['training']['output_dir'] = str(requested)
@@ -453,5 +446,4 @@ def test_legacy_run_paths(run, stages):
     torch.save(checkpoint, best)
     outputs = workflow.run_post_training_workflow(config, best)
     assert outputs['analysis'] == best.parent / 'analysis'
-    assert outputs['latent_variance'] == best.parent / 'analysis/latent_variance'
     assert outputs['inference'] == best.parent / 'analysis/spatial/spatial_predictions.parquet'

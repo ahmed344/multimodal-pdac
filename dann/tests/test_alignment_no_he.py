@@ -37,8 +37,8 @@ def test_configs_preserve_science_and_disable_every_workflow(tmp_path,architectu
     assert c['loss']['target_weights'] == source['loss']['target_weights']
     if architecture != 'mlp':
         assert execution_settings(c)['halo'] == 6
-        assert c['training']['core_size'] == 8
-        assert c['training']['supervised_rows_per_batch'] == 2048
+        assert c['training']['core_size'] == source['training']['spatial']['core_size']
+        assert c['training']['supervised_rows_per_batch'] == source['training']['spatial']['supervised_rows_per_batch']
         assert c['model']['aggregation'][architecture]['channels'] == 128
     assert all(c['loss']['batch_alignment'][n]['enabled'] for n in study.NAMES)
 

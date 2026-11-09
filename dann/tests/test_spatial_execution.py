@@ -201,7 +201,7 @@ def test_workflow_spatial_tile_count_and_legacy_fallback(spatial_config, tmp_pat
         group['type'] = 'mlp'
     resolve_execution(config)
     config['analysis']['batch_size'] = 4096
-    config['post_training'].update(run_analysis=False, run_spatial_heatmaps=False,
+    config['post_training'].update(run_analysis=False, run_inference=True, run_spatial_heatmaps=False,
                                    run_latent_variance=False)
 
     outputs = workflow.run_post_training_workflow(config, path)

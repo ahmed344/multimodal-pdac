@@ -38,7 +38,7 @@ from dann.train import run_epoch
 from dann.verification.fit_diagnosis import constant_parameters
 
 ARCHIVE = Path('data/PDAC/Results/dann/diagnostics/2026-10-01-batch-execution-1000')
-DOWNSTREAM = ('dann.analyze', 'dann.spatial', 'dann.spatial_heatmaps', 'dann.latent_variance')
+DOWNSTREAM = ('dann.analyze', 'dann.spatial', 'dann.spatial_heatmaps')
 
 
 def save_json(path: Path, value: Any) -> None:
@@ -261,12 +261,13 @@ def verify_outputs(config_path: Path) -> dict:
     images = [heatmaps / f'spatial_heatmap_{prefix}{target}.png'
               for target in config['data']['target_columns'] for prefix in ('', 'diagnostics_')]
     assert all(path.is_file() and path.stat().st_size > 0 for path in images)
-    variance_dir = Path(config['latent_variance']['output_dir'])
+    variance_dir = Path(config['analysis']['output_dir']) / 'latent_variance'
     for filename in ('latent_variance_summary.csv', 'pca_variance.csv'):
         values = pd.read_csv(variance_dir / filename).select_dtypes(include='number')
         assert np.isfinite(values.to_numpy()).all()
     summary = pd.read_csv(variance_dir / 'latent_variance_summary.csv').iloc[0].to_dict()
-    assert int(summary['n_observations']) == expected
+    assert summary['scope'] == 'lesion'
+    assert summary['split'] == config['analysis']['split']
     return dict(spatial_prediction_rows=expected, spatial_latent_rows=expected,
                 heatmaps=[str(p) for p in images], variance=summary)
 

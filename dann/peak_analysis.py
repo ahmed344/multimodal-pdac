@@ -305,14 +305,15 @@ def validate_peak_outputs(directory: Path, weights: np.ndarray, families: np.nda
                           spatial_rows: int | None, scores=None) -> list[Path]:
     """Check complete artifacts and exact FP32/row-aligned numerical export contracts."""
     files = validate_outputs(directory)
-    exported = pd.read_csv(directory/'peak_embeddings.csv', float_precision='round_trip')
-    if not np.array_equal(exported.filter(regex='^embedding_').to_numpy(dtype=np.float32), weights):
-        raise ValueError('Peak embedding CSV failed exact FP32 round-trip.')
-    for name in ('peak_annotations.csv', 'family_membership.csv', 'peak_umap.csv'):
-        table = pd.read_csv(directory/name)
-        if not np.array_equal(table['family'].to_numpy(), families) or not np.array_equal(table['peak_index'], np.arange(len(families))):
-            raise ValueError(f'Inconsistent peak ordering/families: {name}')
-    if spatial_rows is not None:
+    if (directory/'peak_embeddings.csv').exists():
+        exported = pd.read_csv(directory/'peak_embeddings.csv', float_precision='round_trip')
+        if not np.array_equal(exported.filter(regex='^embedding_').to_numpy(dtype=np.float32), weights):
+            raise ValueError('Peak embedding CSV failed exact FP32 round-trip.')
+        for name in ('peak_annotations.csv', 'family_membership.csv', 'peak_umap.csv'):
+            table = pd.read_csv(directory/name)
+            if not np.array_equal(table['family'].to_numpy(), families) or not np.array_equal(table['peak_index'], np.arange(len(families))):
+                raise ValueError(f'Inconsistent peak ordering/families: {name}')
+    if spatial_rows is not None and (directory/'family_spatial_activity.parquet').exists():
         parquet = pq.ParquetFile(directory/'family_spatial_activity.parquet')
         if parquet.metadata.num_rows != spatial_rows:
             raise ValueError('Incomplete spatial activity export.')
@@ -345,6 +346,9 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
     from dann import peak_plots as plots
     from threadpoolctl import threadpool_limits
     settings = peak_analysis_settings(config['analysis'].get('peaks'))
+    from dann.config import peak_analysis_requested
+    if not config['analysis'].get('enabled', True) or not peak_analysis_requested(settings):
+        return Path(output_override or config['analysis']['output_dir']) / 'peaks'
     checkpoint_path = Path(checkpoint_override or config['analysis'].get('checkpoint') or Path(config['training']['output_dir'])/'best.pt')
     performance = {'host_budget_gib': execution['performance'].get('host_budget_gib', 192.)}
     with InferenceProgress('Peaks') as progress, threadpool_limits(limits=4):
@@ -400,33 +404,46 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
                         minimum=settings['min_observations'], targets=fingerprint(targets))
         family_corr_key = dict(corr_key, family_correlation_version=1, families=fingerprint(families),
             preprocessing={k: data[k] for k in ('nonzero_threshold', 'intensity_transform', 'intensity_clip_max')})
-        family_corr_hit = cache.get('family-correlations', family_corr_key)
-        stats_hit, corr_hit = cache.get('peak-statistics', stats_key), cache.get('peak-correlations', corr_key)
+        need_annotations = settings['tables'] or any(settings[k] for k in ('umap', 'similarity', 'correlations', 'prevalence')) and (settings['plots'] or settings['interactive'])
+        # Placeholders never leave this invocation; they avoid loading spectra for spatial-only work.
+        slide_names = np.unique(frame[data['batch_column']].astype(str))
+        stats = dict(slides=slide_names, counts=np.zeros((len(slide_names), len(weights))),
+            sums=np.zeros((len(slide_names), len(weights))), rows=np.zeros(len(slide_names)), frequency=np.zeros(len(weights)))
+        correlations = dict(mean=np.full((len(weights), len(data['target_columns'])), np.nan),
+            contributing_slides=np.zeros((len(weights), len(data['target_columns']))))
+        family_associations = None
         matrix = None
-        if stats_hit is None or corr_hit is None or family_corr_hit is None:
-            progress.set_phase('resident labeled spectra')
-            matrix = resident_matrix(source, data, performance)
-            check_host_budget(performance, settings['block_rows']*len(features)*32)
-        if stats_hit is None:
-            progress.set_phase('lesion peak statistics', int(lesion.sum()))
-            stats = peak_statistics(matrix, frame[data['batch_column']].to_numpy(), lesion, settings['block_rows'], progress)
-            cache.put('peak-statistics', stats_key, stats)
-        else:
-            stats = stats_hit[0]
-        if corr_hit is None:
-            progress.set_phase('held-out slide associations', len(stats['slides']), 'slides')
-            correlations = peak_correlations(matrix, frame[data['batch_column']].to_numpy(), rows, targets,
-                settings['min_observations'], settings['correlation_block_peaks'], progress)
-            cache.put('peak-correlations', corr_key, correlations)
-        else:
-            correlations = corr_hit[0]
-        if family_corr_hit is None:
-            progress.set_phase('held-out family signal associations')
-            family_associations = family_correlations(matrix, families, frame[data['batch_column']].to_numpy(),
-                rows, targets, data, settings['block_rows'], settings['min_observations'], progress)
-            cache.put('family-correlations', family_corr_key, family_associations)
-        else:
-            family_associations = family_corr_hit[0]
+        if need_annotations:
+            need_family_corr = settings['tables'] or settings['plots'] and settings['correlations']
+            family_corr_hit = cache.get('family-correlations', family_corr_key) if need_family_corr else None
+            need_stats = settings['tables'] or any(settings[k] for k in ('umap', 'similarity', 'prevalence'))
+            stats_hit = cache.get('peak-statistics', stats_key) if need_stats else None
+            corr_hit = cache.get('peak-correlations', corr_key)
+            matrix = None
+            if (need_stats and stats_hit is None) or corr_hit is None or (need_family_corr and family_corr_hit is None):
+                progress.set_phase('resident labeled spectra')
+                matrix = resident_matrix(source, data, performance)
+                check_host_budget(performance, settings['block_rows']*len(features)*32)
+            if need_stats and stats_hit is None:
+                progress.set_phase('lesion peak statistics', int(lesion.sum()))
+                stats = peak_statistics(matrix, frame[data['batch_column']].to_numpy(), lesion, settings['block_rows'], progress)
+                cache.put('peak-statistics', stats_key, stats)
+            elif need_stats:
+                stats = stats_hit[0]
+            if corr_hit is None:
+                progress.set_phase('held-out slide associations', len(stats['slides']), 'slides')
+                correlations = peak_correlations(matrix, frame[data['batch_column']].to_numpy(), rows, targets,
+                    settings['min_observations'], settings['correlation_block_peaks'], progress)
+                cache.put('peak-correlations', corr_key, correlations)
+            else:
+                correlations = corr_hit[0]
+            if need_family_corr and family_corr_hit is None:
+                progress.set_phase('held-out family signal associations')
+                family_associations = family_correlations(matrix, families, frame[data['batch_column']].to_numpy(),
+                    rows, targets, data, settings['block_rows'], settings['min_observations'], progress)
+                cache.put('family-correlations', family_corr_key, family_associations)
+            elif need_family_corr:
+                family_associations = family_corr_hit[0]
         del matrix, targets
         gc.collect()
         progress.set_phase('peak UMAP')
@@ -438,7 +455,9 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
             return {'coordinates': umap.UMAP(n_neighbors=min(settings['umap_neighbors'], len(weights)-1),
                 min_dist=settings['umap_min_dist'], metric=settings['umap_metric'],
                 random_state=settings['umap_random_state'], n_jobs=1).fit_transform(weights)}
-        coordinates = _cached(cache, 'peak-umap', umap_key, fit)['coordinates']
+        coordinates = (_cached(cache, 'peak-umap', umap_key, fit)['coordinates']
+                       if settings['tables'] or settings['umap'] and (settings['plots'] or settings['interactive'])
+                       else np.full((len(weights), 2), np.nan))
         counts, sums = stats['counts'].sum(axis=0), stats['sums'].sum(axis=0)
         prevalence = 100.*counts/stats['rows'].sum() if stats['rows'].sum() else np.full(len(counts), np.nan)
         mean = np.divide(sums, counts, out=np.full(len(counts), np.nan), where=counts > 0)
@@ -460,42 +479,44 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
             queue = RenderQueue(work/'arrays')
             comparison_queue = RenderQueue(work/'comparison-arrays')
             progress.set_phase('peak tables and plot preparation')
-            embedding_frame = pd.DataFrame(weights, columns=[f'embedding_{i}' for i in range(weights.shape[1])])
-            embedding_frame.insert(0, 'mz', features.astype(float))
-            embedding_frame.insert(0, 'peak_index', np.arange(len(weights)))
-            # Preserve FP32 embeddings exactly and retain the FP64 numeric m/z identity.
-            embedding_frame.to_csv(staged/'peak_embeddings.csv', index=False, float_format='%.17g')
-            annotations.to_csv(staged/'peak_annotations.csv', index=False)
-            annotations[['peak_index', 'mz', 'family', 'family_color']].to_csv(staged/'family_membership.csv', index=False)
-            pd.DataFrame(dict(family=unique, size=[int((families == f).sum()) for f in unique],
-                color=plots.family_colors(len(unique)))).to_csv(staged/'family_sizes.csv', index=False)
-            annotations[['peak_index', 'mz', 'family']].assign(umap_1=coordinates[:, 0], umap_2=coordinates[:, 1]).to_csv(staged/'peak_umap.csv', index=False)
-            for key in ('linkage', 'order'):
-                np.save(staged/f'peak_{key}.npy', tree[key])
-            pd.DataFrame(family_similarity(tree['similarity'], families), index=unique, columns=unique).to_csv(staged/'family_similarity.csv', index_label='family')
-            pd.concat([pd.DataFrame(dict(slide=name, peak_index=np.arange(len(weights)),
-                lesion_rows=stats['rows'][i], detection_count=stats['counts'][i], intensity_sum=stats['sums'][i],
-                prevalence_percent=slide_prevalence[i], mean_detected_intensity=np.divide(stats['sums'][i], stats['counts'][i],
-                    out=np.full(len(weights), np.nan), where=stats['counts'][i] > 0))) for i, name in enumerate(stats['slides'])]).to_csv(staged/'peak_slide_statistics.csv', index=False)
-            pd.concat([pd.DataFrame(dict(slide=name, peak_index=np.arange(len(weights)), target=column,
-                target_label=target_label(column, target_contract(config)), spearman=correlations['correlations'][s, :, t],
-                valid_observations=correlations['valid_observations'][s, t]))
-                for s, name in enumerate(correlations['slides']) for t, column in enumerate(data['target_columns'])]).to_csv(staged/'peak_slide_ihc_associations.csv', index=False)
-            pd.concat([pd.DataFrame(dict(family=unique, target=column,
-                target_label=target_label(column, target_contract(config)), spearman=family_associations['mean'][:, t],
-                contributing_slides=family_associations['contributing_slides'][:, t]))
-                for t, column in enumerate(data['target_columns'])]).to_csv(staged/'family_ihc_associations.csv', index=False)
-            pd.concat([pd.DataFrame(dict(slide=name, family=unique, target=column,
-                target_label=target_label(column, target_contract(config)), spearman=family_associations['correlations'][s, :, t],
-                valid_observations=family_associations['valid_observations'][s, t]))
-                for s, name in enumerate(family_associations['slides']) for t, column in enumerate(data['target_columns'])
-                ]).to_csv(staged/'family_slide_ihc_associations.csv', index=False)
-            queue.submit(plots.plot_family_correlations, families, correlations['mean'], family_associations['mean'],
-                [target_label(c, target_contract(config)) for c in data['target_columns']],
-                staged/'peak_family_ihc_correlations.png', analysis)
+            if settings['tables']:
+                embedding_frame = pd.DataFrame(weights, columns=[f'embedding_{i}' for i in range(weights.shape[1])])
+                embedding_frame.insert(0, 'mz', features.astype(float))
+                embedding_frame.insert(0, 'peak_index', np.arange(len(weights)))
+                # Preserve FP32 embeddings exactly and retain the FP64 numeric m/z identity.
+                embedding_frame.to_csv(staged/'peak_embeddings.csv', index=False, float_format='%.17g')
+                annotations.to_csv(staged/'peak_annotations.csv', index=False)
+                annotations[['peak_index', 'mz', 'family', 'family_color']].to_csv(staged/'family_membership.csv', index=False)
+                pd.DataFrame(dict(family=unique, size=[int((families == f).sum()) for f in unique],
+                    color=plots.family_colors(len(unique)))).to_csv(staged/'family_sizes.csv', index=False)
+                annotations[['peak_index', 'mz', 'family']].assign(umap_1=coordinates[:, 0], umap_2=coordinates[:, 1]).to_csv(staged/'peak_umap.csv', index=False)
+                for key in ('linkage', 'order'):
+                    np.save(staged/f'peak_{key}.npy', tree[key])
+                pd.DataFrame(family_similarity(tree['similarity'], families), index=unique, columns=unique).to_csv(staged/'family_similarity.csv', index_label='family')
+                pd.concat([pd.DataFrame(dict(slide=name, peak_index=np.arange(len(weights)),
+                    lesion_rows=stats['rows'][i], detection_count=stats['counts'][i], intensity_sum=stats['sums'][i],
+                    prevalence_percent=slide_prevalence[i], mean_detected_intensity=np.divide(stats['sums'][i], stats['counts'][i],
+                        out=np.full(len(weights), np.nan), where=stats['counts'][i] > 0))) for i, name in enumerate(stats['slides'])]).to_csv(staged/'peak_slide_statistics.csv', index=False)
+                pd.concat([pd.DataFrame(dict(slide=name, peak_index=np.arange(len(weights)), target=column,
+                    target_label=target_label(column, target_contract(config)), spearman=correlations['correlations'][s, :, t],
+                    valid_observations=correlations['valid_observations'][s, t]))
+                    for s, name in enumerate(correlations['slides']) for t, column in enumerate(data['target_columns'])]).to_csv(staged/'peak_slide_ihc_associations.csv', index=False)
+                pd.concat([pd.DataFrame(dict(family=unique, target=column,
+                    target_label=target_label(column, target_contract(config)), spearman=family_associations['mean'][:, t],
+                    contributing_slides=family_associations['contributing_slides'][:, t]))
+                    for t, column in enumerate(data['target_columns'])]).to_csv(staged/'family_ihc_associations.csv', index=False)
+                pd.concat([pd.DataFrame(dict(slide=name, family=unique, target=column,
+                    target_label=target_label(column, target_contract(config)), spearman=family_associations['correlations'][s, :, t],
+                    valid_observations=family_associations['valid_observations'][s, t]))
+                    for s, name in enumerate(family_associations['slides']) for t, column in enumerate(data['target_columns'])
+                    ]).to_csv(staged/'family_slide_ihc_associations.csv', index=False)
+            if settings['plots'] and settings['correlations']:
+                queue.submit(plots.plot_family_correlations, families, correlations['mean'], family_associations['mean'],
+                    [target_label(c, target_contract(config)) for c in data['target_columns']],
+                    staged/'peak_family_ihc_correlations.png', analysis)
             plots.queue_peak_plots(queue, staged, annotations, coordinates, tree, weights, slide_prevalence,
                                    stats['slides'], analysis, target_contract(config))
-            if settings['spatial']:
+            if settings['spatial'] and (settings['tables'] or (settings['plots'] or settings['interactive']) and (settings['spatial_families'] or settings['spatial_cd8'])):
                 tissue_path = Path(spatial_input or data['context_path'])
                 artifact_preprocessing(tissue_path, data)
                 sources['tissue'] = source_identity(tissue_path)
@@ -525,25 +546,28 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
                     preprocessing=spatial_key['preprocessing'], cohort=preprocessing, family_key=family_key)
                 (staged/'family_spatial_settings.json').write_text(json.dumps(spatial_metadata, indent=2))
                 progress.set_phase('spatial parquet and geometry', len(tissue))
-                _write_spatial_table(staged/'family_spatial_activity.parquet', tissue, scores, unique, data,
-                                     settings['lesion_column'], spatial_metadata)
+                if settings['tables']:
+                    _write_spatial_table(staged/'family_spatial_activity.parquet', tissue, scores, unique, data,
+                                         settings['lesion_column'], spatial_metadata)
                 slides = spatial_geometry(tissue, data, settings['lesion_column'])
-                plots.queue_spatial_plots(queue, staged, tissue_path, slides, scores, limits, unique,
-                    analysis, settings, performance)
-                transformed, mask = prepare_observed_targets(tissue[data['target_columns']].to_numpy(),
-                    data['target_columns'], data.get('cd8_normalization'))
-                cd8_index = data['target_columns'].index('Density_CD8')
-                cd8 = np.where(mask[:, cd8_index], transformed[:, cd8_index], np.nan)
-                plots.queue_cd8_comparisons(comparison_queue, staged, slides, cd8,
-                    target_label('Density_CD8', target_contract(config)), scores, limits, unique, analysis, settings)
-                del transformed, mask
+                if settings['spatial_families'] and settings['plots']:
+                    plots.queue_spatial_plots(queue, staged, tissue_path, slides, scores, limits, unique,
+                        analysis, settings, performance)
+                if settings['spatial_cd8'] and (settings['plots'] or settings['interactive']):
+                    transformed, mask = prepare_observed_targets(tissue[data['target_columns']].to_numpy(),
+                        data['target_columns'], data.get('cd8_normalization'))
+                    cd8_index = data['target_columns'].index('Density_CD8')
+                    cd8 = np.where(mask[:, cd8_index], transformed[:, cd8_index], np.nan)
+                    plots.queue_cd8_comparisons(comparison_queue, staged, slides, cd8,
+                        target_label('Density_CD8', target_contract(config)), scores, limits, unique, analysis, settings)
+                    del transformed, mask
             progress.details.update(requested_family_count=analysis['family_count'], actual_family_count=len(unique),
                 preprocessing=preprocessing,
                 embedding_shape=list(weights.shape), sources=sources, excluded_from_log_plots=int(np.sum(~np.isfinite(mean) | (mean <= 0))),
                 family_colors=plots.family_colors(len(unique)), effective_render_workers=execution['render_workers'])
             # Plotting uses only immutable mmap arrays; all numerical pools are finished.
             expected_plots = {arg for _, _, args, _ in [*queue.tasks, *comparison_queue.tasks] for arg in args
-                              if isinstance(arg, Path) and arg.parent == staged}
+                              if isinstance(arg, Path) and arg.parent == staged and (settings['plots'] or arg.suffix != '.png')}
             if not execution['render_workers']:
                 largest = max((array.nbytes for array, _ in queue.arrays.values()), default=0)
                 check_host_budget(performance, max(2*2**30, 2**30+4*queue.canvas_bytes+3*largest))
@@ -569,21 +593,17 @@ def run_peak_analysis(config: Mapping[str, Any], checkpoint_override: Path | Non
             progress.details['comparison_png_count'] = len(list(staged.glob('cd8_families_*.png')))
             progress.details['png_count'] = len(list(staged.glob('*.png')))
             progress.details['html_count'] = len(list(staged.glob('*.html')))
-            from dann.artifact_layout import peak_relative_path, remove_owned
+            from dann.artifact_layout import peak_relative_path
             relative_paths = {path: (peak_relative_path(path.name) if path.parent == staged else
                 Path('spatial/cd8_comparison')/path.relative_to(staged)) for path in files}
             progress.details['artifacts'] = [str(relative_paths[path]) for path in files]
             (staged/'peak_run.json').write_text(json.dumps(progress.snapshot(torch.device('cpu')), indent=2))
             destination.mkdir(exist_ok=True)
             previous_report = destination/'peak_run.json'
-            previous_artifacts = set()
-            if previous_report.exists():
-                previous_artifacts = set(json.loads(previous_report.read_text()).get('artifacts', []))
             for path, relative in relative_paths.items():
                 target = destination/relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(path, target)
-            remove_owned(destination, previous_artifacts - {str(p) for p in relative_paths.values()})
             os.replace(staged/'peak_run.json', previous_report)
             for report_name in ('peak_audit.json', 'peak_browser_audit.json'):
                 old_report = destination/report_name

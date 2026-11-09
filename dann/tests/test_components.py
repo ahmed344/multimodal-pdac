@@ -53,6 +53,8 @@ def spatial_config(tmp_path):
     config['model']['heads'].pop('he', None)
     config['performance'] = {}
     config['analysis'].pop('spatial_execution', None)
+    config['analysis'].pop('features', None)
+    config['analysis'].pop('sample_scope', None)
     config['analysis'].pop('peaks', None)  # Peak fixtures supply lesion/HES metadata separately.
     config['data'].update(path=str(tmp_path/'labels.h5ad'), context_path=str(tmp_path/'tissue.h5ad'),
                           train_fraction=.6, validation_fraction=.2, test_fraction=.2)
@@ -335,7 +337,7 @@ def test_configuration_routes_and_invalid_selectors(spatial_config):
         resolve_execution(c)
         roots.add(c['results']['run_dir'])
         assert c['analysis']['checkpoint'] == str(Path(c['training']['output_dir'])/'best.pt')
-        assert c['latent_variance']['latents'] == c['spatial']['latents']
+        assert 'latent_variance' not in c
     assert len(roots) == 27
     c['model']['aggregation']['cnn']['depth'] = 0
     with pytest.raises(ValueError, match='positive'):

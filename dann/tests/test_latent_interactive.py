@@ -96,18 +96,21 @@ def test_export_pipeline_cache_reuse_and_failure_cleanup(tmp_path,monkeypatch):
     run_latent_analysis(config)
     report=json.loads((out/'latent_run.json').read_text())
     assert set(report['cache_hits'])=={'latent-feature-associations','latent-feature-umap'}
+    assert set(report['source_hashes']) == {str(root / path) for path in (
+        'tables/latent_embeddings.csv', 'umap/tables/latent_umap.csv', 'tables/ziln_density_scatter.csv')}
+    assert all(digest_file(Path(path)) == digest for path, digest in report['source_hashes'].items())
     assert all(digest_file(p)==digest for p,digest in first.items())
     before=digest_file(out/'sample_umap.html')
-    monkeypatch.setattr('dann.latent_analysis.sample_viewers',lambda *args: (_ for _ in ()).throw(RuntimeError('render failed')))
+    monkeypatch.setattr('dann.latent_analysis.sample_viewers',lambda *args,**kwargs: (_ for _ in ()).throw(RuntimeError('render failed')))
     with pytest.raises(RuntimeError,match='render failed'):run_latent_analysis(config)
     assert digest_file(out/'sample_umap.html')==before
     assert not list(root.glob('.latent-work-*'))
 
 
-def test_normal_analysis_calls_latent_generator(tmp_path,monkeypatch):
+def test_normal_analysis_uses_integrated_viewers(tmp_path,monkeypatch):
     from dann.analyze import run_analysis
     calls=[]
     monkeypatch.setattr('dann.analyze._run_legacy_analysis',lambda *args,**kwargs:tmp_path)
     monkeypatch.setattr('dann.latent_analysis.run_latent_analysis',lambda c,o:calls.append(o))
-    run_analysis({'analysis':{'latent_interactive':True}},None)
-    assert calls==[tmp_path]
+    run_analysis({'analysis':{'latent_interactive':True,'output_dir':str(tmp_path)}},None)
+    assert calls==[]  # Viewers run from arrays inside the shared writer.

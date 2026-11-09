@@ -65,7 +65,7 @@ def remove_owned(directory: Path, names: set[str]) -> None:
 def analysis_relative_path(relative: Path) -> Path:
     """Group known latent, similarity, and diagnostic outputs; leave others alone."""
     name = relative.name
-    if relative.parent == Path('umap'):
+    if relative.parent in (Path('umap'), Path('umap_pca')):
         if name == 'latent_umap.csv':
             group = 'tables'
         elif name.startswith('latent_umap_ziln_diagnostics_'):
@@ -76,7 +76,7 @@ def analysis_relative_path(relative: Path) -> Path:
             group = 'overview'
         else:
             return relative
-        return Path('umap')/group/name
+        return relative.parent/group/name
     if relative.parent != Path('.'):
         return relative
     if name in ('latent_embeddings.csv', 'ziln_density_scatter.csv'):

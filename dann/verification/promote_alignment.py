@@ -72,9 +72,7 @@ def rebase_config(config: dict, source: Path, destination: Path,
               ('analysis', 'output_dir', destination/'analysis'),
               ('analysis', 'checkpoint', destination/f'model/{checkpoint}.pt'),
               ('spatial', 'output', destination/'analysis/spatial/spatial_predictions.parquet'),
-              ('spatial', 'latents', destination/'analysis/spatial/spatial_latent.parquet'),
-              ('latent_variance', 'latents', destination/'analysis/spatial/spatial_latent.parquet'),
-              ('latent_variance', 'output_dir', destination/'analysis/latent_variance')]
+              ('spatial', 'latents', destination/'analysis/spatial/spatial_latent.parquet')]
     for section, key, value in fields:
         old = result[section][key]
         if section != 'results' and not Path(old).resolve().is_relative_to(source):
@@ -98,9 +96,7 @@ def validate_routing(config: dict, checkpoint: dict, destination: Path,
         expected = {'training': {'output_dir': destination/'model'},
                     'analysis': {'checkpoint': destination/f'model/{selected}.pt', 'output_dir': destination/'analysis'},
                     'spatial': {'output': destination/'analysis/spatial/spatial_predictions.parquet',
-                                'latents': destination/'analysis/spatial/spatial_latent.parquet'},
-                    'latent_variance': {'output_dir': destination/'analysis/latent_variance',
-                                        'latents': destination/'analysis/spatial/spatial_latent.parquet'}}
+                                'latents': destination/'analysis/spatial/spatial_latent.parquet'}}
         for section, fields in expected.items():
             for key, path in fields.items():
                 if Path(candidate[section][key]).resolve() != path:
@@ -312,10 +308,14 @@ def bounded_checks(batch: Path) -> None:
                        checkpoint=run.get('checkpoint', 'best'),
                        stages=run.setdefault('bounded_stages', {}))
         checkpoint = str(downstream.checkpoint_path(run))
-        commands = [('analyze', ['dann.analyze', '--config', str(config_path), '--checkpoint', checkpoint,
-                                '--output-dir', str(directory/'analysis')]),
-                    ('spatial', ['dann.spatial', '--config', str(config_path), '--checkpoint', checkpoint,
-                                 '--max-rows', '256', '--overwrite'])]
+        commands = []
+        for stage, arguments in downstream.commands(bounded):
+            if stage in ('analyze', 'spatial'):
+                arguments[arguments.index('--checkpoint') + 1] = checkpoint
+            if stage == 'analyze':
+                commands.append((stage, arguments))
+            elif stage == 'spatial':
+                commands.append((stage, arguments + ['--max-rows', '256']))
         invalid = False
         for stage, arguments in commands:
             previous = bounded['stages'].get(stage, {})
@@ -360,7 +360,10 @@ def write_reports(batch: Path, manifest: dict, reports: dict) -> None:
     for run in manifest['runs']:
         directory = Path(run['directory'])
         report = reports[run['name']]
-        links = dict(principal)
+        # The artifact audit checks required enabled outputs. Omitted feature
+        # families need no placeholder links in the published index.
+        links = {label: relative for label, relative in principal.items()
+                 if (directory/relative).is_file()}
         for path in sorted((directory/'analysis/spatial/heatmaps').rglob('*.png')):
             links[path.stem] = str(path.relative_to(directory))
         for label, relative in links.items():
@@ -403,8 +406,9 @@ def audit(batch: Path) -> dict:
             raise ValueError('Promoted training artifacts changed.')
         if downstream.digest(Path(run['config'])) != run['config_sha256']:
             raise ValueError('Promoted runtime configuration changed.')
-        validate_routing(load_config(Path(run['config'])), checkpoint, directory, selected)
-        if not (directory/'analysis/spatial/spatial_predictions.support.parquet').is_file():
+        config = load_config(Path(run['config']))
+        validate_routing(config, checkpoint, directory, selected)
+        if config.get('post_training', {}).get('run_inference', True) and not (directory/'analysis/spatial/spatial_predictions.support.parquet').is_file():
             raise ValueError('Promotion requires explicit per-row support information.')
         reports[run['name']] = downstream.audit_outputs(Path(run['config']), write_report=False)
     result = dict(status='passed', original_experiment_unchanged=True, root_config_unchanged=True,

@@ -167,7 +167,7 @@ def test_stages_and_smoke_never_invoke_downstream_workflow(tmp_path,monkeypatch)
     c=load_config(Path('dann/config.yaml'))
     c['results'].update(root=str(tmp_path/'runs'),run_name='smoke_isolated')
     def fit(config):
-        assert not any(config['post_training'][k] for k in ('enabled','run_inference','run_analysis','run_spatial_heatmaps','run_latent_variance'))
+        assert not any(config['post_training'][k] for k in ('enabled','run_inference','run_analysis','run_spatial_heatmaps'))
         directory=Path(config['training']['output_dir']);(directory/'archives').mkdir(parents=True)
         ck=dict(config=config,epoch=0,training_rng_state={'yes':True},split_indices={'train':np.arange(2),'validation':np.arange(2)})
         torch.save(ck,directory/'best.pt');torch.save(ck,directory/'archives/epoch_0001.pt')

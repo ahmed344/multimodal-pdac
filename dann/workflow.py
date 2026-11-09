@@ -13,10 +13,9 @@ import torch
 from dann.analyze import run_analysis
 from dann.checkpoints import checkpoint_config
 from dann.config import (
-    density_sampling_settings, execution_settings, inference_input, latent_variance_settings,
+    density_sampling_settings, execution_settings, inference_input,
     post_training_settings, spatial_heatmap_settings,
 )
-from dann.latent_variance import run_latent_variance
 from dann.spatial import (
     _file_identity, run_inference, validate_input_schema, validate_latent_output,
     validate_output,
@@ -72,12 +71,6 @@ def _workflow_config(config: Mapping[str, Any], checkpoint: Mapping[str, Any],
     }
     effective['spatial'] = {key: relocate(config.get('spatial', {}).get(key, default))
                             for key, default in spatial_defaults.items()}
-    variance = latent_variance_settings(config.get('latent_variance'))
-    variance.update(input=config['data'].get('context_path'),
-                    latents=effective['spatial']['latents'],
-                    output_dir=relocate(config.get('latent_variance', {}).get(
-                        'output_dir', Path(config['analysis']['output_dir']) / 'latent_variance')))
-    effective['latent_variance'] = variance
     return effective
 
 
@@ -146,7 +139,7 @@ def run_post_training_workflow(config: Mapping[str, Any], checkpoint_path: Path)
     try:
         switches = post_training_settings(config.get('post_training'))
         if not switches['enabled'] or not any(switches[key] for key in (
-                'run_analysis', 'run_inference', 'run_spatial_heatmaps', 'run_latent_variance')):
+                'run_analysis', 'run_inference', 'run_spatial_heatmaps')):
             return outputs
         checkpoint_path = Path(checkpoint_path).resolve()
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
@@ -184,24 +177,19 @@ def run_post_training_workflow(config: Mapping[str, Any], checkpoint_path: Path)
                                      'performance': effective.get('performance', {})},
             ))
             record('latents', Path(effective['spatial']['latents']))
-        for stage in ('spatial_heatmaps', 'latent_variance'):
-            if not switches[f'run_{stage}']:
-                continue
+        heatmaps = spatial_heatmap_settings(analysis.get('spatial_heatmaps'))
+        if (switches['run_spatial_heatmaps'] and analysis.get('enabled', True)
+                and heatmaps['enabled'] and (heatmaps['parameters'] or heatmaps['diagnostics'])):
+            stage = 'spatial_heatmaps'
             tissue = inference_input(effective)
             if not switches['run_inference']:
-                _validate_exports(effective, checkpoint, checkpoint_path, tissue,
-                                  predictions=stage == 'spatial_heatmaps', latents=stage == 'latent_variance')
-            if stage == 'spatial_heatmaps':
-                record(stage, run_spatial_heatmaps(
-                    input_path=tissue, predictions_path=Path(effective['spatial']['output']),
-                    output_dir=Path(analysis['output_dir']) / 'spatial/heatmaps',
-                    densities=effective['data']['target_columns'],
-                    logit_epsilon=effective['loss']['logit_epsilon'], dpi=analysis['figure_dpi'],
-                    batch_column=effective['data']['batch_column'],
-                    **spatial_heatmap_settings(analysis.get('spatial_heatmaps')),
-                ))
-            else:
-                record(stage, run_latent_variance(effective))
+                _validate_exports(effective, checkpoint, checkpoint_path, tissue, predictions=True, latents=False)
+            record(stage, run_spatial_heatmaps(
+                input_path=tissue, predictions_path=Path(effective['spatial']['output']),
+                output_dir=Path(analysis['output_dir']) / 'spatial/heatmaps',
+                densities=effective['data']['target_columns'],
+                logit_epsilon=effective['loss']['logit_epsilon'], dpi=analysis['figure_dpi'],
+                batch_column=effective['data']['batch_column'], **heatmaps))
         return outputs
     except Exception as error:
         raise PostTrainingError(stage, error) from error

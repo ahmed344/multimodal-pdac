@@ -79,7 +79,7 @@ def test_commands_never_train_and_route_loss_curves_inside_analysis(tmp_path):
     commands = dict(batch.commands(run))
     assert all('dann.train' not in command for command in commands.values())
     assert commands['analyze'][-2:] == ['--output-dir', str(Path(run['directory']) / 'analysis')]
-    assert commands['latent_variance'][-1].endswith('/analysis/latent_variance')
+    assert 'latent_variance' not in commands
 
 
 def test_resume_skips_valid_stages_and_invalidates_dependents(tmp_path, monkeypatch):
@@ -143,7 +143,7 @@ def test_stage_inventory_isolated_from_later_stages(tmp_path):
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('result')
-    assert set(batch.stage_inventory(tmp_path, 'analyze')) == {'tables/data.csv'}
+    assert set(batch.stage_inventory(tmp_path, 'analyze')) == {'tables/data.csv', 'latent_variance/summary.csv'}
     assert set(batch.stage_inventory(tmp_path, 'spatial')) == {'spatial/predictions.parquet'}
     assert set(batch.stage_inventory(tmp_path, 'peak_browser')) == {'peaks/reports/peak_browser_audit.json'}
 
@@ -179,6 +179,7 @@ def test_audit_uses_checkpoint_width_input_slides_and_generated_manifests(tmp_pa
     slides=np.array([f'slide_{i%slide_count}' for i in range(3)])
     data=ad.AnnData(sparse.csr_matrix(np.ones((3,2),dtype=np.float32)),obs=pd.DataFrame(index=names))
     data.obs['batch']=slides
+    data.obs['Lesion']=True
     config=load_config(Path('dann/config.yaml'))
     config['model']['heads']['he']['enabled']=False  # Synthetic audit has no H&E artifacts.
     config['data'].pop('preprocessing_fingerprint',None)
@@ -189,6 +190,10 @@ def test_audit_uses_checkpoint_width_input_slides_and_generated_manifests(tmp_pa
     config['data'].update(path=str(source),context_path=str(source),matrix_key='X')
     config['model'].update(num_peaks=2,latent_dim=width)
     config['analysis'].update(max_samples=None,latent_interactive=True,figure_dpi=1)
+    config['analysis']['features']['pca_umap']['enabled'] = False  # This fixture represents the existing direct UMAP.
+    config['analysis']['peaks']['enabled'] = True
+    config['analysis']['spatial_heatmaps'].update(enabled=True, diagnostics=True)
+    config['post_training'].update(run_inference=True, run_spatial_heatmaps=True)
     resolve_execution(config)
     root=Path(config['analysis']['output_dir']);root.mkdir(parents=True)
     checkpoint=dict(config=config,epoch=24,split_indices={'validation':np.arange(3)},target_columns=config['data']['target_columns'],target_transform=target_contract(config))

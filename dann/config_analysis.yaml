@@ -2,10 +2,33 @@
 # Shared inputs, architecture, and output routing come from config.yaml.
 
 analysis:
+  enabled: true
+  sample_scope: lesion  # Filter saved split rows after inference; context stays unchanged.
+  lesion_column: Lesion
+  slide_column: batch
+  features:
+    latent_exports: {enabled: true, tables: true}
+    variance: {enabled: true, tables: true, explained_variance: true}
+    direct_umap: {enabled: true, tables: true, batch: true, densities: true, logit_densities: true, density_means: true, parameters: true, diagnostics: false, interactive: true}
+    pca_umap: {enabled: true, tables: true, batch: true, densities: true, logit_densities: true, density_means: true, parameters: true, diagnostics: false, interactive: true}
+    prediction_scatter: {enabled: true, tables: true, plot: true, interactive: true}
+    latent_interpretation: {enabled: true, tables: true, correlations: true, feature_umap: true, ihc_scatter: true}
+    calibration: {enabled: true, tables: true, pit: true, hurdle: true, coverage: true}
+    density_diagnostics: {enabled: true, errors: true, support: true, contrasts: true}
+    he_metrics: {enabled: true, tables: true}
+    loss_curves: {enabled: true, overall: true, ihc: true}
   export_he_predictions: false
-  latent_interactive: true  # Offline sample and feature viewers from saved analysis exports.
   peaks:
-    enabled: true
+    enabled: false
+    tables: true
+    plots: true
+    interactive: true
+    umap: true
+    similarity: true
+    correlations: true
+    prevalence: true
+    spatial_families: true
+    spatial_cd8: true
     spatial: true
     lesion_column: Lesion
     block_rows: 4096
@@ -41,6 +64,9 @@ analysis:
       host_budget_gib: 192.0
       vram_budget_gib: 24.0
   spatial_heatmaps:
+    enabled: false
+    parameters: true
+    diagnostics: false
     cmap: turbo
     regions: [tissue, lesion]
     lesion_column: Lesion
@@ -82,17 +108,10 @@ analysis:
   calibration_pit_bins: 50  # Histogram bins for positive-branch probability-integral-transform diagnostics.
   exceedance_thresholds: []  # Optional density thresholds for P(y > t) summaries; empty disables them.
 
-latent_variance:
-  # Reads existing spatial latents; input and output paths follow the selected run.
-  slide_column: batch  # Observation column defining slides for variance decomposition.
-  chunk_size: 8192  # Exported latent rows read per chunk; covariance uses float64.
-  figure_dpi: 300  # Resolution of the explained-variance PNG.
-
 # CLI-only workflow after successful training; --smoke-test disables it.
 post_training:
   enabled: true
   run_analysis: true
-  run_inference: true
-  run_spatial_heatmaps: true
-  run_latent_variance: true
+  run_inference: false
+  run_spatial_heatmaps: false
   overwrite_inference: true

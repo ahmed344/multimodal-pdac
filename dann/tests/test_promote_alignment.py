@@ -169,7 +169,9 @@ def test_latest_preserves_best_results_and_all_scientific_state(study, monkeypat
         selected = promotion.validate_selected(destination/'model', run['name'], 'latest')
         promotion.validate_routing(config, selected, destination, 'latest')
         commands = dict(downstream.commands(run))
-        for name in ('analyze', 'spatial'):
+        assert 'analyze' in commands
+        assert ('spatial' in commands) == config['post_training']['run_inference']
+        for name in ('analyze', *(['spatial'] if config['post_training']['run_inference'] else [])):
             args = commands[name]
             assert args[args.index('--checkpoint')+1] == str(destination/'model/latest.pt')
     assert promotion.prepare(source, results, 'latest') == latest_batch
@@ -200,8 +202,15 @@ def test_results_checkpoint_routing_and_validation(selected):
         resolve_execution(config)
 
 
-def test_bounded_checks_use_latest_and_do_not_reuse_best_stages(study, monkeypatch):
+@pytest.mark.parametrize('inference', [False, True])
+def test_bounded_checks_use_latest_and_do_not_reuse_best_stages(study, monkeypatch, inference):
     batch = promotion.prepare(*study, 'latest')
+    original_load = promotion.load_config
+    def configured(path):
+        config = original_load(path)
+        config['post_training']['run_inference'] = inference
+        return config
+    monkeypatch.setattr(promotion, 'load_config', configured)
     calls = []
     def execute(batch, manifest, run, stage, args):
         calls.append((run['name'], stage, args))
@@ -216,14 +225,16 @@ def test_bounded_checks_use_latest_and_do_not_reuse_best_stages(study, monkeypat
         return True
     monkeypatch.setattr(downstream, 'execute', execute)
     promotion.bounded_checks(batch)
-    assert len(calls) == 4
+    expected = 4 if inference else 2
+    assert len(calls) == expected
     for _, _, args in calls:
         assert args[args.index('--checkpoint')+1].endswith('/model/latest.pt')
+        assert Path(args[args.index('--checkpoint')+1]).is_file()
     promotion.bounded_checks(batch)
-    assert len(calls) == 4
+    assert len(calls) == expected
     manifest = json.loads((batch/'manifest.json').read_text())
     for run in manifest['runs']:
         run['bounded_stages']['analyze']['checkpoint'] = 'best'
     downstream.save_json(batch/'manifest.json', manifest)
     promotion.bounded_checks(batch)
-    assert len(calls) == 8
+    assert len(calls) == 2 * expected

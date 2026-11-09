@@ -199,7 +199,7 @@ def test_load_and_reload_config_without_inference_path(spatial_config, tmp_path)
     for _ in range(2):
         path.write_text(yaml.safe_dump(c))
         c = load_config(path)
-        assert c['latent_variance']['input'] is None
+        assert 'latent_variance' not in c
     smoke = apply_smoke_overrides(c)
     bundle = create_data_bundle(smoke)
     next(iter(bundle.loaders['train']))

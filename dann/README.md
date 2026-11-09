@@ -34,7 +34,7 @@ The editable settings are grouped into three linked files:
 | --- | --- |
 | [`config.yaml`](config.yaml) | Shared `data`, `model`, `results`, and `loss` settings |
 | [`config_trainging.yaml`](config_trainging.yaml) | `training`, `monitoring`, and `performance` |
-| [`config_analysis.yaml`](config_analysis.yaml) | `analysis`, `latent_variance`, and `post_training` |
+| [`config_analysis.yaml`](config_analysis.yaml) | `analysis` and `post_training` |
 
 The main file declares `includes: [config_trainging.yaml, config_analysis.yaml]`. Include paths
 are relative to that file, independent of the working directory; data and output
@@ -109,7 +109,7 @@ horizon), then the configured downstream workflows and matched diagnostics.
 Rerunning validates completed stages; an interrupted fit resumes its compatible
 `latest.pt`. To retry one stage, use `--arm l1 --stage analysis` (also `l2` and
 `baseline`; stages include `smoke`, `train`, `inference`, `spatial_heatmaps`,
-`latent_variance`, and `diagnostics`). Historical outputs are validated and reused;
+`diagnostics`). Historical outputs are validated and reused;
 missing diagnostics are written only in the comparison directory.
 
 `report.html` is an offline report with CSV/JSON metrics and PNG/PDF figures.
@@ -793,55 +793,102 @@ CD8 consistently. Missing tissue annotations stay missing in heatmaps while
 predictions remain available; normalized observed CD8 requires both CD8 and tumor
 annotations. Older exports without metadata are interpreted as raw CD8.
 
-## Standalone latent variance
+## Lesion variance and PCA UMAP
 
-After running `python -m dann.spatial`, compute diagnostics from its existing
-`spatial_latent.parquet` and the exact tissue AnnData used for inference:
+`python -m dann.analyze --config dann/config.yaml` reuses the inferred or cached
+latents from the saved `analysis.split` (currently validation). With
+`analysis.sample_scope: lesion`, saved source row IDs select the `Lesion`
+annotation **after inference**, preserving the model's spatial context. Variance,
+direct sample UMAP, and PCA sample UMAP use exactly these same selected rows.
+`analysis.slide_column` defaults to the configured batch column.
 
-```bash
-python -m dann.latent_variance --config dann/config.yaml
-# Optional overrides:
-python -m dann.latent_variance --latents /path/to/spatial_latent.parquet \
-  --input /path/to/tissue.h5ad --output-dir /path/to/latent_variance \
-  --slide-column batch
-```
+`analysis/latent_variance/` contains `latent_variance_summary.csv`, the complete
+`pca_variance.csv` spectrum, the existing two-panel `explained_variance.png`, and
+`provenance.json`. Provenance records lesion scope, split, checkpoint digest,
+source identity, selected row count, and row-identity digest. No spatial export
+is required. The retired `dann.latent_variance` CLI, top-level `latent_variance`
+configuration and `post_training.run_latent_variance` stage have been removed;
+retired settings in historical checkpoint configurations are accepted and ignored.
 
-This independent script does not run inference or require a checkpoint/GPU.
-Settings live in `latent_variance` in [`config_analysis.yaml`](config_analysis.yaml). Defaults write to
-`<run-root>/analysis/latent_variance/`:
+PCA uses centered, unscaled float64 latents and sample covariance (`n - 1`).
+The complete eigenvalue spectrum includes zero components. Participation ratio
+is `(sum eigenvalues)^2 / sum(eigenvalues^2)`. The pixel-weighted slide fraction is
+`sum_s n_s * ||mean_s - global_mean||^2 / sum_i ||latent_i - global_mean||^2`.
+The plot and summary retain the 90%, 99%, 99.9%, 99.99%, and 99.999% thresholds.
+Constant latents have zero variance and undefined fractions/participation ratio.
 
-- `explained_variance.png`: stacked per-PC (logarithmic y-axis) and cumulative
-  explained variance, with 90%, 99%, 99.9%, 99.99%, and 99.999% thresholds marked.
-- `latent_variance_summary.csv`: latent width, participation ratio, minimum PCs
-  reaching each threshold (`pcs_90`, `pcs_99`, `pcs_99_9`, `pcs_99_99`, `pcs_99_999`),
-  `variance_explained_by_slide_means`, total variance, observation/slide counts,
-  source paths, grouping column, and inference coverage.
-- `pca_variance.csv`: one-based PC numbers, covariance eigenvalues, explained
-  variance fractions, and cumulative fractions.
-
-PCA centers the raw latents without scaling individual dimensions. Total variance
-is the trace of the sample covariance (denominator `n - 1`). Participation ratio
-is the squared sum of eigenvalues divided by the sum of squared eigenvalues;
-it measures effective dimensionality. Slide-mean explained variance divides
-`sum_s n_s * ||mean_s - global_mean||^2` by
-`sum_i ||latent_i - global_mean||^2`. Slides are defined by `batch` by default
-and weighted by their pixel counts. This measures variation associated with
-slide means, not necessarily technical batch effects or all slide differences.
-CSV variance fractions range from 0 to 1; the plot uses percentages.
-
-Parquet is streamed in chunks to compute the full covariance and spectrum;
-only observation names and slide labels are read from AnnData. Row positions
-and names must match, including for duplicate names. Leading-row inference
-prefixes from `--max-rows` are accepted and recorded; their statistics describe
-only that prefix. Missing labels and nonfinite latents are errors. Constant
-latents produce zero total variance, empty undefined CSV metrics, and an
-annotated figure. Repeated runs replace the three diagnostic output files.
+The additional `analysis/umap_pca/` method selects the smallest PC count reaching
+**at least 99%** cumulative variance, with no 50-PC limit, reusing the variance
+eigendecomposition. It passes those scores explicitly as `X_pca` to
+[Scanpy neighbors](https://scanpy.readthedocs.io/en/stable/api/generated/scanpy.pp.neighbors.html):
+15 Euclidean neighbors, reduced to `n - 1` for small samples. Then
+[Scanpy UMAP](https://scanpy.readthedocs.io/en/stable/generated/scanpy.tl.umap.html)
+uses min_dist 0.5, spread 1, two dimensions, spectral initialization, and seed 0.
+Fewer than four rows or zero total variance produce an explicit skip reason.
+`settings.json` records selected PCs, achieved variance, effective parameters,
+and package versions. PCA, neighbor graphs, and embeddings are separate validated
+caches. Direct UMAP keeps its existing parameters and filenames under `umap/`.
 
 ## Configuration
 
 `analysis.split` and `analysis.ziln_scatter_split` default to `validation`.
 `analysis.max_samples: null` analyzes all rows in the selected saved splits.
 A positive integer selects a stratified cap.
+
+### Optional analysis outputs
+
+`analysis.enabled: false` skips all analysis. The validated `analysis.features`
+groups below each have an `enabled` switch plus the listed independent outputs:
+
+| Group | Output switches |
+| --- | --- |
+| `latent_exports` | `tables` |
+| `variance` | `tables`, `explained_variance` |
+| `direct_umap`, `pca_umap` | `tables`, `batch`, `densities`, `logit_densities`, `density_means`, `parameters`, `diagnostics`, `interactive` |
+| `prediction_scatter` | `tables`, `plot`, `interactive` |
+| `latent_interpretation` | `tables`, `correlations`, `feature_umap`, `ihc_scatter` |
+| `calibration` | `tables`, `pit`, `hurdle`, `coverage` |
+| `density_diagnostics` | `errors`, `support`, `contrasts` |
+| `he_metrics` | `tables` (JSON metrics) |
+| `loss_curves` | `overall`, `ihc` |
+
+For example, `features: {variance: {enabled: true, tables: false}}` retains the
+variance figure without CSVs. Disabled families override all child switches;
+a family whose outputs are all disabled does no work. With every family and
+peaks disabled, analysis reads no checkpoint or data. Loss-only analysis reads
+history and checkpoint metadata without inference. Both optimized and legacy
+loaders use this same output plan. Standalone calibration, latent viewers, peaks,
+and spatial heatmaps honor their applicable switches.
+
+Omitted switches preserve established outputs; new variance and PCA UMAP are
+opt-in. The legacy `latent_interactive` flag supplies defaults for the explicit
+viewer switches. Current YAML enables lesion variance and both sample UMAPs,
+keeps numerical calibration/error reports and ordinary prediction/calibration
+plots, and disables peaks, post-training spatial inference, spatial heatmaps,
+and per-target diagnostic UMAP/heatmap figures.
+
+Viewers receive shared arrays during analysis, so disabling CSVs does not disable
+an enabled viewer. Disabled files remain untouched. `analysis_execution.json`
+records only outputs produced by that invocation; an old file's presence does
+not mean it was refreshed. Numerical caches depend on their data and numerical
+parameters, not table/plot switches. Disabled features skip their computations,
+including peak work and Monte Carlo means when no enabled output needs them.
+
+`analysis.peaks` adds `tables`, `plots`, `interactive`, `umap`, `similarity`,
+`correlations`, `prevalence`, `spatial_families`, and `spatial_cd8` to its existing
+`enabled` and `spatial` controls. `plots` and `interactive` control static versus
+browser views; `tables` does not gate viewers. `analysis.spatial_heatmaps` adds
+`enabled`, `parameters`, and `diagnostics`; its region controls remain independent.
+
+Weighted loss curves keep each score directly above its corresponding loss,
+including per-target IHC curves. Component losses omit epochs with zero effective
+weight and leave later inactive intervals as gaps; genuine active zero losses
+remain visible. Saved effective coefficients take precedence, with historical
+CCA schedules reconstructed from checkpoint settings. Under the current schedule,
+training CCA begins at epoch 2 and validation CCA at epoch 1. Scores, stored
+history, aggregate objectives, and checkpoint selection remain unchanged.
+Synchronous training, asynchronous rendering, and analysis use the same layout
+and canvas memory calculation.
 
 ### Analysis execution and reuse
 
@@ -969,7 +1016,7 @@ PDF omits it.
 `python -m dann.train --config dann/config.yaml` runs the enabled downstream
 stages after successful training and resource cleanup, using the **best validation
 checkpoint returned by training** (including resumes and early stopping). The
-order is analysis → spatial inference → spatial heatmaps → latent variance.
+order is analysis → spatial inference → spatial heatmaps. Lesion variance is part of analysis.
 Programmatic `train_model(config)` remains training-only. The reusable entry point
 is `dann.workflow.run_post_training_workflow(config, checkpoint_path)`; it returns
 a mapping of completed output names to `Path` locations and prints those locations.
@@ -978,9 +1025,8 @@ a mapping of completed output names to `Path` locations and prints those locatio
 post_training:
   enabled: true
   run_analysis: true
-  run_inference: true
-  run_spatial_heatmaps: true
-  run_latent_variance: true
+  run_inference: false
+  run_spatial_heatmaps: false
   overwrite_inference: true
 ```
 
@@ -1010,17 +1056,14 @@ preprocessing, targets, training data, and splits. Inference uses the runtime
 `spatial.latents` destinations. Resolved paths within the requested run tree are
 rebased into the actual returned checkpoint's run tree, so a resume with a changed
 run name still writes beside its original model. Explicit destinations outside
-the run tree remain explicit. Latent variance consumes that same spatial latent
-export and runtime tissue input; its standalone CLI delegates to
-`dann.latent_variance.run_latent_variance(config)`.
+the run tree remain explicit. Lesion variance uses selected analysis-split latents.
 
-With `run_inference: false`, enabled heatmaps and latent variance consume existing
+With `run_inference: false`, enabled heatmaps consume existing prediction
 exports. They require complete tissue coverage, matching schemas and row order,
 and the prediction-adjacent `.provenance.json` sidecar matching the checkpoint and
 tissue file identities. The sidecar also binds the required prediction/latent
 file identities; prediction reuse checks target semantics and current density
-sampling settings. Heatmaps require only predictions; latent variance requires
-only latents plus the provenance sidecar. Missing, changed, partial, or older
+sampling settings. Heatmaps require predictions plus the provenance sidecar. Missing, changed, partial, or older
 exports without these identities fail with instructions to regenerate them.
 Inference is never implicitly enabled. With inference enabled,
 `overwrite_inference: false` preserves its refusal to replace existing artifacts;
@@ -2632,15 +2675,15 @@ unrecognized files and numerical caches are preserved.
 
 ### Offline latent explorers and number formatting
 
-`analysis.latent_interactive: true` generates five viewers under `analysis/latent/`:
+The explicit interactive and latent-interpretation switches generate viewers under `analysis/latent/`:
 `sample_umap.html`, `latent_ihc_scatter.html`, `prediction_scatter.html`,
 `feature_correlations.html`, and `feature_umap.html`. Open these directly from
 disk; retain the accompanying `assets/` directory. Sample UMAP coordinates and
-all saved samples are preserved. Feature columns load on demand, with at most
+the selected lesion samples are preserved. The additional PCA sample viewer is `umap_pca/sample_umap.html`. Feature columns load on demand, with at most
 twelve columns retained in the browser cache. Prediction scatter uses the
 configured scatter split; sample UMAP and latent–IHC scatter use the analysis split.
 
-Regenerate these viewers without model inference:
+Regenerate enabled viewers from existing CSV exports without model inference (normal analysis also supports viewers without CSV exports):
 
 ```bash
 python -m dann.latent_analysis --config dann/config.yaml
@@ -2659,9 +2702,8 @@ and other values with two decimals at absolute values ≥1, three at 0.01–1, a
 four below 0.01. Values below 0.0001 use scientific notation. Raw embedded values
 and exported numerical tables retain their precision.
 
-Recognized legacy variance files migrate into `analysis/latent_variance/` without
-recomputation. Conflicting destination contents stop migration; unrelated files
-remain untouched. Explicit standalone `--output-dir` overrides remain supported.
+Disabled outputs remain untouched, including historical variance exports. Analysis
+`--output-dir` overrides route newly produced variance and UMAP artifacts together.
 
 ### Repeat analysis for existing checkpoints
 
