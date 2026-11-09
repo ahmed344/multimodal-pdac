@@ -25,6 +25,34 @@ Changed preprocessing requires fresh training; an older checkpoint cannot be
 resumed with the new fingerprint. The training/inference files share fitted
 parameters, feature order, and exactly matching lesion values.
 
+## Configuration files
+
+Keep using `--config dann/config.yaml` for training and downstream commands.
+The editable settings are grouped into three linked files:
+
+| File | Settings |
+| --- | --- |
+| [`config.yaml`](config.yaml) | Shared `data`, `model`, `results`, and `loss` settings |
+| [`config_trainging.yaml`](config_trainging.yaml) | `training`, `monitoring`, and `performance` |
+| [`config_analysis.yaml`](config_analysis.yaml) | `analysis`, `latent_variance`, and `post_training` |
+
+The main file declares `includes: [config_trainging.yaml, config_analysis.yaml]`. Include paths
+are relative to that file, independent of the working directory; data and output
+paths retain their existing interpretation. The linked files are fragments and
+should not be passed directly to `--config`. When copying an editable configuration,
+copy all three files together, or save their combined settings as one YAML file.
+
+`dann.config.read_config(path)` combines the source settings without applying
+defaults. `load_config(path)` then validates them and resolves execution settings
+and output paths. Includes support one level only; missing files, malformed
+mappings, nested includes, and duplicate top-level sections raise errors rather
+than overriding settings. Historical standalone configurations remain supported.
+
+Checkpoints, `resolved_config.yaml`, and generated experiment configurations store
+the combined settings without includes, so they remain usable without the source
+files. Training still runs the enabled `post_training` stages, and `--smoke-test`
+still disables them. Edit those switches in `config_analysis.yaml`.
+
 ## Spectral pooling
 
 `model.spectral_encoder.deep_sets` selects either `pooling: occurrence_mlp`
@@ -779,7 +807,7 @@ python -m dann.latent_variance --latents /path/to/spatial_latent.parquet \
 ```
 
 This independent script does not run inference or require a checkpoint/GPU.
-Settings live in `latent_variance` in the YAML. Defaults write to
+Settings live in `latent_variance` in [`config_analysis.yaml`](config_analysis.yaml). Defaults write to
 `<run-root>/analysis/latent_variance/`:
 
 - `explained_variance.png`: stacked per-PC (logarithmic y-axis) and cumulative

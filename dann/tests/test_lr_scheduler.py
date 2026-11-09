@@ -10,7 +10,7 @@ import torch
 import yaml
 
 from dann import train
-from dann.config import load_config, lr_scheduler_settings, resolve_execution
+from dann.config import load_config, lr_scheduler_settings, read_config, resolve_execution
 from dann.data_loader import create_data_bundle
 from dann.lr_scheduler import create_lr_scheduler, step_lr_scheduler
 from dann.model import AdversarialLatentFusion
@@ -75,7 +75,7 @@ def test_invalid_scheduler_settings(key, value):
 
 @pytest.mark.parametrize("key,value", [("patience", 1.5), ("metric", "unknown_loss")])
 def test_config_loader_validates_scheduler(tmp_path, key, value):
-    config = yaml.safe_load(Path("dann/config.yaml").read_text())
+    config = read_config(Path("dann/config.yaml"))
     config["training"]["lr_scheduler"][key] = value
     path = tmp_path / "invalid.yaml"
     path.write_text(yaml.safe_dump(config))

@@ -205,8 +205,8 @@ def test_normal_diagnostics_umap_panels(tmp_path: Path, monkeypatch: pytest.Monk
 def test_config_validates_analysis_cap(tmp_path: Path, cap: object) -> None:
     """Only null and positive integer analysis limits are accepted."""
     import yaml
-    from dann.config import load_config
-    config = yaml.safe_load(Path("dann/config.yaml").read_text())
+    from dann.config import load_config, read_config
+    config = read_config(Path("dann/config.yaml"))
     config["analysis"]["max_samples"] = cap
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump(config))

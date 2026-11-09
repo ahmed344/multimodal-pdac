@@ -21,7 +21,7 @@ import yaml
 from torch import nn
 from torch.utils.data import DataLoader
 
-from dann.config import load_config, seed_everything, resolve_device
+from dann.config import load_config, read_config, seed_everything, resolve_device
 from dann.data_loader import create_data_bundle, sparse_collate, DataBundle
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion, transform_biology
@@ -252,7 +252,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     root.mkdir(parents=True, exist_ok=False)
     started = time.monotonic()
     source_hashes = {str(p): file_hash(p) for p in (args.config, args.reference_checkpoint)}
-    (root/'source_config.yaml').write_bytes(args.config.read_bytes())
+    (root/'source_config.yaml').write_text(yaml.safe_dump(read_config(args.config), sort_keys=False))
     (root/'runner.py').write_bytes(Path(__file__).read_bytes())
     for source in Path('dann').rglob('*.py'):
         destination = root/'source'/source

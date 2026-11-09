@@ -94,8 +94,10 @@ def promote(staging: Path, output: Path, config_path: Path, manifest: dict) -> N
 
 def smoke(staging: Path, config_path: Path, manifest: dict) -> None:
     """Run the actual capped DANN entry point with outputs isolated in this generation."""
+    from dann.config import read_config
+
     smoke_path = staging / "smoke_config.yaml"
-    smoke_path.write_bytes(config_path.read_bytes())
+    smoke_path.write_text(yaml.safe_dump(read_config(config_path), sort_keys=False))
     update_dann_config(smoke_path, staging, manifest)
     config = yaml.safe_load(smoke_path.read_text())
     config["results"]["root"] = str((staging / "dann_smoke").resolve())

@@ -1,0 +1,98 @@
+# DANN analysis and post-training settings, loaded through config.yaml.
+# Shared inputs, architecture, and output routing come from config.yaml.
+
+analysis:
+  export_he_predictions: false
+  latent_interactive: true  # Offline sample and feature viewers from saved analysis exports.
+  peaks:
+    enabled: true
+    spatial: true
+    lesion_column: Lesion
+    block_rows: 4096
+    correlation_block_peaks: 64
+    min_observations: 20
+    umap_neighbors: 30
+    umap_min_dist: 0.30
+    umap_metric: cosine
+    umap_random_state: 20260719
+    signal_percentile: 99.0
+    sequential_cmap: turbo
+    detection_cmap: turbo
+    ihc_cmap: RdBu_r
+    ihc_percentile: 99.0
+    ihc_gamma: 0.5
+  execution:
+    enabled: true
+    cache_policy: reuse  # reuse, refresh, or off; plot settings do not invalidate numerical stages.
+    tiles_per_batch: 64
+    spectral_peak_budget: 262144
+    gat_tiles: 32
+    feature_cache: true
+    feature_cache_rows: 1024
+    sampling_workers: 1  # Ordered RNG producer plus numerical worker; 0 uses serial sampling.
+    render_workers: 16  # Spawned processes, one numerical-library thread each; 0 is serial.
+    performance:
+      ram_cache: true
+      cache_geometry: true
+      preparation_workers: 2  # Measured equivalent to 8 threads; GPU compute dominates.
+      prepared_batches: 4
+      transfer_prefetch: true
+      torch_threads: 4
+      host_budget_gib: 192.0
+      vram_budget_gib: 24.0
+  spatial_heatmaps:
+    cmap: turbo
+    regions: [tissue, lesion]
+    lesion_column: Lesion
+    workers: 16
+    host_budget_gib: 192.0
+    png_compress_level: 1  # Lossless; faster encoding with larger files.
+  spatial_execution:
+    export_he_predictions: false  # Stream raw H&E vectors beside spatial outputs.
+    enabled: true
+    tiles_per_batch: 64
+    spectral_peak_budget: 262144
+    gat_tiles: 32
+    feature_cache: true
+    feature_cache_rows: 1024
+    output_rows: 16384
+    density_workers: 16
+  split: validation  # Saved checkpoint split used for latent/prediction and peak–IHC analysis.
+  ziln_scatter_split: validation  # Saved held-out split used for prediction scatter and additional calibration.
+  max_samples: null  # Optional stratified cap within saved splits; null uses all saved rows.
+  batch_size: 4096  # Pixel-mode tissue inference batch size; spatial inference uses spatial_execution or the saved tile default.
+  num_workers: 4  # Analysis and tissue-inference workers; does not change training workers.
+  density_mc_samples: 1000  # Hurdle draws per pixel/target, averaged to estimate unconditional density.
+  density_mc_seed: 20260719  # Isolated Monte Carlo seed; tissue exports use row-keyed streams for cap invariance.
+  umap_neighbors: 30  # UMAP neighborhood size.
+  umap_min_dist: 0.30  # UMAP minimum-distance parameter.
+  umap_metric: cosine  # Distance metric used for latent UMAP.
+  umap_random_state: 20260719  # UMAP reproducibility seed.
+  activity_chunk_size: 5000000  # Sparse values processed per peak-activity scan chunk.
+  activity_max_nonzeros: null  # Optional activity-scan cap; null scans the full labeled dataset.
+  heatmap_top_peaks: 512  # Most frequently active peaks shown in peaks/similarity/global/.
+  family_count: 32  # Number of hierarchical cosine peak-embedding families.
+  clustering_linkage: average  # Hierarchical linkage method for embedding cosine distances.
+  figure_dpi: 300  # Resolution of saved analysis PNGs.
+  point_size: 0.1  # Marker size in UMAP and validation scatter plots.
+  density_cmap: jet  # Continuous colormap for density-colored UMAP panels.
+  density_vmin_percentile: 1.0  # Lower percentile for density UMAP color limits.
+  density_vmax_percentile: 99.0  # Upper percentile for density UMAP color limits.
+  calibration_coverage_levels: [0.50, 0.90]  # Central positive-branch predictive intervals to score.
+  calibration_pit_bins: 50  # Histogram bins for positive-branch probability-integral-transform diagnostics.
+  exceedance_thresholds: []  # Optional density thresholds for P(y > t) summaries; empty disables them.
+
+latent_variance:
+  # Reads existing spatial latents; input and output paths follow the selected run.
+  slide_column: batch  # Observation column defining slides for variance decomposition.
+  chunk_size: 8192  # Exported latent rows read per chunk; covariance uses float64.
+  figure_dpi: 300  # Resolution of the explained-variance PNG.
+
+# CLI-only workflow after successful training; --smoke-test disables it.
+post_training:
+  enabled: true
+  run_analysis: true
+  run_inference: true
+  run_spatial_heatmaps: true
+  run_latent_variance: true
+  overwrite_inference: true

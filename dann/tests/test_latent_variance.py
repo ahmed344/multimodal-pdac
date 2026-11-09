@@ -11,7 +11,7 @@ import pytest
 import yaml
 from scipy import sparse
 
-from dann.config import latent_variance_settings, load_config
+from dann.config import latent_variance_settings, load_config, read_config
 from dann.latent_variance import compute_latent_variance, latent_columns, main
 
 
@@ -137,7 +137,7 @@ def test_config_validation(key, value):
 def test_cli_and_legacy_config(tmp_path, constant):
     values = np.ones((3, 2)) if constant else np.arange(6).reshape(3, 2)
     paths = write_inputs(tmp_path, values, ["a", "a", "b"])
-    config = yaml.safe_load(Path("dann/config.yaml").read_text())
+    config = read_config(Path("dann/config.yaml"))
     config.pop("latent_variance")
     config_path = tmp_path / "config.yaml"
     config_path.write_text(yaml.safe_dump(config))

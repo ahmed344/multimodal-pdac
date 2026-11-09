@@ -13,10 +13,11 @@ from typing import Any
 
 import numpy as np
 import torch
+import yaml
 from torch import nn
 from torch.utils.data import DataLoader
 
-from dann.config import load_config, resolve_device, seed_everything
+from dann.config import load_config, read_config, resolve_device, seed_everything
 from dann.data_loader import create_data_bundle, sparse_collate
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion
@@ -265,7 +266,7 @@ def main(argv: list[str] | None = None) -> None:
             break
     else:
         raise RuntimeError('Could not snapshot a stable reference checkpoint.')
-    (root/'source_config.yaml').write_bytes(args.config.read_bytes())
+    (root/'source_config.yaml').write_text(yaml.safe_dump(read_config(args.config), sort_keys=False))
     for source in Path('dann').rglob('*.py'):
         destination = root/'source'/source
         destination.parent.mkdir(parents=True, exist_ok=True)

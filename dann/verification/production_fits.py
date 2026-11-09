@@ -28,7 +28,7 @@ import yaml
 
 from dann.checkpoints import (architecture_contract, sampling_contract, validate_checkpoint,
                               validate_sampling_contract, validate_training_data_contract)
-from dann.config import load_config
+from dann.config import load_config, read_config
 from dann.data_loader import create_data_bundle
 from dann.losses import ZILNLoss
 from dann.model import AdversarialLatentFusion
@@ -122,8 +122,8 @@ def gpu_snapshot() -> dict:
 def prepare(source: Path, output: Path, archive: Path) -> dict:
     """Resolve isolated configs and establish immutable pre-training evidence."""
     output.mkdir(parents=True, exist_ok=False)
-    raw = yaml.safe_load(source.read_text())
-    (output / 'source_config.yaml').write_text(source.read_text())
+    raw = read_config(source)
+    (output / 'source_config.yaml').write_text(yaml.safe_dump(raw, sort_keys=False))
     stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + os.urandom(3).hex()
     runs = []
     for name, aggregation, halo in [('A', 'cnn', 6), ('B', 'mlp', 3)]:

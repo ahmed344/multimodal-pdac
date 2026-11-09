@@ -26,7 +26,7 @@ import yaml
 
 from dann.analysis_execution import digest_file, fingerprint
 from dann.checkpoints import architecture_contract, checkpoint_config, validate_checkpoint
-from dann.config import load_config, resolve_execution, seed_everything
+from dann.config import load_config, read_config, resolve_execution, seed_everything
 from dann.data_loader import create_data_bundle, stratified_cap_indices
 from dann.initialization import initialize_supervised_heads
 from dann.model import AdversarialLatentFusion
@@ -73,7 +73,8 @@ def prepare(root: Path, source: Path, baseline_path: Path) -> None:
     assert source_config['loss'] == baseline['config']['loss']
     assert target_contract(source_config) == baseline['target_transform']
     assert baseline['epoch'] + 1 == 116
-    (root/'source_config.yaml').write_text(source.read_text())
+    raw = read_config(source)
+    (root/'source_config.yaml').write_text(yaml.safe_dump(raw, sort_keys=False))
     # Metadata preflight is backed; resident spectra are only allocated for fitting.
     c = copy.deepcopy(source_config)
     c['performance'] = {}
@@ -98,7 +99,6 @@ def prepare(root: Path, source: Path, baseline_path: Path) -> None:
         quartiles = np.quantile(stroma[bundle.metadata.target_valid_mask[train, s]], [.25, .5, .75]).tolist()
         runs = {}
         initial_hashes, head_hashes = [], []
-        raw = yaml.safe_load(source.read_text())
         for arm in ARMS:
             candidate = copy.deepcopy(raw)
             candidate['results'].update(root=str(root/'runs'), run_name=arm)

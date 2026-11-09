@@ -21,9 +21,10 @@ from time import perf_counter
 import h5py
 import numpy as np
 import torch
+import yaml
 from torch.utils.data import DataLoader, Dataset
 
-from dann.config import load_config, performance_settings, seed_everything
+from dann.config import load_config, performance_settings, read_config, seed_everything
 from dann.data_loader import DataBundle, SparseAnnDataDataset, create_data_bundle, sparse_collate
 from dann.execution import PreparedLoader
 from dann.losses import ZILNLoss
@@ -270,7 +271,10 @@ def main() -> None:
         relative = source if not source.is_absolute() else Path('config.yaml')
         destination = args.output / 'source' / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        if source == args.config:
+            destination.write_text(yaml.safe_dump(read_config(source), sort_keys=False))
+        else:
+            shutil.copy2(source, destination)
     manifest = dict(arguments={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                     config=config, torch_version=torch.__version__, numpy_version=np.__version__,
                     h5py_version=h5py.__version__,

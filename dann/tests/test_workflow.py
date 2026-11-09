@@ -15,7 +15,7 @@ from scipy import sparse
 
 from dann import workflow
 from dann.checkpoints import architecture_contract
-from dann.config import apply_smoke_overrides, load_config, post_training_settings, resolve_execution
+from dann.config import apply_smoke_overrides, load_config, post_training_settings, read_config, resolve_execution
 from dann.spatial import _file_identity, build_latent_output_table, build_output_table
 from dann.targets import target_contract
 
@@ -89,7 +89,7 @@ def test_invalid_settings(supplied):
 
 @pytest.mark.parametrize('supplied', ['omitted', {}, {'run_analysis': False}, None])
 def test_yaml_settings(tmp_path, supplied):
-    config = yaml.safe_load(Path('dann/config.yaml').read_text())
+    config = read_config(Path('dann/config.yaml'))
     if supplied == 'omitted':
         config.pop('post_training')
     else:

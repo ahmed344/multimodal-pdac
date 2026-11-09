@@ -15,6 +15,7 @@ import pytest
 from scipy import sparse
 import yaml
 
+from dann.config import read_config
 from msi_preprocess.apply import apply, clean_slide, update_dann_config
 from msi_preprocess.config import load_config, validate_config
 from msi_preprocess.fit import fit, integration_parameters, load_fit, selection_decisions
@@ -60,7 +61,7 @@ def fixture(tmp_path: Path, *, interleaved=True) -> tuple[dict, dict]:
     lesion = tissue[rng.choice(2*n, 240, replace=False)].copy()
     tissue.write_h5ad(tmp_path / "tissue.h5ad")
     lesion.write_h5ad(tmp_path / "lesion.h5ad")
-    dann = yaml.safe_load(Path("dann/config.yaml").read_text())
+    dann = read_config(Path("dann/config.yaml"))
     dann["data"].pop("preprocessing_fingerprint", None)
     dann["data"].update(path=str(tmp_path / "lesion.h5ad"), context_path=str(tmp_path / "tissue.h5ad"),
                          train_fraction=.9, validation_fraction=.1, test_fraction=0, matrix_key="X", intensity_transform="log1p")

@@ -32,7 +32,7 @@ import yaml
 from dann.analysis_execution import digest_file, fingerprint
 from dann.batch_alignment import AlignmentEvaluationError, NAMES
 from dann.checkpoints import checkpoint_config, validate_checkpoint
-from dann.config import apply_smoke_overrides, load_config, resolve_execution
+from dann.config import apply_smoke_overrides, load_config, read_config, resolve_execution
 from dann.data_loader import create_data_bundle
 from dann.model import AdversarialLatentFusion
 from dann.spatial import _file_identity
@@ -174,7 +174,7 @@ def prepare(root: Path, previous: Path, source: Path) -> None:
     for name in frozen:
         shutil.copyfile(previous/name, root/name)
         depend(previous/name)
-    shutil.copyfile(source, root/'root_config_original.yaml')
+    (root/'root_config_original.yaml').write_text(yaml.safe_dump(read_config(source), sort_keys=False))
     c = make_config(c,root,'source',(0.,0.,0.))
     c['analysis']['exceedance_thresholds'] = old['cd8_thresholds']
     (root/'source_config.yaml').write_text(yaml.safe_dump(c,sort_keys=False))
@@ -185,8 +185,11 @@ def prepare(root: Path, previous: Path, source: Path) -> None:
         relative = Path('dann/config.yaml') if path == source else path.relative_to(repository)
         dest = root/'source'/relative
         dest.parent.mkdir(parents=True,exist_ok=True)
-        shutil.copyfile(path,dest)
-        sources[str(relative)] = digest_file(path)
+        if path == source:
+            shutil.copyfile(root/'root_config_original.yaml', dest)
+        else:
+            shutil.copyfile(path,dest)
+        sources[str(relative)] = digest_file(dest)
     m = copy.deepcopy(old)
     m.update(version=3, created_utc=datetime.now(timezone.utc).isoformat(), previous=str(previous),
         sources=sources, files={n:digest_file(root/n) for n in frozen}, dependencies=dependencies,
@@ -874,6 +877,8 @@ def audit(root: Path) -> None:
     m = manifest_for(root)
     if digest_file(Path(m['root_config'])) != m['root_config_sha256']:
         raise ValueError('User root configuration changed during the study.')
+    if read_config(Path(m['root_config'])) != read_config(root/'root_config_original.yaml'):
+        raise ValueError('User configuration settings changed during the study.')
     receipts = []
     for p in (root/'stages').glob('*.json'):
         receipt = json.loads(p.read_text())

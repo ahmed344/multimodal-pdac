@@ -76,9 +76,11 @@ def clean_slide(counts: sparse.csr_matrix, retained: np.ndarray, multiplier: flo
 
 def update_dann_config(path: str | Path, output: Path, manifest: dict) -> None:
     """Patch only preprocessing fields, preserving all unrelated YAML and comments."""
+    from dann.config import read_config
+
     path = Path(path)
     text = path.read_text()
-    parsed = yaml.safe_load(text)
+    parsed = read_config(path)
     if parsed["training"].get("resume_checkpoint"):
         raise ValueError("Changed MSI inputs require fresh training; clear resume_checkpoint before updating DANN.")
     if parsed["data"]["matrix_key"] != "X" or parsed["data"]["intensity_transform"] != "log1p":

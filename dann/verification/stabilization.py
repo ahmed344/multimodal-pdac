@@ -19,7 +19,7 @@ from scipy.special import expit, ndtr
 import torch
 import yaml
 
-from dann.config import load_config, resolve_execution, resolve_device, seed_everything
+from dann.config import load_config, read_config, resolve_execution, resolve_device, seed_everything
 from dann.data_loader import create_data_bundle
 from dann.initialization import initialize_supervised_heads
 from dann.losses import ZILNLoss
@@ -340,7 +340,7 @@ def main():
     if args.prepare_only:
         root.mkdir(parents=True, exist_ok=False)
         (root/'configs').mkdir(); (root/'arms').mkdir()
-        shutil.copyfile(args.config, root/'source_config.yaml')
+        (root/'source_config.yaml').write_text(yaml.safe_dump(read_config(args.config), sort_keys=False))
         for path in Path('dann').rglob('*.py'):
             dest = root/'source'/path
             dest.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,97 @@
+# DANN training settings, loaded through config.yaml.
+# Keep shared data/model/results/loss settings in config.yaml.
+
+monitoring:
+  enabled: true
+  gradient_updates_per_epoch: 5  # Unique evenly spaced logical updates; null monitors every update.
+
+training:
+  seed: 20260719  # Seed for data splits, initialization, and loader shuffling.
+  device: cuda  # Runtime device: auto, cpu, cuda, or cuda:<index>.
+  epochs: 300  # Maximum fitting epochs; validation/test labels are never included in a final refit.
+
+  # Automatically selected execution settings. Edit these blocks rather than
+  # adding competing top-level batch_size, learning_rate, or worker overrides.
+  pixel:  # Used only when aggregation and both prediction heads are MLPs.
+    batch_size: 4096  # Supervised sparse pixels per optimizer step.
+    validation_batch_size: 8192  # Supervised sparse pixels per validation step.
+    learning_rate: 0.001  # AdamW learning rate for pixel mode.
+    num_workers: 20  # Read-only, process-local HDF5 data-loader workers.
+    prefetch_factor: 4  # Batches prefetched per worker; used only when workers > 0.
+
+  spatial:  # Used when any selected aggregation/head component is a CNN or GATv2.
+    core_size: 16  # Core side length in grid pixels; no edge pixels are discarded.
+    sampling_strategy: proportional_slide_tiles  # Independently shuffled slide queues, proportional row interleaving.
+    supervised_rows_per_batch: 4096  # Effective optimizer batch; final epoch batch may be smaller.
+    microbatch_rows: null  # One physical batch, benchmarked at radius 1.5; use 16384 for two accumulation steps.
+    tiles_per_batch: 8  # Validation/test tile count; also training count with legacy shuffled_tiles.
+    learning_rate: 0.001  # AdamW learning rate for spatial mode; not automatically scaled with batch size.
+    num_workers: 20  # Tile-reading workers; tiles shuffle across slides without requiring distinct slides.
+    prefetch_factor: 4  # Tile batches prefetched per worker; larger batches also increase host-memory use.
+    # Halo is derived: aggregation radius + max(biology radius, discriminator radius, H&E radius).
+    # Selected depths/radii determine the halo and supports recorded in execution metadata.
+    # Only occupied, selected core rows supply labels; all occupied halo MSI remains context.
+
+  # Shared optimization and adversarial schedule.
+  pin_memory: true  # Pin loader tensors for host-to-CUDA transfers.
+  weight_decay: 0.00001  # AdamW decoupled weight decay.
+  beta1: 0.9  # AdamW first-moment coefficient.
+  beta2: 0.999  # AdamW second-moment coefficient.
+  head_initialization:
+    enabled: true
+    output_weight_scale: 0.01
+    min_positive_sigma: 0.1
+  warmup:
+    epochs: 1
+    start_factor: 0.1
+  lr_scheduler:  # Independent validation objective; only metric follows current YAML on resume.
+    enabled: true
+    metric: total_loss  # Also supports supervised_objective, cd8_loss, and batch_aware_objective (requires discriminator).
+    factor: 0.5
+    patience: 5
+    cooldown: 2
+    threshold: 0.001  # Absolute improvement in scheduler-metric units, independent of early stopping.
+    min_lr_factor: 0.01  # Floor relative to the selected mode's original starting LR.
+    eps: 0.0  # Allow reductions all the way to the floor, including very small LRs.
+  gradient_clip_norm: 5.0  # Maximum global gradient norm; null disables clipping.
+  grl_max_lambda: 0.25  # Finite, nonnegative maximum GRL strength; fixed multiplier for the selection penalty.
+  grl_schedule: dann  # GRL schedule: constant, linear, or dann logistic ramp.
+  grl_gamma: 10.0  # Steepness of the DANN logistic schedule.
+  grl_horizon_updates: null  # Full-fit epoch-based schedule derived from actual logical updates; the pilot's 500-update horizon is not used.
+  early_stopping_enabled: true  # Disable only for bounded diagnostic comparisons.
+  early_stopping_metric: total_loss  # Also supports supervised_objective, cd8_loss, and batch_aware_objective (requires discriminator).
+  early_stopping_patience: 10  # Epochs without improvement in the validation selection metric.
+  early_stopping_min_delta: 0.001  # Minimum improvement in the selected score's units.
+  checkpoint_every: 1  # Save latest.pt every this many epochs; improvements also save best.pt.
+  resume_checkpoint: null  # Retain saved optimizer/sampling settings; current performance controls, epochs, workers, prefetch, scheduler metric, and early stopping may override.
+  deterministic_algorithms: false  # Request deterministic PyTorch algorithms when possible.
+
+  # --smoke-test overrides, recorded in resolved_config.yaml under a separate smoke/ run directory.
+  smoke_train_samples: 2048  # Stratified cap on training labels; all labeled-file MSI context is retained.
+  smoke_validation_samples: 512  # Stratified validation-label cap.
+  smoke_test_samples: 512  # Stratified test-label and analysis cap.
+  smoke_epochs: 1  # Epoch count for smoke training.
+  smoke_num_workers: 0  # Worker count for smoke training and analysis.
+  smoke_core_size: 8  # Spatial smoke core side length; the halo is still derived from component radii.
+  smoke_tiles_per_batch: 2  # Spatial smoke evaluation tiles.
+  smoke_supervised_rows_per_batch: 64  # Scattered capped labels occupy many tiles; bound smoke training memory.
+
+# Execution-only profile measured on the RTX 5090; historical configurations default to backed loading.
+# Enabled residency uses one shared CSR cache and CPU threads, overriding process workers.
+performance:
+  async_artifacts: true  # CPU workers save checkpoints/audits/history and render curves while the next epoch trains.
+  ram_cache: true
+  he_ram_cache: true  # One shared float32 H&E cache for initialization and all supervised splits.
+  startup_workers: 8  # Measured startup optimum: parallel MSI transforms and train-only H&E reductions.
+  cache_geometry: true
+  torch_threads: 4  # Intra-operation CPU threads; null keeps the process default.
+  preparation_workers: 2  # Cached-data GPU benchmark: more workers gave no meaningful throughput gain.
+  prepared_batches: 4  # Two requests per preparation worker; completed results retain sampler order.
+  transfer_prefetch: true  # One pinned staging batch on a dedicated CUDA stream.
+  validation_tiles: 8  # Tested physical validation batch for 32x32 cores; tiles_per_batch still defines losses.
+  validation_peak_budget: 262144  # Explicit values also set the inner inference chunk cap; null keeps model limits.
+  validation_gat_tiles: 32  # Null inherits model.gatv2_tile_budget.
+  validation_feature_cache: true  # Pass-local pooled spectra; requires both caches above.
+  feature_cache_rows: 1024
+  host_budget_gib: 128.0
+  vram_budget_gib: 24.0

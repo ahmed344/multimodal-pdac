@@ -157,6 +157,50 @@ def monitoring_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     return resolved
 
 
+def _read_yaml_mapping(path: Path) -> dict[str, Any]:
+    """Read a source mapping with file-specific errors."""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            config = yaml.safe_load(handle)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"Configuration file not found: {path}") from error
+    except yaml.YAMLError as error:
+        raise ValueError(f"Invalid YAML in configuration file {path}: {error}") from error
+    if not isinstance(config, dict) or any(not isinstance(key, str) for key in config):
+        raise ValueError(f"Configuration file {path} must contain a mapping with string keys.")
+    return config
+
+
+def read_config(path: Path) -> dict[str, Any]:
+    """Combine YAML sources without applying defaults or resolving execution.
+
+    Optional ``includes`` lists fragments relative to the main file. Fragments
+    cannot include other files or repeat top-level sections from any source.
+    The returned dictionary has no file references and can be saved independently.
+    Other configured paths retain their existing interpretation.
+    """
+    path = Path(path)
+    config = _read_yaml_mapping(path)
+    includes = config.pop("includes", [])
+    if not isinstance(includes, list) or any(
+        not isinstance(value, str) or not value.strip() for value in includes
+    ):
+        raise ValueError(f"Configuration {path}: includes must be a list of nonempty file paths.")
+    sources = {section: path for section in config}
+    for reference in includes:
+        included_path = path.parent / reference
+        fragment = _read_yaml_mapping(included_path)
+        if "includes" in fragment:
+            raise ValueError(f"Nested includes are not supported: {included_path}")
+        duplicates = config.keys() & fragment.keys()
+        if duplicates:
+            details = ", ".join(f"{key} (already in {sources[key]})" for key in sorted(duplicates))
+            raise ValueError(f"Duplicate configuration sections in {included_path}: {details}")
+        config.update(fragment)
+        sources.update({section: included_path for section in fragment})
+    return config
+
+
 def load_config(path: Path) -> dict[str, Any]:
     """Load and minimally validate a YAML configuration.
 
@@ -167,8 +211,7 @@ def load_config(path: Path) -> dict[str, Any]:
         dict[str, Any]: Mutable nested configuration dictionary.
     """
 
-    with path.open("r", encoding="utf-8") as handle:
-        config = yaml.safe_load(handle)
+    config = read_config(path)
     required_sections = {"data", "model", "loss", "training", "analysis"}
     missing = required_sections.difference(config)
     if missing:
