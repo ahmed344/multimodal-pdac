@@ -31,11 +31,11 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: "peaks_embedding_8_deep_cca_d16_latent_128_all_0p01"  # Separate outputs for the provisional CCA choice.
+  run_name: "peaks_embedding_8_deep_cca_d16_latent_512_all_0p01"  # Separate outputs for the provisional CCA choice.
 
 model:
   num_peaks: 5023  # Number of aligned m/z bins in both MSI files.
-  latent_dim: 128  # Aggregation output width; this is the exported latent before either head.
+  latent_dim: 512  # Aggregation output width; this is the exported latent before either head.
 
   # 1. Per-pixel spectral processing: learned embeddings -> intensity weighting
   #    -> per-peak MLP -> mean pooling over active peaks. Empty spectra pool to zero.
@@ -48,15 +48,15 @@ model:
       peak_mlp_residual: true  # Normalized skips around equal-width hidden blocks.
       pool_centering: zero_input  # occurrence: none/zero_input; dictionary: none/dictionary_mean.
       embedding_dim: 8  # Width of each learned peak embedding.
-      peak_hidden_dims: [128, 128]  # Hidden widths of the original per-peak MLP.
-      peak_output_dim: 128  # Pooled pixel width passed to the aggregation component.
+      peak_hidden_dims: [512, 512]  # Hidden widths of the original per-peak MLP.
+      peak_output_dim: 512  # Pooled pixel width passed to the aggregation component.
 
   # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
   aggregation:
-    type: cnn  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
+    type: mlp  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
     mlp:
       residual: true
-      hidden_dims: [128, 128]  # Hidden widths after pooling; final width is latent_dim.
+      hidden_dims: [512, 512]  # Hidden widths after pooling; final width is latent_dim.
     cnn:
       channels: 128  # Pointwise input projection and hidden convolution width.
       depth: 3  # Number of 3x3, stride-one convolutions; spatial radius equals depth.
@@ -74,10 +74,10 @@ model:
   # 3. Prediction heads: choices are independent; all consume aggregation latents.
   heads:
     biology:
-      type: cnn  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
+      type: mlp  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
       mlp:
         residual: true
-        hidden_dims: [128, 64, 32]  # Original pointwise biology-head hidden widths.
+        hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
       cnn:
         channels: 128  # Hidden spatial width; final pointwise projection emits target parameters.
         depth: 3  # Neighborhood radius in latent-grid pixels.

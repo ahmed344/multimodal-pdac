@@ -6,6 +6,28 @@ analysis:
   sample_scope: lesion  # Filter saved split rows after inference; context stays unchanged.
   lesion_column: Lesion
   slide_column: batch
+  # Separate opt-in CLI: python -m dann.latent_geometry --config dann/config.yaml
+  # This block does not add work to ordinary analysis or post-training workflows.
+  latent_geometry:
+    geometries: [raw_cosine, centered_cosine, raw_euclidean, standardized_euclidean, pca_16, pca_32, pca_99, pca_32_partial]
+    guided_geometry: pca_32_partial  # Select an enabled Euclidean geometry after reviewing discovery diagnostics.
+    cd8_weights: [0.0, 0.1, 0.3]
+    threshold_quantiles: [0.25, 0.5, 0.75, 0.9]  # All eligible saved training labels; frozen before validation.
+    whitening_power: 0.5  # PC scale = max(eigenvalue, floor)^(-power/2); 0 is unwhitened, 1 fully whitened.
+    eigenvalue_floor: 0.0001  # Relative to the largest training eigenvalue.
+    n_neighbors: [30]  # After distance diagnostics, sweep selected geometries with [30, 60, 120].
+    min_dist: 0.3
+    seeds: [20260719]  # Add seeds for layout-neighborhood stability comparisons.
+    max_train_samples: 50000  # Stratified inference cap; null uses all saved training rows.
+    max_validation_samples: null  # Full eligible study validation; smoke runs explicitly cap this.
+    diagnostic_max_samples: 4000  # Bounded exact kNN panels and training-neighbor probe reference.
+    spatial_stride: 4  # One pixel per slide/grid cell; grid units, not an exclusion radius.
+    resamples: 3  # Slide and spatial-block subsampling without replacement.
+    resample_fraction: 0.8
+    distance_pairs: 20000  # Seeded distinct training pairs for RMS block-distance scaling.
+    plot_max_samples: 12000  # Display only; representation/coordinate exports retain every eligible row.
+    technical_columns: []  # Optional numeric obs columns for diagnostic correlations, never feature weights.
+    layouts: true  # UMAP fits training rows and transforms validation with frozen settings.
   features:
     latent_exports: {enabled: true, tables: true}
     variance: {enabled: true, tables: true, explained_variance: true}

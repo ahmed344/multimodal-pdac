@@ -28,6 +28,71 @@ def density_sampling_settings(analysis: Mapping[str, Any]) -> tuple[int, int]:
     return count, seed
 
 
+LATENT_GEOMETRIES = (
+    'raw_cosine', 'centered_cosine', 'raw_euclidean', 'standardized_euclidean',
+    'pca_16', 'pca_32', 'pca_99', 'pca_32_partial',
+)
+
+
+def latent_geometry_settings(settings: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Validate the separate, opt-in frozen-checkpoint geometry experiment CLI."""
+    defaults = dict(geometries=list(LATENT_GEOMETRIES), guided_geometry='pca_32_partial',
+        cd8_weights=[0., .1, .3], threshold_quantiles=[.25, .5, .75, .9],
+        whitening_power=.5, eigenvalue_floor=1e-4, n_neighbors=[30], min_dist=.3,
+        seeds=[20260719], max_train_samples=50000, max_validation_samples=None,
+        diagnostic_max_samples=4000, spatial_stride=4, resamples=3,
+        resample_fraction=.8, distance_pairs=20000, plot_max_samples=12000,
+        technical_columns=[], layouts=True)
+    if settings is not None and not isinstance(settings, Mapping):
+        raise ValueError('analysis.latent_geometry must be a mapping.')
+    supplied = dict(settings or {})
+    if supplied.keys() - defaults.keys():
+        raise ValueError('Unknown analysis.latent_geometry settings.')
+    result = {**defaults, **supplied}
+    for key in ('geometries', 'cd8_weights', 'threshold_quantiles', 'n_neighbors', 'seeds', 'technical_columns'):
+        value = result[key]
+        if not isinstance(value, list) or (key != 'technical_columns' and not value):
+            raise ValueError(f'analysis.latent_geometry.{key} must be a nonempty list.')
+        if any(not isinstance(v, (str, int, float)) or isinstance(v, bool) for v in value) or len(set(value)) != len(value):
+            raise ValueError(f'analysis.latent_geometry.{key} must contain unique scalar values.')
+    if any(v not in LATENT_GEOMETRIES for v in result['geometries']):
+        raise ValueError('Unknown latent geometry.')
+    if result['guided_geometry'] not in result['geometries'] or result['guided_geometry'].endswith('cosine'):
+        raise ValueError('guided_geometry must select an enabled Euclidean geometry.')
+    for key in ('technical_columns',):
+        if any(not isinstance(v, str) or not v.strip() for v in result[key]):
+            raise ValueError(f'analysis.latent_geometry.{key} requires nonempty column names.')
+    for key in ('max_train_samples', 'max_validation_samples', 'diagnostic_max_samples',
+                'spatial_stride', 'resamples', 'distance_pairs', 'plot_max_samples'):
+        v = result[key]
+        if v is None and key.startswith('max_'):
+            continue
+        minimum = 0 if key == 'resamples' else 4 if key in ('max_train_samples', 'max_validation_samples', 'diagnostic_max_samples') else 1
+        if isinstance(v, bool) or not isinstance(v, int) or v < minimum:
+            raise ValueError(f'analysis.latent_geometry.{key} must be an integer >= {minimum}.')
+    for key, minimum in (('n_neighbors', 2), ('seeds', 0)):
+        if any(isinstance(v, bool) or not isinstance(v, int) or v < minimum for v in result[key]):
+            raise ValueError(f'analysis.latent_geometry.{key} requires integers >= {minimum}.')
+    for key, values, low, high, strict in (
+        ('cd8_weights', result['cd8_weights'], 0, 1, False),
+        ('threshold_quantiles', result['threshold_quantiles'], 0, 1, True),
+        ('whitening_power', [result['whitening_power']], 0, 1, False),
+        ('eigenvalue_floor', [result['eigenvalue_floor']], 0, 1, True),
+        ('min_dist', [result['min_dist']], 0, 1, False),
+        ('resample_fraction', [result['resample_fraction']], 0, 1, True),
+    ):
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not np.isfinite(v)
+               or not (low < v < high if strict else low <= v <= high) for v in values):
+            raise ValueError(f'Invalid analysis.latent_geometry.{key}.')
+    if result['cd8_weights'][0] != 0:
+        raise ValueError('cd8_weights must start with the unguided weight 0 control.')
+    if result['threshold_quantiles'] != sorted(result['threshold_quantiles']):
+        raise ValueError('threshold_quantiles must be increasing.')
+    if not isinstance(result['layouts'], bool):
+        raise ValueError('analysis.latent_geometry.layouts must be boolean.')
+    return result
+
+
 # Omitted switches preserve the established analysis outputs. New analyses opt in.
 ANALYSIS_FEATURE_DEFAULTS = {
     'latent_exports': dict(enabled=True, tables=True),
@@ -282,6 +347,7 @@ def load_config(path: Path) -> dict[str, Any]:
     config["post_training"] = post_training_settings(config.get("post_training"))
     config.pop("latent_variance", None)  # Accepted, retired spatial-export diagnostic.
     analysis_feature_settings(config["analysis"])
+    latent_geometry_settings(config['analysis'].get('latent_geometry'))
     config["data"]["cd8_normalization"] = normalization_settings(config["data"].get("cd8_normalization"))
     target_contract(config)
     return resolve_execution(config)

@@ -13,7 +13,7 @@ training:
   # Automatically selected execution settings. Edit these blocks rather than
   # adding competing top-level batch_size, learning_rate, or worker overrides.
   pixel:  # Used only when aggregation and both prediction heads are MLPs.
-    batch_size: 4096  # Supervised sparse pixels per optimizer step.
+    batch_size: 2048  # Supervised sparse pixels per optimizer step.
     validation_batch_size: 8192  # Supervised sparse pixels per validation step.
     learning_rate: 0.001  # AdamW learning rate for pixel mode.
     num_workers: 20  # Read-only, process-local HDF5 data-loader workers.

@@ -829,6 +829,116 @@ Fewer than four rows or zero total variance produce an explicit skip reason.
 and package versions. PCA, neighbor graphs, and embeddings are separate validated
 caches. Direct UMAP keeps its existing parameters and filenames under `umap/`.
 
+### Controlled discovery and CD8-guided geometry experiments
+
+Run a separate analysis against a frozen checkpoint; the existing direct/PCA
+UMAPs remain references:
+
+```bash
+python -m dann.latent_geometry --config dann/config.yaml --checkpoint /path/to/model/best.pt
+# Capped real-data verification, including all geometry arms and UMAP rendering:
+python -m dann.latent_geometry --config dann/config.yaml --checkpoint /path/to/model/best.pt --smoke-test
+# Diagnose higher-dimensional neighborhoods before spending time on layouts:
+python -m dann.latent_geometry --config dann/config.yaml --checkpoint /path/to/model/best.pt --diagnostics-only
+```
+
+`analysis.latent_geometry` controls this CLI only. It does not enable extra
+post-training work. Outputs default to a new timestamped directory beneath the
+checkpoint run's `analysis/latent_geometry/`; `--output` must name a new or empty
+directory. A checksummed inference cache lives beside these directories. The CLI
+uses saved, disjoint training/validation row IDs and frozen checkpoint model,
+preprocessing and target semantics. Working YAML source paths and analysis
+preferences remain configurable. Training inference uses a sequential evaluation
+loader so training samplers cannot repeat or reweight rows. Spatial model context
+is retained. Lesion and valid-CD8 eligibility is applied after inference, with
+separate flags for non-lesion exclusion and invalid CD8, plus the specific
+insufficient-non-tumor-area or normalized-ratio-above-one reason. Mixed tumor–stroma
+pixels remain eligible. The saved 90/10 split is not changed.
+
+The initial discovery comparison includes raw cosine, globally centered cosine,
+raw Euclidean, feature-standardized Euclidean, 16/32/99%-variance PCA, and
+32-PC partial whitening. The same eligible rows enter every arm. Discovery still
+uses an IHC-supervised latent representation. All means, channel scales, PCA
+components and whitening scales are fitted on training rows. For alpha = 0.5,
+PC scores are multiplied by `max(lambda, floor)^(-alpha/2)`, with the default
+floor equal to `1e-4 * largest_training_eigenvalue`. Feature standardization is
+distinct from PCA whitening. Global centering before cosine is distinct from
+row-wise centering for correlation distance. Small samples cap the requested PC
+count at `min(width, n_train - 1)`; undefined geometries are explicitly skipped.
+
+The guided view combines the selected **Euclidean** discovery representation with
+`[P(CD8 > 0), P(CD8 > t1), ...]`, using the existing hurdle exceedance calculation.
+Thresholds are positive-label training quartiles and the 90th percentile, using
+all eligible saved training labels before any inference cap. They are frozen for
+validation, clipped to the checkpoint logit epsilon at the boundaries, and
+deduplicated. No positive labels yields a documented presence-only vector.
+These are exploratory thresholds, not established biological cutoffs.
+
+RMS distances from seeded, distinct training-row pairs normalize both blocks.
+The mixture satisfies
+`d²/sL² = (1-w)*dL²/sL² + w*dQ²/sQ²`. Weights 0, 0.1 and 0.3 are compared;
+weight zero exactly reuses the selected discovery features and layout. A constant
+probability block cannot be normalized and produces an explicit skip. Guidance
+summarizes checkpoint predictions; a smoother CD8 gradient is an intended
+consequence, not independent biological validation.
+
+Every UMAP uses the same neighbors (initially 30), min_dist (0.3), and seed.
+UMAP fits the training representation and transforms held-out validation rows;
+validation is never used to refit the geometry or layout. This differs from the
+older validation-fitted reference UMAPs. After reviewing neighborhood diagnostics,
+restrict `geometries` to candidate arms (including `guided_geometry`) and set
+`n_neighbors: [30, 60, 120]` or add `seeds` for sensitivity checks. No tumor
+residualization, slide quotas, covariance deflation or graph rewiring is applied.
+MNN augmentation, diffusion/PHATE and supervised projection comparators remain
+follow-up experiments conditional on biological and distance diagnostics.
+
+The default training inference cap is 50,000 stratified rows, and validation uses
+the complete saved split. Set either cap to null for all saved rows. A smoke run
+uses 256/192 rows, is labeled in provenance, and is unsuitable for biological
+conclusions. Numerical diagnostics use the same bounded row panels across arms:
+representative sampling, equal slide sampling, one pixel per slide/grid cell,
+and repeated slide/block subsampling without replacement. Grid thinning is not a
+minimum spatial separation guarantee. Exact kNN excludes self even with duplicate
+latent vectors; fewer available rows reduce the effective neighbor count.
+
+Artifacts include:
+
+- `preprocessing.npz`, `thresholds.json`, `settings.json`, `provenance.json`,
+  `eligibility.csv` and observation tables: frozen transforms, source/checkpoint
+  identities, original split hashes, caps, row identities and probability summaries.
+- `neighborhood_diagnostics.csv`, per-slide diagnostics and per-arm neighbor
+  arrays: same-slide fraction, leave-one-out chance, enrichment/excess, undirected
+  connected components, cross-slide edge distances and local-radius ratios,
+  within-slide spatial distances, observed-target neighborhood differences, and
+  overlap with raw Euclidean neighbors. These describe sampled graphs, not the
+  connectivity of a full-data graph. Neighbor indices address the `row_ids` array
+  saved alongside each graph, rather than source observation positions directly.
+- `heldout_probes.csv`: training-neighbor observed-label predictions scored on
+  validation for CD8 presence/exceedance/density and the auxiliary IHC targets,
+  overall and within training-defined tumor quartile strata. Both the training
+  reference and query sample are bounded by `diagnostic_max_samples`.
+- `train_associations.csv` and `validation_associations.csv`: leading training
+  PCs and latent norms versus observed targets and explicitly configured numeric
+  technical columns, pooled and within slides. They never become feature weights.
+- `calibration.csv`, `reliability.csv`, `distribution_metrics.json`: full eligible
+  validation presence/exceedance calibration and positive-branch PIT/coverage,
+  computed once because geometry cannot change checkpoint calibration.
+- Each arm's `representation.npz`, neighbor arrays, UMAP coordinates, static PNG
+  and offline HTML viewer; `layout_stability.csv` measures neighborhood agreement
+  across layout seeds and preservation of higher-dimensional neighbors. The plot
+  cap affects display only. Representation and coordinate tables retain all
+  eligible validation rows, with source IDs and spatial coordinates in the
+  observation table.
+- `slide_observed_summary.csv` uses all eligible validation rows before diagnostic
+  downsampling. Connected components and 2D islands are not assigned biological
+  state labels. Any later state proportions must use full eligible rows.
+
+Review biological preservation, supported connections, spatial localization,
+rare regions and stability together. Neither maximum slide mixing nor attractive
+2D gradients selects a winner automatically. Within-slide validation retains
+spatial dependence and is not an independent-patient test. These analyses identify
+states associated with infiltration; susceptibility requires additional evidence.
+
 ## Configuration
 
 `analysis.split` and `analysis.ziln_scatter_split` default to `validation`.
