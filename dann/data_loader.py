@@ -651,10 +651,8 @@ def create_data_bundle(config: Mapping[str, Any], saved_splits=None, saved_ident
         resident = ResidentSpectra(path, data_config, int(performance['host_budget_gib'] * 2**30),
                                   workers=performance['startup_workers'])
         print(f'Startup: MSI cache ready in {resident.startup_seconds:.2f}s ({resident.nbytes / 2**30:.2f} GiB).', flush=True)
-    from dann.he import HETargetReader, he_settings
-    he = he_settings(config)
-    he_reader = (HETargetReader(path, data_config.get('he_features_key', 'hes_features'),
-                               metadata.num_observations, he['output_dim']) if he else None)
+    from dann.he import create_he_reader
+    he_reader = create_he_reader(config, path, metadata.num_observations)
     if he_reader is not None and performance['he_ram_cache']:
         print('Startup: loading shared H&E cache.', flush=True)
         he_reader.cache_in_memory(int(performance['host_budget_gib'] * 2**30))

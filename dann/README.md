@@ -4,6 +4,8 @@ This package fits sparse MALDI-MSI to four IHC targets and exports a shared late
 representation. MSI stays sparse, either backed or resident in RAM, until the spectral encoder
 pools learned peak responses. Aggregation and the prediction
 heads can independently use MLPs, local spatial CNNs, or residual GATv2 attention.
+Aggregation also supports a masked ConvNeXt feature pyramid. The main configuration
+selects this pyramid with sparse attention pooling and exports 256-dimensional latents.
 
 The four biology targets each use a structural-zero hurdle with three parameters:
 zero probability `pi`, positive logit mean `mu`, and positive logit standard
@@ -13,7 +15,7 @@ reversal path. Neither alignment method guarantees biological preservation.
 
 The main [`config.yaml`](config.yaml) also enables the provisional
 [Deep CCA H&E objective](#deep-cca-he-auxiliary-objective): dimension 16, MSI/H&E
-hidden widths 128/256, and weight 0.015. This is an explicit user choice despite
+hidden widths 64/128, and the coefficient in `loss.he_weight`. This is an explicit user choice despite
 the pilot missing its original 1% stromal probe-improvement threshold.
 
 The study configuration uses the linear MSI exports from
@@ -55,12 +57,34 @@ still disables them. Edit those switches in `config_analysis.yaml`.
 
 ## Spectral pooling
 
-`model.spectral_encoder.deep_sets` selects either `pooling: occurrence_mlp`
-with `normalization: count` (the historical default), or
-`pooling: intensity_weighted_dictionary` with `normalization: l1` or `l2`.
-Omitted fields reconstruct occurrence pooling; the checked-in configuration
-retains that selection. Changing pooling, normalization, centering, or the
-normalization floor requires fresh training.
+`model.spectral_encoder.deep_sets` selects `pooling: attention` with
+`normalization: softmax`, `pooling: occurrence_mlp` with `normalization: count`
+(the historical omitted-field default), or `pooling: intensity_weighted_dictionary`
+with `normalization: l1` or `l2`. The main configuration selects attention.
+Changing pooling, its dimensions, normalization, centering, or the normalization
+floor requires fresh training.
+
+Attention pooling concatenates a learned peak-identity embedding with
+`log1p(I)`, where `I` is the already transformed nonnegative intensity, then
+applies the token MLP. Each learned query scores the token as
+`query @ key / sqrt(key_dim) + log(I)` and softmax-normalizes within its spectrum.
+The weighted value summaries are concatenated and linearly projected to
+`peak_output_dim`. The defaults use eight queries, 128-dimensional tokens,
+32-dimensional keys, and 64-dimensional values. The main experiment instead uses
+four queries, token/key/value widths 64/16/32, a 16-dimensional peak embedding,
+two 64-wide token hidden layers, and a 256-wide pooled output.
+This is learned-query pooling, without pairwise self-attention between peaks.
+
+Duplicate entries are summed after the configured intensity transform; explicit
+zeros are excluded and empty/zero-only spectra return exact zero with finite
+gradients. Attention requires `pool_centering: none`. `normalization_epsilon`
+remains a dictionary-only floor. Both query scores and values depend on intensity;
+uniformly rescaling a spectrum can therefore change its representation. No dense
+pixel-by-peak-vocabulary matrix is constructed. Training microbatches retain whole
+spectra and support activation checkpointing. Inference merges stable running
+softmax statistics across `inference_peak_chunk_size` chunks, including chunks
+that split a spectrum. Evaluation feature caches store the final pooled width,
+which can differ from the token MLP width.
 
 Occurrence pooling applies the peak MLP separately to each intensity-scaled
 embedding, retaining its original dropout, stored-entry counts, and
@@ -87,15 +111,165 @@ version 8 introduced explicit pooling metadata. Versions 2–7 keep
 their original occurrence pooling and residual/centering interpretation, with
 unchanged parameter registration and seeded draws. Existing raw-embedding
 visualizations remain raw embeddings; an occurrence encoder does not have a
-single intensity-independent transformed dictionary.
+single intensity-independent transformed dictionary. Attention likewise has no
+single effective dictionary; raw peak-embedding plots remain identity-embedding
+plots and do not summarize its intensity-dependent attention weights.
+
+## Masked ConvNeXt feature pyramid
+
+`model.aggregation.type: convnext` enables the hierarchy in
+[`model_components/aggregation_convnext.py`](model_components/aggregation_convnext.py).
+It is an aggregation option; prediction-head selectors retain their existing choices.
+The main settings are:
+
+```yaml
+model:
+  latent_dim: 256
+  aggregation:
+    type: convnext
+    convnext:
+      channels: [32, 64, 128]
+      depths: [1, 1, 1]
+      kernel_size: 3
+      expansion: 4
+      pyramid_dim: 64
+      layer_scale_init: 1.0e-6
+      dropout: 0.10
+```
+
+Each ConvNeXt block has a depthwise spatial convolution, channel-only LayerNorm,
+an expanded GELU channel MLP, and a learnable scaled residual. Every block masks
+missing tissue. Between scales, 2×2 stride-two pooling averages only occupied
+children; a coarse pixel is occupied if any child is occupied. The feature pyramid
+uses pointwise lateral projections and nearest-neighbor top-down upsampling with
+normalized sums. Its final projection is combined with a pointwise projection of
+the original pooled spectrum. This local path preserves direct access to the
+center spectrum. The resulting full-resolution vector is the **exported latent**,
+and is also the input to biology, CCA, and alignment objectives.
+
+For odd kernel width `k` and stage depths `d_i`, the conservative input radius is
+`floor(k/2) * sum(d_i * 2**i) + 2**(number_of_stages-1) - 1`. The main radius is
+10 grid pixels. Spatial head radii add to this as before. Tile input origins are
+rounded down to a global grid multiple of `2**(number_of_stages-1)` (four here),
+including at negative coordinates. The footprint reserves up to three additional
+pixels to retain the complete halo. This keeps pooling cells fixed when core size,
+batching, or output selection changes; odd core sizes remain supported. Output
+rows, tissue holes, and target ordering are preserved. Support fractions retain
+the existing enclosing-square occupancy definition.
+
+This increases spatial context and memory relative to the three-layer CNN. The
+main attention peak budget is 262,144 per checkpointed group. Spatial batch and
+inference settings remain configurable; neither model size nor smooth maps alone
+establish better stromal representations or calibrated CD8 distributions.
+
+Architecture version **11** records attention dimensions/semantics, pyramid
+settings, masking/downsampling semantics, and grid alignment. Versions 2–10 still
+reconstruct their original architectures. The new architecture requires fresh
+training and uses run name `attention4_convnext_k3_latent256_bio256x256_fast`.
+The existing CCA objective, conditional alignment, 90/10 split, and hurdle
+logit-normal biology distribution are retained.
+
+The fast experiment has **770,652 parameters**, three ConvNeXt stages with depths
+`[1, 1, 1]`, and a two-layer biology MLP with hidden widths `[256, 256]`. Residual
+connections, normalization, precision, spectral checkpointing, 16×16 cores,
+4,096 supervised rows per update, full split coverage, and slide mixing remain
+unchanged. NHSIC and ANOVA retain weights 0.01 each. Soft-NN stays enabled with
+weight zero: undefined measurements are NaN in history, with invalid counts and
+reasons, and contribute exactly zero to the objective. Positive-weight alignment
+objectives still fail if an epoch has no valid evaluations.
+
+`training.progress_interval_seconds` is a positive finite number (default 30).
+Training reports optimizer updates, rows/s, elapsed time, and ETA after the first
+update and at that interval. Feature encoding and validation report separate row
+counts and phase boundaries. Reporting uses host bookkeeping without additional
+GPU synchronization; in-flight GPU work can make intermediate estimates approximate.
+The interval can change on resume. Gradient decomposition samples one update per
+epoch; clipping norms still cover every update, and validation retains full latent
+variance and participation-ratio diagnostics.
+
+Run the full-coverage three-epoch pilot, including representative/largest-batch
+benchmarks with AdamW and gradient monitoring, in new report and model directories:
+
+```bash
+python -m dann.verification.fast_latent_pilot \
+  --config dann/config.yaml \
+  --output data/verification/attention4_convnext_k3_latent256_bio256x256_fast
+```
+
+The pilot preserves the 300-epoch scheduling horizon, stops after epoch three,
+archives each completed epoch, and covers CCA training weights 0, 0.05, and 0.1.
+It verifies finite gradient norms on every update, valid weighted objectives, and
+saved checkpoints. Reports include epoch times/memory, held-out CD8 presence and
+exceedance Brier scores, positive-branch coverage/PIT, and row-aligned latent
+exports with explicit width metadata. The smaller architecture remains experimental
+pending assessment of stromal representation quality and H&E-mediated transfer.
+
+The completed 2026-11-12 fast pilot retained 1,499,209 training rows and 166,598
+validation rows. Each training epoch covered every row exactly once in 367 updates.
+All 1,101 preclip gradient norms and saved model states were finite; best/latest
+and all three epoch archives loaded with 256-dimensional architecture metadata.
+Epoch-one validation Soft-NN was unavailable due to degenerate similarity variance;
+its zero-weight contribution was zero, while NHSIC and ANOVA stayed valid.
+
+| Epoch | Training (s) | Validation (s) | Peak training VRAM (GiB) | Validation latent variance | Participation ratio | CD8 loss |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 207.40 | 13.60 | 2.72 | 0.000100 | 1.83 | 1.25031 |
+| 2 | 199.22 | 12.71 | 2.64 | 0.01306 | 3.08 | 1.25027 |
+| 3 | 195.17 | 13.60 | 2.60 | 95.9194 | 2.78 | 1.20357 |
+
+These are phase wall times on the RTX 5090, including configured monitoring and
+validation feature caching; startup and final artifact drainage are separate.
+Synthetic tests ran concurrently on CPU, so these are shared-host measurements.
+Peak process host memory was 24.02 GiB. The representative/largest epoch-zero
+peak footprints were 10.13/12.01 million visits. With AdamW and gradient
+decomposition on **every** measured update, their three-repeat median times were
+3.93/4.55 seconds and peak allocated VRAM was 2.28/2.47 GiB. Normal pilot training
+sampled gradient decomposition once per epoch. Total epoch-zero peak visits were
+3.71 billion. These measurements do not establish the earlier isolated-batch
+5.2× speedup for complete epochs against the larger architecture.
+
+On 166,584 valid held-out CD8 rows, epoch three had presence AUC **0.7230**, Brier
+score **0.23134**, positive-branch 50%/90% coverage **45.33%/87.00%**, and PIT KS
+**0.12628**. At normalized density thresholds 0.01/0.05/0.1, exceedance Brier
+scores were 0.11878/0.02869/0.00932. Mean predicted exceedance rates were
+5.86%/0.77%/0.26%, below observed 14.52%/3.05%/0.95%. The low latent participation
+ratio and this underprediction keep the model experimental; downstream stromal
+representation quality and H&E-mediated transfer have not been established.
+The [full pilot report](../data/verification/attention4_convnext_k3_latent256_bio256x256_fast/pilot.json)
+and [latent metadata](../data/verification/attention4_convnext_k3_latent256_bio256x256_fast/latent_metadata.json)
+record the measurements and the `[166598, 256]` row-aligned export. Earlier results
+and failure artifacts remain under their original run names.
+The [compact summary](../data/verification/attention4_convnext_k3_latent256_bio256x256_fast/summary.json)
+also records verification: 232 focused regressions passed with CUDA available;
+both complete synthetic suites passed on CPU with 1,796 passed and 21 skipped.
+Numerical-library threads were capped at four for that full-suite run. Progress
+equivalence checks confirmed unchanged epoch metrics, gradients, and RNG state.
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest -q dann/tests/test_attention_convnext.py
+python -m dann.train --config dann/config.yaml --smoke-test
+```
+
+The earlier 2026-11-12 real-data smoke of the 512-dimensional architecture completed one epoch with 2,048 training rows and
+512 validation rows, retaining CCA and conditional alignment. The selected
+2,289,484-parameter checkpoint reloaded with architecture version 11, a
+512-dimensional latent, and finite state tensors. Its validation total objective
+was 1.374238 and weighted IHC objective was 1.275294. Training CCA was in its
+configured biology-only warmup; validation CCA was active. Synthetic tests also
+exercise nonzero CCA gradients through both new components. Representation and
+calibration gains should be assessed in matched fits beyond this execution check.
+Both synthetic suites were exercised (1,803 cases). The 33 initial failures were
+an outdated selector-message assertion and historical fixtures inheriting the new
+defaults without the required checkpoint metadata. After making those fixtures
+explicit, all 75 tests in the affected rerun passed; no failures remain.
 
 ## Matched dictionary comparison
 
 The isolated comparison runner uses `train_model` and optional observational
 hooks. It checks identical seeded parameters, train-only head initialization,
 feature order, targets, and saved splits against
-`he10_biology2_discriminator1_non_centered` before fitting. The root YAML keeps
-occurrence pooling. Explicit L1/L2 configurations, immutable manifest, initial
+`he10_biology2_discriminator1_non_centered` before fitting. This historical study used
+occurrence pooling as its control. Explicit L1/L2 configurations, immutable manifest, initial
 snapshots, logs, and per-stage completion records live beneath a new directory:
 
 ```bash
@@ -206,19 +380,19 @@ There are three groups and five selectors, all in `dann/config.yaml`:
 | Group | Selector | Choices | Default |
 |---|---|---|---|
 | Spectral processing | `model.spectral_encoder.type` | `deep_sets` | `deep_sets` |
-| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
+| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2`, `convnext` | `convnext` |
 | Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
 | Optional discriminator | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `mlp` (disabled) |
 | Optional H&E head | `model.heads.he.type` | `mlp` for CCA; `mlp`, `cnn`, `gatv2` for raw MSE | `mlp` (CCA enabled) |
 
 All aggregation/head combinations are supported. Selectable neural modules
-live in `dann/model_components/`; `dann/model.py` composes them. The Deep Sets stage uses
-256-dimensional learned peak embeddings, multiplies each by its transformed
-intensity, applies the per-peak MLP with `[256, 256]` hidden widths and
-256 output channels, and mean-pools over active peaks. Empty spectra pool to zero.
+live in `dann/model_components/`; `dann/model.py` composes them. The main spectral
+stage uses 16-dimensional learned peak embeddings and attention pooling, described
+above, to produce 256 features per pixel. Empty spectra pool to zero.
 The selectable aggregation produces the **exported 256-dimensional latent**.
-The MLP aggregation uses `[256, 256]` hidden widths; biology, discriminator, and
-raw-MSE MLP heads use `[256, 128, 64]`. CCA uses separate projectors described below.
+The biology MLP uses `[256, 256]` hidden widths. The alternative MLP aggregation
+uses `[512, 512]`; discriminator and raw-MSE MLP heads use `[256, 128, 64]`.
+CCA uses separate projectors described below.
 The shared ZILN transformation, weighted four-target objective,
 and optional class-weighted batch cross-entropy retain their definitions.
 Only an enabled discriminator input receives gradient reversal.
@@ -227,7 +401,8 @@ Each CNN independently projects to 128 channels, applies three 3×3 stride-one
 convolutions, and finishes with a pointwise output projection. Hidden stages use
 per-pixel channel LayerNorm, GELU, and dropout 0.10. Occupancy masks suppress
 features in missing tissue after every hidden stage and the output projection.
-There is no spatial pooling or normalization over a whole tile.
+These CNNs have no spatial pooling or normalization over a whole tile; ConvNeXt
+uses the explicitly masked local pooling described above.
 
 All three CNN components default to residual connections for new training.
 The independent boolean options are `model.aggregation.cnn.residual`,
@@ -2998,7 +3173,7 @@ and completed updates. Enabled-warmup resumes reject missing or inconsistent sta
 Existing epoch-only resume restrictions still apply to partial-epoch checkpoints.
 
 Stabilization settings were introduced in architecture contract version 7;
-Version 8 added explicit spectral pooling and normalization; current checkpoints use version 10.
+Version 8 added explicit spectral pooling and normalization; current checkpoints use version 11.
 Versions 2–7 reconstruct their historical MLP and pooling behavior. Changing
 pooling, normalization, centering, or residual semantics is
 incompatible with loading those weights as a new architecture; start a fresh fit.
@@ -3061,20 +3236,111 @@ slides with the existing seeded 90%/10% within-slide split. See
 
 `loss.batch_alignment` independently enables `nhsic`, `anova`, and `soft_nn`, each
 with its own nonnegative `weight`. An enabled zero-weight objective is a diagnostic;
-disabled objectives are neither evaluated nor plotted. The current configuration uses
-nHSIC and `model.heads.discriminator.enabled: false` (legacy default: true).
+disabled objectives are neither evaluated nor plotted. The current configuration enables
+all three objectives and sets `model.heads.discriminator.enabled: false` (legacy default: true).
 Disabling the discriminator removes its parameters, logits, GRL, and spatial halo.
 Both checkpoint selection and LR scheduling default to validation `total_loss`
 in the checked-in YAML and can select their objectives independently.
 
-Alignment compares L2-normalized aggregation latents across all pixels without
-tissue conditioning, giving each represented slide equal total weight. Training
-samples up to 32 rows per slide per complete optimizer update; positive-weight
-alignment rejects split optimizer batches. Validation gathers a saved sample of up
-to 64 rows per slide across the complete pass. Undefined geometry is recorded as
-unavailable; enabled objectives with no valid evaluations fail the epoch. Changing
-alignment or architecture contracts requires fresh training. Normalization does not
-guarantee preservation of slide-associated biology.
+Alignment compares L2-normalized aggregation latents. The main YAML explicitly
+uses biological conditioning with `alpha: 0.1`, up to **128 training pixels per
+slide** per complete optimizer update, and 64 validation pixels per slide. The run
+suffix is `bioalign_a0p1_n128`. Positive-weight alignment requires unsplit optimizer
+batches. All enabled alignment objectives share the conditioning settings and
+retain independent weights (including zero-weight diagnostics).
+
+```yaml
+loss:
+  batch_alignment:
+    train_per_slide: 128
+    validation_per_slide: 64
+    conditioning:
+      enabled: true
+      alpha: 0.1
+```
+
+With `enabled: false`, alignment uses the historical unconditional estimators and
+skips biological fitting/calculation. The configured sampling cap still applies.
+Missing conditioning settings mean disabled; historical configurations with no
+explicit training cap keep their original cap of 32. With conditioning enabled,
+`alpha: 0` uses IHC only, `0.1` gives H&E a modest influence, and `1` uses the full
+product of IHC and H&E similarity. Alpha must be finite and in `[0, 1]`. Alpha zero
+does not load H&E for conditioning; an independently enabled H&E head can still
+require it. Positive alpha loads fixed UNI2-h features even when that head is off,
+for both pixel and spatial training.
+
+Preprocessing is fitted on up to 1,024 eligible **training** pixels per slide,
+selected deterministically in canonical row order. Eligibility requires valid
+observed CD8, tumor, collagen and stroma; existing CD8 normalization and validity
+masks apply before sampling. Exclusions change alignment only, leaving the biology
+loss's per-target masks intact. Absent and positive CD8 groups have zero similarity
+across groups. Within each group, tissue densities are divided by reference IQRs;
+positive CD8 additionally uses clipped logit density divided by its positive-only
+IQR. A zero IQR falls back to population standard deviation. Constant dimensions
+are omitted and reported. No predictions or CCA projections enter the weights.
+
+For summed squared scaled IHC differences `d²`,
+`K_IHC = exp(-d² / (2 * ihc_bandwidth²))`, with bandwidth 1 by default. Fixed H&E
+vectors are L2 normalized; nonfinite or zero-norm vectors are rejected.
+`K_HE = exp(-cosine_distance / fitted_bandwidth)`, where the bandwidth is the median
+of 16,384 deterministic distinct unordered training-reference pairs (all pairs if
+fewer exist). Constant training H&E geometry yields neutral `K_HE = 1`, recorded
+as `he_neutral`; a zero median with nonconstant geometry uses a `1e-12` bandwidth
+floor. The combined weight is
+`K_bio = K_IHC * ((1 - alpha) + alpha * K_HE)`.
+
+Neighborhoods retain `K_IHC >= 0.05`. Each participating slide needs at least two
+candidates and effective sample size `(sum w)² / sum(w²) >= 2`. An anchor needs
+support from its own slide and another slide. Biological weights are normalized
+within each participating slide so that slides have equal total weight. Support
+is determined before Soft-NN's self exclusion.
+
+- **Soft-NN** evaluates every supported anchor. The standardization measure is the
+  joint distribution of equal-slide supported anchors and their biological
+  candidate weights, with diagonal pairs removed and the remaining mass normalized.
+  Self is excluded from both learned neighbor probabilities and the conditional
+  same-slide chance baseline. The score is squared positive excess over chance.
+- **nHSIC** uses up to two supported anchors per slide, drawn by a separate seeded
+  permutation of canonical supported row identities. Both kernels are centered
+  and normalized under each neighborhood's weights. Shared pairwise matrices and
+  weighted matrix moments avoid an anchor-by-pixel-by-pixel tensor. Common
+  precentering protects nearly constant kernels from cancellation; all estimator
+  algebra remains float64.
+- **ANOVA** uses those same sampled neighborhoods and recomputes weighted slide
+  centroids, the overall centroid, and between-slide/total variance ratios locally.
+
+Valid scores are averaged within anchor slides and then equally across slides.
+Coverage, supported slides, effective sample sizes, excluded rows, and unavailable
+or degenerate estimates appear in history diagnostics. A positive-weight objective
+with no valid epoch evaluations fails the epoch. These are **local conditional
+estimates**, not an exact continuous conditional-independence test or a guarantee
+of biological preservation.
+
+All conditioning controls are exposed in `loss.batch_alignment.conditioning`:
+`ihc_bandwidth: 1`, `ihc_min_similarity: 0.05`, `minimum_candidates: 2`,
+`minimum_ess: 2`, `reference_per_slide: 1024`, `he_pairs: 16384`,
+`anchors_per_slide: 2`, `reference_seed: 0`, and `anchor_seed: 0`.
+The reference, pair, and anchor caps cannot exceed 1,024, 16,384, and 2, respectively. Seeds are independent of model/global RNG state.
+
+Validation collects detached biological features with its frozen sample and
+assembles them in canonical row order across the complete pass. Checkpoints store
+fitted scales, H&E bandwidth, feature order, reference identities, settings, and
+training/source content hashes. Resume verifies and restores these statistics,
+including reference source data, without refitting. Evaluation never fits them.
+Conditional objectives use contract version 2; historical unconditional contracts
+remain version 1. Changed conditioning settings, preprocessing semantics, or
+sampling caps require fresh training.
+
+Run the isolated capped check with:
+
+```bash
+python -m dann.verification.bioalignment_smoke --output data/verification/NEW_DIRECTORY
+```
+
+This performs one 2,048-row optimizer update and a capped validation pass, checks
+finite losses/gradients and checkpoint restoration, and writes coverage, runtime,
+and peak host/GPU memory against configured budgets to `report.json`. It requires
+a new output directory and does not run a full training comparison.
 
 Use `python -m dann.verification.batch_alignment_comparison FIRST_ANALYSIS
 SECOND_ANALYSIS --output NEW_DIRECTORY --device cuda` for a matched five-seed,
@@ -3084,7 +3350,7 @@ limits are documented in [the alignment analysis](../markdowns/dann_batch_alignm
 
 ### Alignment sweep with slide-mixing selection
 
-The 40-slide study runner keeps the current 512-dimensional MLP, 90%/10% split,
+The 40-slide study runner keeps its historical 512-dimensional MLP, 90%/10% split,
 seed 20260719, optimizer, preprocessing, IHC weight 2 and H&E weight 10. It compares
 a fresh zero-alignment control and nHSIC weights 1, 10 and 100 with the existing
 0.1 checkpoint. It then tests ANOVA 0.1/1 and soft-NN 1/10 separately at the
@@ -3295,15 +3561,16 @@ or checkpoint conflicts are rejected; training is never invoked.
 
 `model.heads.he.objective` selects `raw_mse` (the historical default when omitted)
 or `deep_cca`. The main [`config.yaml`](config.yaml) enables `deep_cca` with
-dimension 16, MSI/H&E hidden widths 128/256, H&E weight 0.015, one biology-only
-epoch, and a two-epoch ramp. The run name `deep_cca_d16_w0p015_256_provisional`
-keeps outputs separate from existing results. All other main settings, including
-the post-training switches, are preserved. The initial candidate used weight 0.05.
+dimension 16, MSI/H&E hidden widths 64/128, H&E weight 0.1, one biology-only
+epoch, and a two-epoch ramp, alongside the attention/ConvNeXt architecture above.
+The original pilot selected weight 0.015 on a 256-dimensional latent under run
+name `deep_cca_d16_w0p015_256_provisional`; those historical results below do not
+evaluate the current architecture or coefficient. The initial candidate used weight 0.05.
 CCA is enabled by explicit user choice despite missing the original promotion
 threshold of at least 1% improvement in the primary stromal probe error ratio;
 the pilot findings below remain provisional.
 
-CCA uses pointwise MSI `latent_dim → 128 → d` and H&E `output_dim → 256 → d`
+The current CCA uses pointwise MSI `latent_dim → 64 → d` and H&E `output_dim → 128 → d`
 projectors with hidden LayerNorm/GELU, linear outputs, and no dropout. Projector
 initialization uses a separate RNG stream. The biology head still sees the full
 MSI latent. Aggregation and biology may use MLP, CNN or GATv2; CCA projectors use
@@ -3391,7 +3658,7 @@ study directory. Production training and Visium transfer are separate.
 
 The [comparison report](../data/PDAC/Results/dann/deep_cca_pilot_20261107/comparison.html)
 contains all eight arms at 160 and 320 updates, plus second-seed confirmations of
-both eligible CCA arms and the no-H&E control. The main configuration now enables
+both eligible CCA arms and the no-H&E control. The pilot selected
 **d=16, weight=0.015** by user choice, retaining its provisional status.
 
 Its two-seed mean stromal probe-error ratio was **0.999683**, a **0.0317%**

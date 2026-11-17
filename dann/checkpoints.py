@@ -5,12 +5,19 @@ from typing import Any, Mapping
 from dann.model_components.layers_gatv2 import GATV2_DEFAULTS, GRAPH_SEMANTICS, gatv2_settings, graph_reach
 from dann.config import component_settings, execution_settings
 from dann.deep_cca import cca_contract
+from dann.model_components.attention_pooling import ATTENTION_SEMANTICS
+from dann.model_components.aggregation_convnext import CONVNEXT_SEMANTICS, convnext_reach
+
+
+ARCHITECTURE_VERSION = 11
 
 
 def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     """Describe selected architecture and numerical settings, independent of run paths."""
     settings = component_settings(config['model'])
     selected = {'spectral_encoder': settings['spectral_encoder']}
+    if settings['spectral_encoder']['deep_sets']['pooling'] == 'attention':
+        selected['spectral_encoder']['attention_semantics'] = copy.deepcopy(ATTENTION_SEMANTICS)
     for name, group in [('aggregation', settings['aggregation']), *settings['heads'].items()]:
         selected[name] = {'type': group['type'], group['type']: group[group['type']]}
         if name == 'he':
@@ -26,7 +33,10 @@ def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
         if group['type'] == 'gatv2':
             selected[name]['graph_semantics'] = copy.deepcopy(GRAPH_SEMANTICS)
             selected[name]['reach'] = graph_reach(group['gatv2']['depth'], group['gatv2']['neighbor_radius'])
-    return {'version': 10, 'components': selected, 'enabled_heads': sorted(settings['heads']),
+        elif group['type'] == 'convnext':
+            selected[name]['pyramid_semantics'] = copy.deepcopy(CONVNEXT_SEMANTICS)
+            selected[name]['reach'] = convnext_reach(group['convnext'])
+    return {'version': ARCHITECTURE_VERSION, 'components': selected, 'enabled_heads': sorted(settings['heads']),
             'numerics': {key: config['model'][key] for key in
                          ('num_peaks', 'latent_dim', 'activation', 'dropout', 'use_layer_norm', 'sigma_min')},
             'spatial': execution_settings(config)}
@@ -44,8 +54,11 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     config = copy.deepcopy(checkpoint['config'])
     saved = copy.deepcopy(checkpoint.get('architecture'))
     version = saved['version'] if saved is not None else 2
-    if version not in (2, 3, 4, 5, 6, 7, 8, 9, 10):
+    if version not in range(2, ARCHITECTURE_VERSION + 1):
         raise ValueError('Unsupported checkpoint architecture version.')
+    if version < 11 and (config['model'].get('aggregation', {}).get('type') == 'convnext'
+            or config['model'].get('spectral_encoder', {}).get('deep_sets', {}).get('pooling') == 'attention'):
+        raise ValueError('Attention pooling and ConvNeXt require architecture version 11 and fresh training.')
     if version < 10 and cca_contract(config) is not None:
         raise ValueError('Deep CCA requires architecture version 10 and fresh training.')
     if version >= 8 and not {'pooling', 'normalization', 'normalization_epsilon'} <= set(
@@ -111,13 +124,23 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
             saved['enabled_heads'] = sorted(n for n in ('biology', 'discriminator', 'he') if n in saved['components'])
         if version < 10 and 'he' in saved['components']:
             saved['components']['he']['objective'] = 'raw_mse'
-        saved['version'] = 10
+        saved['version'] = ARCHITECTURE_VERSION
         if saved != architecture_contract(config):
             raise ValueError('Checkpoint configuration disagrees with architecture metadata.')
     if checkpoint.get('objective_contract') is not None:
         from dann.batch_alignment import alignment_contract
         if checkpoint['objective_contract'] != alignment_contract(config):
             raise ValueError('Checkpoint configuration disagrees with alignment objective metadata.')
+    from dann.conditional_alignment import BiologyConditioner, conditioning_contract
+    if conditioning_contract(config) is not None and 'model_state' in checkpoint:
+        from dann.batch_alignment import alignment_contract
+        if checkpoint.get('objective_contract') != alignment_contract(config):
+            raise ValueError('Missing or incompatible conditional alignment objective contract.')
+        BiologyConditioner.restore(checkpoint.get('alignment_conditioner'), config, checkpoint['split_indices']['train'])
+        if checkpoint.get('alignment_conditioner') != config.get('alignment_conditioner'):
+            raise ValueError('Checkpoint biological preprocessing disagrees with saved configuration.')
+    elif conditioning_contract(config) is None and checkpoint.get('alignment_conditioner') is not None:
+        raise ValueError('Unexpected biological preprocessing for unconditional alignment.')
     contract = cca_contract(config)
     if contract is not None:
         if checkpoint.get('cca_contract') != contract:
@@ -174,6 +197,8 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
         if any(getattr(model.encoder, key) != spectral[key] for key in
                ('pool_centering', 'peak_mlp_residual', 'pooling', 'normalization', 'normalization_epsilon')):
             raise ValueError('Model spectral centering/residual settings are incompatible.')
+        if model.encoder.attention_settings != spectral.get('attention'):
+            raise ValueError('Model spectral attention settings are incompatible.')
         for name, module in [('aggregation', model.encoder.aggregation_mlp),
                              ('biology', model.biology_predictor),
                              ('discriminator', model.batch_discriminator),
@@ -189,7 +214,12 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
                 if any(model.he_cca.settings[k] != group['deep_cca'][k] for k in model.he_cca.settings):
                     raise ValueError('Incompatible CCA projector settings.')
                 continue
-            if group['type'] == 'gatv2':
+            if group['type'] == 'convnext':
+                from dann.model_components.aggregation_convnext import ConvNeXtAggregation
+                if (not isinstance(module, ConvNeXtAggregation) or module.settings != group['convnext']
+                        or module.radius != group['reach']):
+                    raise ValueError(f'Model {name} ConvNeXt settings are incompatible with checkpoint.')
+            elif group['type'] == 'gatv2':
                 from dann.model_components.layers_gatv2 import GATv2Network
                 if (not isinstance(module, GATv2Network) or module.settings != group['gatv2']
                         or module.radius != group['reach'] or module.residual != group['gatv2']['residual']):
@@ -200,7 +230,7 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
                     raise ValueError(f'Model {name} component type is incompatible with checkpoint.')
                 if getattr(module, 'residual', None) != group['cnn']['residual']:
                     raise ValueError(f'Model {name} CNN residual setting is incompatible with checkpoint.')
-            elif hasattr(module, 'residual'):
+            elif hasattr(module, 'residual') or getattr(module, 'radius', 0):
                 raise ValueError(f'Model {name} spatial component is incompatible with an MLP checkpoint.')
             else:
                 width = (spectral['peak_output_dim'] if name == 'aggregation' else requested['numerics']['latent_dim'])
@@ -212,6 +242,9 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
     if optimizer and cca_contract(checkpoint['config']) != cca_contract(config):
         raise ValueError('Changed CCA objective requires fresh training.')
     if optimizer:
+        from dann.conditional_alignment import conditioning_contract
+        if conditioning_contract(checkpoint['config']) != conditioning_contract(config):
+            raise ValueError('Changed biological conditioning preprocessing requires fresh training.')
         from dann.batch_alignment import alignment_contract
         if alignment_contract(checkpoint['config']) != alignment_contract(config):
             raise ValueError('Changed alignment objective requires fresh training.')

@@ -24,6 +24,9 @@ from dann.targets import target_contract
 def run(tmp_path):
     config = load_config(Path('dann/config.yaml'))
     config['model']['heads']['he']['enabled'] = False  # Biology-only synthetic checkpoint.
+    # Metadata-free checkpoints exercise historical pooling, independently of main defaults.
+    config['model']['spectral_encoder']['deep_sets'].update(
+        pooling='occurrence_mlp', normalization='count')
     config['data'].pop('preprocessing_fingerprint', None)  # Synthetic checkpoint/input contract.
     config['results'].update(root=str(tmp_path / 'requested'), run_name='fit')
     config['model']['aggregation']['type'] = 'mlp'

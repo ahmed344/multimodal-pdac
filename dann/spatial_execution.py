@@ -109,7 +109,8 @@ def preflight(path: Path, config: Mapping[str, Any], rows: int, performance: Map
     from dann.config import execution_settings
     from dann.spatial import matrix_group_path
     execution = execution_settings(config)
-    size = config['training'].get('core_size', 32) + 2 * execution['halo']
+    size = (config['training'].get('core_size', 32) + 2 * execution['halo']
+            + execution.get('grid_alignment', 1) - 1)
     core = config['training'].get('core_size', 32)
     with h5py.File(path, 'r') as handle:
         group = handle[matrix_group_path(config['data']['matrix_key'])]
@@ -142,12 +143,16 @@ def check_feature_budget(model: torch.nn.Module, rows: int, device: torch.device
     """Reject an explicit cache that cannot fit before reading resident spectra."""
     encoder = model.encoder
     element_size = encoder.embedding.weight.element_size()
-    required = rows * encoder.peak_mlp[-1].out_features * element_size
-    hidden = max(m.out_features for m in encoder.peak_mlp if isinstance(m, torch.nn.Linear))
+    required = rows * encoder.output_dim * element_size
+    hidden = max(m.out_features for m in encoder.peak_mlp.modules() if isinstance(m, torch.nn.Linear))
     peaks = settings.get('validation_peak_budget') or model.peak_budget
     # Inference retains weighted embeddings plus the current MLP input/output;
     # reserve a further hidden-width temporary for normalization/activation.
     workspace = peaks * (2 * encoder.embedding.embedding_dim + 3 * hidden) * element_size
+    if encoder.pooling == 'attention':
+        attention = encoder.attention_settings
+        workspace += peaks * (3 * attention['num_queries'] + attention['key_dim']
+                              + 2 * attention['value_dim']) * element_size
     if device.type == 'cuda':
         allocated = torch.cuda.memory_allocated(device)
         if allocated + required + workspace > settings['vram_budget_gib'] * 2**30:

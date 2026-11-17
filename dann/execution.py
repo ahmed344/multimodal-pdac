@@ -365,7 +365,7 @@ def build_validation_features(model: torch.nn.Module, loader: PreparedLoader,
     del required_rows
     if progress is not None:
         progress.set_phase('feature encoding', len(rows))
-    width = model.encoder.peak_mlp[-1].out_features
+    width = model.encoder.output_dim
     element_size = model.encoder.embedding.weight.element_size()
     required = len(rows) * width * element_size
     settings = loader.settings
@@ -409,12 +409,14 @@ def pooled_validation_loader(loader: Any, settings: Mapping[str, Any]) -> Iterat
 
 
 def evaluation_groups(model: torch.nn.Module, loader: Any,
-                      device: torch.device) -> Iterator[tuple[dict, dict, dict]]:
+                      device: torch.device, progress=None) -> Iterator[tuple[dict, dict, dict]]:
     """Execute physical tile batches, then restore historical loss-reduction groups."""
     settings = getattr(loader, 'settings', {})
     cache_settings = settings if getattr(model, 'spatial', False) else {}
     with validation_execution(model, settings), pooled_validation_loader(loader, cache_settings):
-        cache = build_validation_features(model, loader, device) if settings.get('validation_feature_cache') and model.spatial else None
+        cache = build_validation_features(model, loader, device, progress) if settings.get('validation_feature_cache') and model.spatial else None
+        if progress is not None:
+            progress.set_phase('validation', len(loader.dataset.indices))
         pending_id, pending_batch, pending_outputs = None, [], []
 
         def finish():

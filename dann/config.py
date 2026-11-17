@@ -12,6 +12,7 @@ import torch
 import yaml
 
 from dann.model_components.layers_gatv2 import gatv2_settings, graph_reach
+from dann.model_components.aggregation_convnext import convnext_settings, convnext_reach
 from dann.selection import OBJECTIVE_METRICS
 from dann.targets import normalization_settings, target_contract
 
@@ -490,14 +491,22 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
     from dann.model_components.deep_sets import validate_pooling
     validate_pooling(*(spectral[key] for key in
                        ("pooling", "normalization", "pool_centering", "normalization_epsilon")))
+    if spectral['pooling'] == 'attention':
+        from dann.model_components.attention_pooling import attention_settings
+        spectral['attention'] = attention_settings(spectral.get('attention'))
+    else:
+        spectral.pop('attention', None)
     positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
                 spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
                 model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144),
                 model.get("gatv2_tile_budget", 8)]
     for name, group in [("aggregation", settings["aggregation"]),
                         *((f"heads.{name}", group) for name, group in settings["heads"].items())]:
-        if group["type"] not in {"mlp", "cnn", "gatv2"}:
-            raise ValueError("Component type must be mlp or cnn or gatv2.")
+        allowed = {"mlp", "cnn", "gatv2", "convnext"} if name == 'aggregation' else {"mlp", "cnn", "gatv2"}
+        if group["type"] not in allowed:
+            raise ValueError(f"Invalid {name} component type; choose from {sorted(allowed)}.")
+        if name == 'aggregation' and ('convnext' in group or group['type'] == 'convnext'):
+            group['convnext'] = convnext_settings(group.get('convnext'))
         group.setdefault("mlp", {"hidden_dims": [512, 512]})
         group["mlp"].setdefault("residual", False)
         if not isinstance(group["mlp"]["residual"], bool):
@@ -537,6 +546,8 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
             radii.append(group["cnn"]["depth"])
         elif group["type"] == "gatv2":
             radii.append(graph_reach(group["gatv2"]["depth"], group["gatv2"]["neighbor_radius"]))
+        elif group['type'] == 'convnext':
+            radii.append(convnext_reach(group['convnext']))
     result = {"mode": "spatial" if any(radii) else "pixel", "halo": radii[0] + max(radii[1:]),
             "latent_radius": radii[0], "biology_radius": radii[0] + radii[1],
             "combination": "deep_sets__agg-{}__bio-{}__disc-{}".format(*(g["type"] for g in groups[:3]))}
@@ -545,6 +556,8 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     if len(groups) == 4:
         result.update(he_radius=radii[0] + radii[3])
         result["combination"] += "__he-" + groups[3]["type"]
+    if settings['aggregation']['type'] == 'convnext':
+        result['grid_alignment'] = 2 ** (len(settings['aggregation']['convnext']['channels']) - 1)
     return result
 
 
@@ -561,6 +574,8 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
     monitoring_settings(config)
     from dann.batch_alignment import alignment_settings
     alignment = alignment_settings(config)
+    from dann.conditional_alignment import conditioning_contract
+    conditioning_contract(config)
     weight = config.get("loss", {}).get("he_weight", 1.0)
     if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not np.isfinite(weight) or weight < 0:
         raise ValueError("loss.he_weight must be finite and nonnegative.")
@@ -580,8 +595,14 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
             resolved = settings["aggregation"] if name == "aggregation" else settings["heads"][name]
             group.setdefault("cnn", {})["residual"] = resolved["cnn"]["residual"]
             group["gatv2"] = resolved["gatv2"]
+            if name == 'aggregation' and 'convnext' in resolved:
+                group['convnext'] = resolved['convnext']
     execution = execution_settings(config)
     training = config["training"]
+    interval = training.setdefault('progress_interval_seconds', 30.)
+    if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+            or not np.isfinite(interval) or interval <= 0):
+        raise ValueError('training.progress_interval_seconds must be positive and finite.')
     from dann.selection import selection_metric
     training["early_stopping_metric"] = selection_metric(config)
     mode = execution["mode"]

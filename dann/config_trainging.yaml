@@ -3,12 +3,13 @@
 
 monitoring:
   enabled: true
-  gradient_updates_per_epoch: 5  # Unique evenly spaced logical updates; null monitors every update.
+  gradient_updates_per_epoch: 1  # Unique evenly spaced logical updates; null monitors every update.
 
 training:
   seed: 20260719  # Seed for data splits, initialization, and loader shuffling.
   device: cuda  # Runtime device: auto, cpu, cuda, or cuda:<index>.
   epochs: 300  # Maximum fitting epochs; validation/test labels are never included in a final refit.
+  progress_interval_seconds: 30  # Wall-clock progress between phase boundaries; no additional GPU synchronization.
 
   # Automatically selected execution settings. Edit these blocks rather than
   # adding competing top-level batch_size, learning_rate, or worker overrides.

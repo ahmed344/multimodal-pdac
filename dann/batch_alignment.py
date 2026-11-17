@@ -8,10 +8,14 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 import math
-from typing import Any, Mapping
+from typing import Any, Mapping, TYPE_CHECKING
 
 import numpy as np
 import torch
+
+if TYPE_CHECKING:
+    from dann.conditional_alignment import ConditioningInput
+
 
 NAMES = ('nhsic', 'anova', 'soft_nn')
 BANDWIDTHS = (0.05, 0.1, 0.2, 0.5)
@@ -22,7 +26,7 @@ DENOMINATOR_FLOOR = 1e-12
 def alignment_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve and validate independent switches, including zero-weight diagnostics."""
     raw = config.get('loss', {}).get('batch_alignment', {})
-    if not isinstance(raw, Mapping) or set(raw) - {*NAMES, 'bandwidths', 'temperature', 'train_per_slide', 'validation_per_slide'}:
+    if not isinstance(raw, Mapping) or set(raw) - {*NAMES, 'bandwidths', 'temperature', 'train_per_slide', 'validation_per_slide', 'conditioning'}:
         raise ValueError('Invalid loss.batch_alignment settings.')
     result = {}
     for name in NAMES:
@@ -40,23 +44,40 @@ def alignment_settings(config: Mapping[str, Any]) -> dict[str, Any]:
     result['temperature'] = raw.get('temperature', .1)
     if not result['bandwidths'] or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x <= 0 for x in [*result['bandwidths'], result['temperature']]):
         raise ValueError('Alignment bandwidths and temperature must be positive and finite.')
-    for key, default in [('train_per_slide', 32), ('validation_per_slide', 64)]:
+    # Retain historical implicit cap; new runs explicitly request 128.
+    for key, default, maximum in [('train_per_slide', 32, 128), ('validation_per_slide', 64, 64)]:
         value = raw.get(key, default)
-        if isinstance(value, bool) or not isinstance(value, int) or not 2 <= value <= default:
-            raise ValueError(f'batch_alignment.{key} must be an integer from 2 to {default}.')
+        if isinstance(value, bool) or not isinstance(value, int) or not 2 <= value <= maximum:
+            raise ValueError(f'batch_alignment.{key} must be an integer from 2 to {maximum}.')
         result[key] = value
+    from dann.conditional_alignment import conditioning_settings
+    result['conditioning'] = conditioning_settings(raw.get('conditioning', {}))
     return result
 
 
 def alignment_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     """Freeze estimator and sampling semantics separately from architecture."""
-    return dict(version=1, settings=alignment_settings(config), latent='exported aggregation, L2 normalized',
+    settings = alignment_settings(config)
+    conditioning = settings.pop('conditioning')
+    contract = dict(version=1, settings=settings, latent='exported aggregation, L2 normalized',
                 distribution='equal slide: w_i=1/(S*n_slide)', conditioning='none',
                 nhsic='mean exp(-cosine_distance/bandwidth); categorical label kernel; weighted centering and Frobenius norms; biased V statistic',
                 anova='equal-slide between-centroid variance / total variance',
                 soft_nn='weighted off-diagonal std; candidate weight w_j; self excluded; squared positive excess over leave-one-out chance',
                 norm_variance_floor=NORM_FLOOR, denominator_floor=DENOMINATOR_FLOOR,
                 sampling='sorted row identities, NumPy SeedSequence([seed, optimizer_update]); validation update=0')
+    # Preserve byte-for-byte v1 contracts for historical configurations.
+    if 'conditioning' in config.get('loss', {}).get('batch_alignment', {}):
+        contract['version'] = 2
+        contract['settings']['conditioning'] = conditioning
+        if conditioning['enabled']:
+            contract.update(anchor_sampling='dedicated NumPy RNG permutes canonical supported identities; first up to two per slide',
+                conditioning='frozen observed IHC * ((1-alpha)+alpha*fixed UNI2-h RBF)',
+                distribution='equal slide within supported biological neighborhoods; equal anchor slide reduction',
+                nhsic='local separately weighted-centered kernels; normalized biased V statistic; matrix moments',
+                anova='local weighted slide centroids / local total variance',
+                soft_nn='all supported anchors; joint biological off-diagonal standardization; self excluded from probabilities and chance')
+    return contract
 
 
 def sample_rows(row_ids, labels, cap: int, seed: int, update: int = 0) -> np.ndarray:
@@ -90,7 +111,8 @@ def _center(kernel: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 
 
 def evaluate_alignment(latent: torch.Tensor, labels: torch.Tensor, names=NAMES,
-                       bandwidths=BANDWIDTHS, temperature: float = .1) -> dict[str, Measurement]:
+                       bandwidths=BANDWIDTHS, temperature: float = .1,
+                       conditioning: ConditioningInput | None = None) -> dict[str, Measurement]:
     """Evaluate differentiable objectives on one complete mixed-slide sample."""
     names = tuple(names)
     if not names:
@@ -99,6 +121,9 @@ def evaluate_alignment(latent: torch.Tensor, labels: torch.Tensor, names=NAMES,
         raise ValueError('Unknown alignment objective.')
     if latent.ndim != 2 or labels.ndim != 1 or len(latent) != len(labels):
         raise ValueError('Alignment expects [rows, features] latents and [rows] labels.')
+    if conditioning is not None:
+        from dann.conditional_alignment import evaluate_conditional
+        return evaluate_conditional(latent, labels, names, bandwidths, temperature, conditioning)
     _, inverse, counts = torch.unique(labels, return_inverse=True, return_counts=True)
     keep = counts[inverse] >= 2
     excluded = int((~keep).sum())
@@ -223,18 +248,26 @@ class ValidationSample:
         self.parts = []
         self.slide_counts = Counter()
         self.total_rows = 0
+        self.conditioning_parts = []
+        self.invalid_biology_rows = 0
 
-    def add(self, rows, labels, latent):
+    def add(self, rows, labels, latent, conditioning=None):
         ids = rows.detach().cpu().numpy()
         self.total_rows += len(ids)
         self.slide_counts.update(labels.detach().cpu().tolist())
+        if conditioning is not None:
+            self.invalid_biology_rows += int((~conditioning.valid).sum())
         positions = np.flatnonzero(np.isin(ids, self.row_ids))
-        if len(positions):
+        if len(positions) or not len(self.row_ids):
             self.parts.append((ids[positions], labels[positions].detach(), latent[positions].detach()))
+            if conditioning is not None:
+                self.conditioning_parts.append(conditioning.select(positions))
 
     def coverage(self):
         """Describe sampling relative to the complete observed validation pass."""
         return dict(available_rows=self.total_rows, available_slides=len(self.slide_counts),
+                    sampling_invalid_rows=self.invalid_biology_rows,
+                    sampling_eligible_rows=self.total_rows-self.invalid_biology_rows,
                     sampled_fraction=len(self.row_ids)/max(self.total_rows, 1),
                     sampling_singleton_rows=sum(n for n in self.slide_counts.values() if n == 1))
 
@@ -246,3 +279,14 @@ class ValidationSample:
             raise ValueError('Validation alignment sample identities are missing or duplicated.')
         order = np.argsort(rows)
         return torch.cat([p[2] for p in self.parts])[order], torch.cat([p[1] for p in self.parts])[order]
+
+    def conditioning(self):
+        """Return detached biology in exactly the canonical latent order."""
+        if not self.conditioning_parts:
+            return None
+        from dann.conditional_alignment import ConditioningInput
+        rows = np.concatenate([p[0] for p in self.parts])
+        features = ConditioningInput.concatenate(self.conditioning_parts)
+        if len(features.row_ids) != len(rows):
+            raise ValueError('Missing validation conditioning features.')
+        return features.select(np.argsort(rows))

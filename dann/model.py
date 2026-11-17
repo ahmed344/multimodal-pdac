@@ -8,6 +8,7 @@ from dann.model_components.layers import build_activation, build_mlp
 from dann.model_components.deep_sets import DeepSetsEncoder
 from dann.model_components.aggregation_mlp import MLPAggregation
 from dann.model_components.aggregation_cnn import CNNAggregation
+from dann.model_components.aggregation_convnext import ConvNeXtAggregation
 from dann.model_components.biology_mlp import MLPBiology
 from dann.model_components.biology_cnn import CNNBiology
 from dann.model_components.discriminator_mlp import MLPDiscriminator
@@ -30,12 +31,14 @@ class IntensityWeightedPeakEncoder(DeepSetsEncoder):
                  aggregation_hidden_dims, latent_dim, activation="gelu", dropout=0.,
                  use_layer_norm=True, inference_peak_chunk_size=262144,
                  peak_mlp_residual=False, pool_centering="none", aggregation_residual=False,
-                 pooling="occurrence_mlp", normalization="count", normalization_epsilon=1.0e-8):
+                 pooling="occurrence_mlp", normalization="count", normalization_epsilon=1.0e-8,
+                 attention=None):
         super().__init__(num_peaks, embedding_dim, peak_hidden_dims, peak_output_dim,
                          activation, dropout, use_layer_norm, inference_peak_chunk_size,
                          initialize_embeddings=False, peak_mlp_residual=peak_mlp_residual,
                          pool_centering=pool_centering, pooling=pooling,
-                         normalization=normalization, normalization_epsilon=normalization_epsilon)
+                         normalization=normalization, normalization_epsilon=normalization_epsilon,
+                         attention=attention)
         self.aggregation_mlp = MLPAggregation(
             peak_output_dim, aggregation_hidden_dims, latent_dim, activation=activation,
             dropout=dropout, use_layer_norm=use_layer_norm, residual=aggregation_residual)
@@ -151,6 +154,9 @@ class AdversarialLatentFusion(nn.Module):
         elif settings["aggregation"]["type"] == "gatv2":
             encoder.aggregation_mlp = AggregationGATv2(spectral["peak_output_dim"],
                 values["latent_dim"], **settings["aggregation"]["gatv2"])
+        elif settings["aggregation"]["type"] == "convnext":
+            encoder.aggregation_mlp = ConvNeXtAggregation(spectral["peak_output_dim"],
+                values["latent_dim"], **settings["aggregation"]["convnext"])
         bio = settings["heads"]["biology"]
         disc = settings["heads"].get("discriminator")
         if bio["type"] == "mlp":
@@ -190,7 +196,7 @@ class AdversarialLatentFusion(nn.Module):
         model.he_output_dim = he["output_dim"] if he is not None else 0
         model.num_targets, model.sigma_min = num_targets, values["sigma_min"]
         model.latent_dim = int(values["latent_dim"])
-        model.spatial = any(x["type"] in {"cnn", "gatv2"} for x in (settings["aggregation"], *settings["heads"].values()))
+        model.spatial = any(x["type"] in {"cnn", "gatv2", "convnext"} for x in (settings["aggregation"], *settings["heads"].values()))
         model.pixel_spectral_microbatching = values.get("pixel_spectral_microbatching", False)
         model.peak_budget = values.get("spectral_peak_budget", 65536)
         model.checkpointing = values.get("spectral_checkpointing", True)

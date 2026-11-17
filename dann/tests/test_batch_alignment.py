@@ -292,7 +292,7 @@ def test_alignment_plot_layout_legends_and_memory(tmp_path,monkeypatch,diagnosti
 
 @pytest.mark.parametrize('settings', [None, [], {'typo': True}, {'nhsic': {'enabled':1}},
     {'nhsic': {'weight':math.nan}}, {'nhsic':{'weight':-1}}, {'bandwidths':None},
-    {'bandwidths':[]}, {'bandwidths':[0.]}, {'temperature':0.}, {'train_per_slide':33},
+    {'bandwidths':[]}, {'bandwidths':[0.]}, {'temperature':0.}, {'train_per_slide':129},
     {'validation_per_slide':65}, {'train_per_slide':1}])
 def test_settings_validation(settings):
     with pytest.raises(ValueError):alignment_settings({'loss':{'batch_alignment':settings}})

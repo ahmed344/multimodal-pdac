@@ -31,8 +31,10 @@ from dann.initialization import initialize_supervised_heads
 from dann.model import AdversarialLatentFusion
 from dann.deep_cca import (cca_contract, effective_weight, evaluate_cca, SlideCovariance, CCASummary)
 from dann.monitoring import GradientMonitor, StreamingCovariance, freeze_monitoring
+from dann.progress import EpochProgress
 from dann.batch_alignment import (NAMES as ALIGNMENT_NAMES, alignment_settings, alignment_contract,
                                   evaluate_alignment, sample_rows, AlignmentSummary, ValidationSample, AlignmentEvaluationError)
+from dann.conditional_alignment import BiologyConditioner, ConditioningInput, conditioning_contract, eligible_targets
 from dann.checkpoints import (architecture_contract, checkpoint_config, validate_checkpoint, training_data_contract,
                               validate_training_data_contract, sampling_contract, validate_sampling_contract)
 from dann.tiles import row_identity
@@ -116,6 +118,7 @@ _RESUME_OVERRIDES = (
     "epochs",
     "num_workers",
     "prefetch_factor",
+    "progress_interval_seconds",
     "resume_checkpoint",
 )
 
@@ -138,6 +141,8 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
             != requested_config.get('data', {}).get('preprocessing_fingerprint')):
         raise ValueError('Changed MSI preprocessing requires fresh training; cannot resume this checkpoint.')
     from dann.batch_alignment import alignment_contract
+    if conditioning_contract(saved_config) != conditioning_contract(requested_config):
+        raise ValueError('Changed biological conditioning preprocessing requires fresh training.')
     if cca_contract(saved_config) != cca_contract(requested_config):
         raise ValueError('Changed CCA objective or schedule requires fresh training.')
     if alignment_contract(saved_config) != alignment_contract(requested_config):
@@ -863,6 +868,8 @@ def run_epoch(
     batch_alignment: Mapping[str, Any] | None = None,
     alignment_seed: int = 0,
     validation_alignment_rows: Sequence[int] | None = None,
+    alignment_conditioner: BiologyConditioner | None = None,
+    progress_interval_seconds: float | None = None,
 ) -> dict[str, float]:
     """Run one training or validation epoch and report loss components.
 
@@ -895,6 +902,7 @@ def run_epoch(
         evaluation_callback (Callable | None): Observe held-out predictions without changing evaluation.
         monitoring (Mapping | None): Validated runtime switches; omitted disables monitoring.
         warmup (UpdateWarmup | None): Advance the LR only at logical optimizer boundaries.
+        progress_interval_seconds (float | None): Host-only progress interval; None disables it.
 
     Returns:
         dict[str, float]: Mean losses, batch accuracy, hurdle accuracy, and mean R².
@@ -908,6 +916,9 @@ def run_epoch(
     cca_validation = SlideCovariance(cca.settings['dimension']) if cca is not None and not training else None
     alignment = alignment_settings({'loss': {'batch_alignment': batch_alignment or {}}})
     alignment_names = [n for n in ALIGNMENT_NAMES if alignment[n]['enabled']]
+    conditioned = bool(alignment_names and alignment['conditioning']['enabled'])
+    if conditioned and (alignment_conditioner is None or alignment_conditioner.state['contract']['settings'] != alignment['conditioning']):
+        raise ValueError('Enabled conditioning requires matching frozen preprocessing.')
     alignment_summary = AlignmentSummary(alignment)
     validation_sample = None
     diagnostic_parts = []
@@ -939,6 +950,12 @@ def run_epoch(
                         ziln_loss.include_normal_constant).to(device)
     steps_per_epoch = max(getattr(getattr(loader, 'sampler', None), 'logical_updates', len(loader)), 1)
     state = progress_state or TrainingProgress(epoch_index * steps_per_epoch, 0, epoch_index, 0)
+    reporter = (EpochProgress(epoch_index + 1, total_epochs, progress_interval_seconds)
+                if progress_interval_seconds is not None else None)
+    initial_rows = state.supervised_rows
+    validation_rows = 0
+    if reporter is not None and training:
+        reporter.set_phase('training', steps_per_epoch, unit='updates', completed=state.update_in_epoch)
     monitor_settings = monitoring_settings({"monitoring": monitoring or {}})
     gradient_monitor = (GradientMonitor(model, target_columns, steps_per_epoch,
                                        monitor_settings["gradient_updates_per_epoch"])
@@ -958,7 +975,7 @@ def run_epoch(
     audit = (SamplingEpochAudit(epoch_index, len(loader.dataset.indices))
              if training and (sampling_audit_dir is not None or update_callback is not None) else None)
     from dann.execution import device_batches, evaluation_groups
-    batches = ((cpu, batch, None) for cpu, batch in device_batches(loader, device)) if training else evaluation_groups(model, loader, device)
+    batches = ((cpu, batch, None) for cpu, batch in device_batches(loader, device)) if training else evaluation_groups(model, loader, device, reporter)
     group_rows, group_batches = [], []
     batch_class_count = None
     update_started = perf_counter()
@@ -1036,24 +1053,32 @@ def run_epoch(
                     cca_validation.update(outputs['cca_msi'], outputs['cca_he'], batch['batches'])
             alignment_components = {}
             if alignment_names:
+                biology_features = (alignment_conditioner.transform(batch['targets'], batch.get('target_valid_mask'),
+                                    batch['row_ids'], batch.get('he_targets')) if conditioned else None)
                 if not training:
-                    validation_sample.add(batch['row_ids'], batch['batches'], outputs['latent'])
+                    validation_sample.add(batch['row_ids'], batch['batches'], outputs['latent'], biology_features)
                 else:
                     # Diagnostic-only accumulation is allowed, but evaluated after gathering
                     # the complete logical batch. Positive-weight objectives reject splitting.
                     diagnostic_parts.append((batch['row_ids'].detach(), batch['batches'].detach(),
-                                             outputs['latent'] if group.get('count', 1) == 1 else outputs['latent'].detach()))
+                                             outputs['latent'] if group.get('count', 1) == 1 else outputs['latent'].detach(), biology_features))
                     if last:
                         ids = torch.cat([p[0] for p in diagnostic_parts]).cpu().numpy()
                         labels = torch.cat([p[1] for p in diagnostic_parts])
                         latents = torch.cat([p[2] for p in diagnostic_parts])
-                        chosen = sample_rows(ids, labels.cpu().numpy(), alignment['train_per_slide'],
+                        features = ConditioningInput.concatenate([p[3] for p in diagnostic_parts]) if conditioned else None
+                        eligible = features.valid.cpu().numpy() if conditioned else np.ones(len(ids), dtype=bool)
+                        chosen = sample_rows(ids[eligible], labels.cpu().numpy()[eligible], alignment['train_per_slide'],
                                              alignment_seed, state.optimizer_updates)
                         indices = np.flatnonzero(np.isin(ids, chosen))
+                        if conditioned:
+                            indices = indices[np.argsort(ids[indices])]
                         measurements = evaluate_alignment(latents[indices], labels[indices], alignment_names,
-                                                          alignment['bandwidths'], alignment['temperature'])
+                                                          alignment['bandwidths'], alignment['temperature'],
+                                                          conditioning=features.select(indices) if conditioned else None)
                         for measurement in measurements.values():
                             measurement.diagnostics.update(optimizer_rows=len(ids),
+                                sampling_invalid_rows=int((~eligible).sum()), sampling_eligible_rows=int(eligible.sum()),
                                 optimizer_slides=len(torch.unique(labels)), sampled_fraction=len(indices)/max(len(ids), 1),
                                 sampling_singleton_rows=int((torch.unique(labels, return_counts=True)[1] == 1).sum()))
                         alignment_summary.add(measurements)
@@ -1107,6 +1132,8 @@ def run_epoch(
                     state.optimizer_updates += 1
                     state.update_in_epoch += 1
                     state.supervised_rows += group.get("rows", len(batch["targets"]))
+                    if reporter is not None:
+                        reporter.update(state.update_in_epoch, rows=state.supervised_rows - initial_rows)
                     record = {}
                     if audit is not None:
                         record = audit.update(dict(row_ids=torch.cat(group_rows), batches=torch.cat(group_batches),
@@ -1131,6 +1158,9 @@ def run_epoch(
                     validation_monitor.update(outputs["latent"])
                 if evaluation_callback is not None:
                     evaluation_callback(batch, outputs)
+                validation_rows += len(batch['targets'])
+                if reporter is not None:
+                    reporter.update(validation_rows)
 
             batch_size = int(batch["targets"].shape[0])
             metrics["samples"] += batch_size
@@ -1151,6 +1181,8 @@ def run_epoch(
                 predictions = outputs["batch_logits"].argmax(dim=1)
                 metrics["batch_correct"] += (predictions == batch["batches"]).sum().detach()
     batches.close()
+    if reporter is not None:
+        reporter.set_phase('training diagnostics' if training else 'validation diagnostics', 1, unit='passes')
     if training and state.update_in_epoch == steps_per_epoch:
         state.epoch = epoch_index + 1
         state.update_in_epoch = 0
@@ -1191,7 +1223,7 @@ def run_epoch(
         latents, labels = validation_sample.tensors()
         with torch.inference_mode():
             measurements = evaluate_alignment(latents, labels, alignment_names,
-                alignment['bandwidths'], alignment['temperature'])
+                alignment['bandwidths'], alignment['temperature'], conditioning=validation_sample.conditioning())
             for measurement in measurements.values():
                 measurement.diagnostics.update(validation_sample.coverage())
             alignment_summary.add(measurements)
@@ -1238,6 +1270,9 @@ def run_epoch(
                          peak_reserved_vram_gib=(torch.cuda.max_memory_reserved(device) / 2**30 if device.type == 'cuda' else 0),
                          peak_host_gib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20,
                          prepared_batch_mib=loader.max_batch_bytes / 2**20)
+    if reporter is not None:
+        reporter.update(1)
+        reporter.finish_phase()
     return finalized
 
 
@@ -1305,6 +1340,7 @@ def checkpoint_metadata(
         "objective_contract": alignment_contract(config),
         "cca_contract": cca_contract(config),
         "validation_alignment_sample": copy.deepcopy(config.get("validation_alignment_sample")),
+        "alignment_conditioner": copy.deepcopy(config.get("alignment_conditioner")),
         "optimization": dict(
             logical_updates_per_epoch=getattr(bundle.loaders["train"].sampler, "logical_updates",
                                               len(bundle.loaders["train"])),
@@ -1505,13 +1541,28 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
         raise ValueError("Resume batch order is incompatible.")
     config = copy.deepcopy(dict(config))
     alignment = alignment_settings(config)
+    alignment_conditioner = None
+    config.pop('alignment_conditioner', None)
+    if conditioning_contract(config) is not None:
+        alignment_conditioner = (BiologyConditioner.restore(resume_payload.get('alignment_conditioner'), config,
+                                    bundle.split_indices['train'], bundle) if resume_payload else
+                                 BiologyConditioner.fit(config, bundle))
+        config['alignment_conditioner'] = copy.deepcopy(alignment_conditioner.state)
+        print(json.dumps(dict(alignment_conditioning={k: v for k, v in alignment_conditioner.state.items()
+              if k not in {'reference_rows', 'contract'}})), flush=True)
     if any(alignment[n]['enabled'] for n in ALIGNMENT_NAMES):
         rows = bundle.split_indices['validation']
+        split_count = len(rows)
+        if alignment_conditioner is not None:
+            valid = eligible_targets(bundle.metadata.targets, bundle.metadata.target_valid_mask, config['data']['target_columns'])
+            rows = rows[valid[rows]]
         chosen = sample_rows(rows, bundle.metadata.batch_codes[rows], alignment['validation_per_slide'], int(training['seed']))
         validation_sample = dict(row_ids=chosen.tolist(), batch_codes=bundle.metadata.batch_codes[chosen].tolist(),
                                  batch_names=list(bundle.metadata.batch_names), seed=int(training['seed']),
-                                 split_rows=len(rows), sampled_fraction=len(chosen)/max(len(rows), 1),
+                                 split_rows=split_count, sampled_fraction=len(chosen)/max(split_count, 1),
                                  estimator=alignment_contract(config))
+        if alignment_conditioner is not None:
+            validation_sample.update(eligible_rows=len(rows), excluded_invalid_rows=split_count-len(rows))
         saved_sample = resume_payload.get('validation_alignment_sample')
         if resume_payload and saved_sample != validation_sample:
             raise ValueError('Validation alignment sample changed; fresh training required.')
@@ -1689,7 +1740,9 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=gradient_clip_norm,
                 monitoring=config.get("monitoring"),
+                progress_interval_seconds=training.get('progress_interval_seconds', 30.),
                 batch_alignment=config['loss'].get('batch_alignment'),
+                alignment_conditioner=alignment_conditioner,
                 alignment_seed=int(training['seed']),
                 validation_alignment_rows=config.get('validation_alignment_sample', {}).get('row_ids'),
                 cd8_index=target_columns.index(CD8),
@@ -1720,7 +1773,9 @@ def train_model(config: Mapping[str, Any], *, observer: Callable | None = None,
                 grl_gamma=float(training["grl_gamma"]),
                 gradient_clip_norm=None,
                 monitoring=config.get("monitoring"),
+                progress_interval_seconds=training.get('progress_interval_seconds', 30.),
                 batch_alignment=config['loss'].get('batch_alignment'),
+                alignment_conditioner=alignment_conditioner,
                 alignment_seed=int(training['seed']),
                 validation_alignment_rows=config.get('validation_alignment_sample', {}).get('row_ids'),
                 cd8_index=target_columns.index(CD8),

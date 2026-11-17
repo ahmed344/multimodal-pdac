@@ -1,6 +1,6 @@
 # Shared DANN settings. Training and analysis settings live in the linked files.
 # resolved_config.yaml records the combined effective settings and derived paths.
-# All-MLP aggregation/heads select pixel mode; any CNN or GATv2 selects spatial mode.
+# All-MLP aggregation/heads select pixel mode; ConvNeXt, CNN, or GATv2 selects spatial mode.
 includes: [config_trainging.yaml, config_analysis.yaml]
 
 data:
@@ -31,29 +31,42 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: "peaks_embedding_8_deep_cca_d16_latent_512_all_0p01"  # Separate outputs for the provisional CCA choice.
+  run_name: "attention4_convnext_k3_latent256_bio256x256_fast01"  # Experimental fresh architecture; preserve previous runs.
 
 model:
   num_peaks: 5023  # Number of aligned m/z bins in both MSI files.
-  latent_dim: 512  # Aggregation output width; this is the exported latent before either head.
+  latent_dim: 256  # Aggregation output width; this is the exported latent before either head.
 
-  # 1. Per-pixel spectral processing: learned embeddings -> intensity weighting
-  #    -> per-peak MLP -> mean pooling over active peaks. Empty spectra pool to zero.
+  # 1. Per-pixel spectral processing: peak identity + explicit intensity -> token MLP
+  #    -> four learned attention summaries -> 256 features. Empty spectra pool to zero.
   spectral_encoder:
     type: deep_sets  # Supported spectral encoder: deep_sets.
     deep_sets:
-      pooling: occurrence_mlp  # Or intensity_weighted_dictionary; requires fresh training.
-      normalization: count  # occurrence_mlp: count; dictionary: l1 or l2 (transformed intensities).
+      pooling: attention  # attention, occurrence_mlp, or intensity_weighted_dictionary; requires fresh training.
+      normalization: softmax  # attention: softmax; occurrence_mlp: count; dictionary: l1 or l2.
       normalization_epsilon: 1.0e-8  # Positive row-norm floor for dictionary pooling.
       peak_mlp_residual: true  # Normalized skips around equal-width hidden blocks.
-      pool_centering: zero_input  # occurrence: none/zero_input; dictionary: none/dictionary_mean.
-      embedding_dim: 8  # Width of each learned peak embedding.
-      peak_hidden_dims: [512, 512]  # Hidden widths of the original per-peak MLP.
-      peak_output_dim: 512  # Pooled pixel width passed to the aggregation component.
+      pool_centering: none  # attention: none; occurrence: none/zero_input; dictionary: none/dictionary_mean.
+      embedding_dim: 16  # Width of each learned peak identity embedding.
+      peak_hidden_dims: [64, 64]  # Token MLP hidden widths; intensity is concatenated explicitly in attention mode.
+      peak_output_dim: 256  # Pooled pixel width passed to the aggregation component.
+      attention:
+        num_queries: 4  # Independent learned spectral summaries per pixel.
+        token_dim: 64  # Output width of the per-peak token MLP.
+        key_dim: 16  # Query/key dot-product width.
+        value_dim: 32  # Each summary's width before concatenation and projection.
 
-  # 2. Latent aggregation: choose pointwise MLP, local CNN, or distance-based GATv2.
+  # 2. Latent aggregation: masked ConvNeXt pyramid, pointwise MLP, local CNN, or GATv2.
   aggregation:
-    type: mlp  # Choices: mlp, cnn, gatv2. Only the selected component's settings are used.
+    type: convnext  # Choices: mlp, cnn, gatv2, convnext. ConvNeXt is aggregation-only.
+    convnext:
+      channels: [32, 64, 128]  # Full, half, and quarter-resolution occupied grids.
+      depths: [1, 1, 1]  # ConvNeXt blocks at each scale.
+      kernel_size: 3  # Odd depthwise kernel; determines the complete halo (10 with these settings).
+      expansion: 4  # Channel MLP expansion in each block.
+      pyramid_dim: 64  # Top-down feature width before projection to latent_dim.
+      layer_scale_init: 1.0e-6  # Learnable residual-branch scaling.
+      dropout: 0.10
     mlp:
       residual: true
       hidden_dims: [512, 512]  # Hidden widths after pooling; final width is latent_dim.
@@ -77,7 +90,7 @@ model:
       type: mlp  # Choices: mlp, cnn, gatv2. Emits three raw ZILN parameters per target.
       mlp:
         residual: true
-        hidden_dims: [256, 128, 64]  # Original pointwise biology-head hidden widths.
+        hidden_dims: [256, 256]  # Two-layer biology head; normalized residual connections remain enabled.
       cnn:
         channels: 128  # Hidden spatial width; final pointwise projection emits target parameters.
         depth: 3  # Neighborhood radius in latent-grid pixels.
@@ -98,8 +111,8 @@ model:
       # Enabled by user choice despite missing the pilot's 1% promotion gate.
       deep_cca:
         dimension: 16
-        msi_hidden_dim: 128
-        he_hidden_dim: 256
+        msi_hidden_dim: 64
+        he_hidden_dim: 128
         biology_only_epochs: 1  # CCA weight is zero; existing batch alignment remains active.
         ramp_epochs: 2  # Half weight in epoch 2, full weight from epoch 3.
       output_dim: 1536
@@ -152,19 +165,31 @@ model:
   gatv2_checkpointing: false  # Independent of spectral checkpointing; preserves parameter names.
   gatv2_tile_budget: 64  # Independent tile graphs per internal attention call; all neighbors and optimizer rows are retained.
   pixel_spectral_microbatching: false  # Opt in to bounded checkpointed pooling for wide MLP training.
-  spectral_peak_budget: 524288  # Spatial spectral microbatch budget in active peaks; complete spectra stay together.
+  spectral_peak_budget: 262144  # Bound attention activations per checkpointed group; complete spectra stay together.
   spectral_checkpointing: true  # Recompute spectral activations during spatial backward, preserving dropout RNG.
   inference_peak_chunk_size: 262144  # Maximum peaks per inner no-gradient encoder chunk; spatial mode also uses the budget above.
 
 loss:
   batch_alignment:
-    nhsic: {enabled: true, weight: 0.01}  # Initial experimental weight, not an established optimum.
+    nhsic: {enabled: true, weight: 0.1}  # Initial experimental weight, not an established optimum.
     anova: {enabled: true, weight: 0.01}
-    soft_nn: {enabled: true, weight: 0.001}
+    soft_nn: {enabled: true, weight: 0.0}  # Diagnostic only; undefined measurements remain unavailable.
     bandwidths: [0.05, 0.1, 0.2, 0.5]
     temperature: 0.1
-    train_per_slide: 32
+    train_per_slide: 128
     validation_per_slide: 64
+    conditioning:
+      enabled: true
+      alpha: 0.1  # 0: IHC only; 1: full IHC-times-H&E similarity.
+      ihc_bandwidth: 1.0
+      ihc_min_similarity: 0.05
+      minimum_candidates: 2
+      minimum_ess: 2.0
+      reference_per_slide: 1024
+      he_pairs: 16384
+      anchors_per_slide: 2
+      reference_seed: 0
+      anchor_seed: 0
   ziln_reduction: mean  # Reduction over valid weighted target entries: mean or sum.
   target_weights: [8.0, 4.0, 2.0, 1.0]  # Relative weights in data.target_columns order.
   logit_epsilon: 0.00001  # Clamp positive target densities before taking their logits.

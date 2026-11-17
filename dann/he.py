@@ -19,6 +19,31 @@ def he_settings(config: Mapping[str, Any]) -> dict[str, Any] | None:
     return component_settings(config['model'])['heads'].get('he')
 
 
+def create_he_reader(config: Mapping[str, Any], path: Path, rows: int,
+                     shared: HETargetReader | None = None) -> HETargetReader | None:
+    """Load fixed H&E for either auxiliary supervision or active conditioning."""
+    from dann.conditional_alignment import conditioning_contract
+    he = he_settings(config)
+    conditioning = conditioning_contract(config)
+    condition_he = conditioning is not None and conditioning['settings']['alpha'] > 0
+    if he is None and not condition_he:
+        return None
+    key = config['data'].get('he_features_key', 'hes_features')
+    width = he['output_dim'] if he else None
+    if width is None:
+        with h5py.File(path, 'r') as handle:
+            name = f'obsm/{key}'
+            if name not in handle or not isinstance(handle[name], h5py.Dataset) or handle[name].ndim != 2:
+                raise ValueError('H&E conditioning requires a fixed UNI2-h feature matrix.')
+            width = handle[name].shape[1]
+    if shared is not None:
+        if (shared.path.resolve() != Path(path).resolve() or shared.key != key
+                or shared.rows != rows or shared.width != width):
+            raise ValueError('Shared H&E reader source or dimensions differ from input.')
+        return shared
+    return HETargetReader(path, key, rows, width)
+
+
 class HETargetReader:
     """Read selected obsm rows from disk or a shared immutable float32 cache.
 

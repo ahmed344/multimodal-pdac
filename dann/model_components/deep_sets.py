@@ -1,19 +1,22 @@
-"""Sparse spectral pooling with historical occurrence or weighted dictionary MLPs."""
+"""Sparse spectral pooling with occurrence, dictionary, or learned-query pooling."""
 import math
 from typing import Sequence
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from .layers import build_mlp, without_dropout
+from .attention_pooling import SparseAttentionPooling, attention_settings
 
 
 def validate_pooling(pooling: str, normalization: str, pool_centering: str,
                      normalization_epsilon: float) -> None:
     """Reject ambiguous pooling semantics before constructing parameters."""
-    if pooling not in {"occurrence_mlp", "intensity_weighted_dictionary"}:
-        raise ValueError("pooling must be occurrence_mlp or intensity_weighted_dictionary.")
-    allowed = ({"count"}, {"none", "zero_input"}) if pooling == "occurrence_mlp" else (
-        {"l1", "l2"}, {"none", "dictionary_mean"})
+    choices = {"occurrence_mlp": ({"count"}, {"none", "zero_input"}),
+               "intensity_weighted_dictionary": ({"l1", "l2"}, {"none", "dictionary_mean"}),
+               "attention": ({"softmax"}, {"none"})}
+    if pooling not in choices:
+        raise ValueError("pooling must be occurrence_mlp, intensity_weighted_dictionary, or attention.")
+    allowed = choices[pooling]
     if normalization not in allowed[0] or pool_centering not in allowed[1]:
         raise ValueError(f"{pooling} requires normalization in {sorted(allowed[0])} and "
                          f"pool_centering in {sorted(allowed[1])}; changing pooling requires fresh training.")
@@ -23,7 +26,7 @@ def validate_pooling(pooling: str, normalization: str, pool_centering: str,
 
 
 class DeepSetsEncoder(nn.Module):
-    """Sparse occurrence or intensity-weighted dictionary spectral pooling."""
+    """Sparse occurrence, intensity-weighted dictionary, or attention pooling."""
 
     def __init__(
         self,
@@ -42,6 +45,7 @@ class DeepSetsEncoder(nn.Module):
         pooling: str = "occurrence_mlp",
         normalization: str = "count",
         normalization_epsilon: float = 1.0e-8,
+        attention: dict | None = None,
     ) -> None:
         """Initialize the learnable peak dictionary and Deep Sets MLPs.
 
@@ -49,7 +53,7 @@ class DeepSetsEncoder(nn.Module):
             num_peaks (int): Number of aligned m/z bins.
             embedding_dim (int): Peak dictionary width.
             peak_hidden_dims (Sequence[int]): Per-peak MLP hidden widths.
-            peak_output_dim (int): Per-peak output width.
+            peak_output_dim (int): Pooled pixel width passed to aggregation.
             activation (str): Hidden activation name.
             dropout (float): Hidden dropout probability.
             use_layer_norm (bool): Apply hidden LayerNorm.
@@ -61,10 +65,12 @@ class DeepSetsEncoder(nn.Module):
             pool_centering (str): Subtract the dropout-free zero-input reference
                 for nonempty occurrence pools with ``zero_input``, or subtract
                 the transformed vocabulary mean with ``dictionary_mean``.
-            pooling (str): Historical ``occurrence_mlp`` or
-                ``intensity_weighted_dictionary`` sparse projection.
-            normalization (str): Occurrence ``count`` or dictionary ``l1``/``l2``.
+            pooling (str): ``occurrence_mlp``, ``intensity_weighted_dictionary``,
+                or learned-query ``attention``.
+            normalization (str): Occurrence ``count``, dictionary ``l1``/``l2``,
+                or attention ``softmax``.
             normalization_epsilon (float): Positive dictionary row-norm floor.
+            attention (dict | None): Learned-query dimensions for attention pooling.
 
         Returns:
             None: Module parameters are initialized.
@@ -79,19 +85,23 @@ class DeepSetsEncoder(nn.Module):
         self.peak_mlp_residual = peak_mlp_residual
         self.num_peaks = int(num_peaks)
         self.embedding_dim = int(embedding_dim)
+        self.output_dim = int(peak_output_dim)
+        self.attention_settings = attention_settings(attention) if pooling == 'attention' else None
         self.inference_peak_chunk_size = int(inference_peak_chunk_size)
         if self.inference_peak_chunk_size <= 0:
             raise ValueError("inference_peak_chunk_size must be positive.")
         self.embedding = nn.Embedding(self.num_peaks, self.embedding_dim)
         self.peak_mlp = build_mlp(
-            self.embedding_dim,
+            self.embedding_dim + (pooling == 'attention'),
             peak_hidden_dims,
-            peak_output_dim,
+            self.attention_settings['token_dim'] if self.attention_settings else peak_output_dim,
             activation,
             dropout,
             use_layer_norm,
             residual=peak_mlp_residual,
         )
+        if self.attention_settings is not None:
+            self.attention_pool = SparseAttentionPooling(peak_output_dim, self.attention_settings)
         if initialize_embeddings:
             nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
 
@@ -152,6 +162,11 @@ class DeepSetsEncoder(nn.Module):
             torch.Tensor: Pooled representations with shape ``[batch, peak_output_dim]``.
         """
 
+        if self.pooling == 'attention':
+            chunk_size = (max(len(peak_indices), 1) if torch.is_grad_enabled()
+                          else self.inference_peak_chunk_size)
+            return self.attention_pool(peak_indices, intensities, sample_indices, peak_counts,
+                                       self.embedding, self.peak_mlp, chunk_size)
         if self.pooling == "intensity_weighted_dictionary":
             return self._dictionary_pool(self.effective_dictionary(), peak_indices,
                                          intensities, sample_indices, peak_counts)

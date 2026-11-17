@@ -46,7 +46,8 @@ def spatial_config(tmp_path):
     config['training']['early_stopping_metric'] = 'supervised_objective'
     config['training']['warmup']['epochs'] = 0
     config['training']['head_initialization']['enabled'] = False
-    config['model']['spectral_encoder']['deep_sets'].update(peak_mlp_residual=False, pool_centering='none')
+    config['model']['spectral_encoder']['deep_sets'].update(
+        peak_mlp_residual=False, pool_centering='none', pooling='occurrence_mlp', normalization='count')
     for group in [config['model']['aggregation'], *config['model']['heads'].values()]:
         group['mlp']['residual'] = False
     # Exercise the legacy path unless a test explicitly opts into execution caches.
@@ -344,7 +345,7 @@ def test_configuration_routes_and_invalid_selectors(spatial_config):
         resolve_execution(c)
     c['model']['aggregation']['cnn']['depth'] = 2
     c['model']['aggregation']['type'] = 'dnn'
-    with pytest.raises(ValueError, match='mlp or cnn'):
+    with pytest.raises(ValueError, match='component type.*convnext'):
         resolve_execution(c)
 
 

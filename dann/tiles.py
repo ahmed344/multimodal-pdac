@@ -142,21 +142,16 @@ class SpatialTileDataset(Dataset):
             self.keys, features = geometry[0], geometry[1]
         self.indices = np.asarray(selected_rows, dtype=np.int64)
         self.metadata = metadata
-        from dann.he import HETargetReader, he_settings
-        he = he_settings(config)
-        self.he_reader = None
-        if metadata is not None and he:
-            key = self.data.get('he_features_key', 'hes_features')
-            if he_reader is not None and (he_reader.path.resolve() != self.path.resolve()
-                    or he_reader.key != key or he_reader.rows != len(self.keys)
-                    or he_reader.width != he['output_dim']):
-                raise ValueError('Shared H&E reader source or dimensions differ from tile input.')
-            self.he_reader = he_reader or HETargetReader(self.path, key, len(self.keys), he['output_dim'])
+        from dann.he import create_he_reader
+        self.he_reader = (create_he_reader(config, self.path, len(self.keys), he_reader)
+                          if metadata is not None else None)
         self.core_size = int(config['training'].get('core_size', 32))
-        self.halo = execution_settings(config)['halo']
-        self.latent_radius = execution_settings(config)['latent_radius']
-        self.biology_radius = execution_settings(config)['biology_radius']
-        self.size = self.core_size + 2 * self.halo
+        execution = execution_settings(config)
+        self.halo = execution['halo']
+        self.latent_radius = execution['latent_radius']
+        self.biology_radius = execution['biology_radius']
+        self.grid_alignment = execution.get('grid_alignment', 1)
+        self.size = self.core_size + 2 * self.halo + self.grid_alignment - 1
         if len(features) != config['model']['num_peaks']:
             raise ValueError("Context feature width differs from configured num_peaks.")
         if metadata is not None and metadata.num_observations != len(self.keys):
@@ -205,14 +200,20 @@ class SpatialTileDataset(Dataset):
                     > self.performance.get('host_budget_gib', 128) * 2**30):
                 raise MemoryError('Spatial geometry plus resident caches exceed host budget.')
 
+    def _tile_origin(self, tile_x: int, tile_y: int) -> tuple[int, int]:
+        """Anchor pooling to global coordinates, including negative grid origins."""
+        return tuple((v * self.core_size - self.halo) // self.grid_alignment * self.grid_alignment
+                     for v in (tile_x, tile_y))
+
     def _prepare_geometry(self, item: int) -> dict[str, Any]:
         """Cache immutable full footprints and graphs shared by all label splits."""
         tile_key, _ = self.tiles[item]
-        key = (self.geometry[-1], self.core_size, self.halo, tuple(sorted(self.graph_radii)), tile_key)
+        key = (self.geometry[-1], self.core_size, self.halo, self.grid_alignment,
+               tuple(sorted(self.graph_radii)), tile_key)
         if key in self.spatial_cache:
             return self.spatial_cache[key]
         slide, tile_x, tile_y = tile_key
-        x0, y0 = tile_x * self.core_size - self.halo, tile_y * self.core_size - self.halo
+        x0, y0 = self._tile_origin(tile_x, tile_y)
         rows, positions = [], []
         mask = np.zeros((self.size, self.size), dtype=np.float32)
         for y in range(self.size):
@@ -236,7 +237,7 @@ class SpatialTileDataset(Dataset):
     def _prepared_item(self, item: int) -> dict[str, Any]:
         geometry = self.context_rows[item] if hasattr(self, 'context_rows') else self._prepare_geometry(item)
         (slide, tile_x, tile_y), selected = self.tiles[item]
-        x0, y0 = tile_x * self.core_size - self.halo, tile_y * self.core_size - self.halo
+        x0, y0 = self._tile_origin(tile_x, tile_y)
         rows, core, support, latent_support = [], [], [], []
         mask = geometry['occupancy']
         for output_row, context_row in selected:
@@ -274,8 +275,7 @@ class SpatialTileDataset(Dataset):
         if self.resident is not None or self.performance.get('cache_geometry'):
             return self._prepared_item(item)
         (slide, tile_x, tile_y), selected = self.tiles[item]
-        x0 = tile_x * self.core_size - self.halo
-        y0 = tile_y * self.core_size - self.halo
+        x0, y0 = self._tile_origin(tile_x, tile_y)
         samples, positions = [], []
         mask = np.zeros((self.size, self.size), dtype=np.float32)
         for y in range(self.size):
