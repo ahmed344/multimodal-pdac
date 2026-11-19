@@ -42,7 +42,7 @@ def latent_geometry_settings(settings: Mapping[str, Any] | None = None) -> dict[
         whitening_power=.5, eigenvalue_floor=1e-4, n_neighbors=[30], min_dist=.3,
         seeds=[20260719], max_train_samples=50000, max_validation_samples=None,
         diagnostic_max_samples=4000, spatial_stride=4, resamples=3,
-        resample_fraction=.8, distance_pairs=20000, plot_max_samples=12000,
+        resample_fraction=.8, distance_pairs=20000, plot_max_samples=None,
         technical_columns=[], layouts=True)
     if settings is not None and not isinstance(settings, Mapping):
         raise ValueError('analysis.latent_geometry must be a mapping.')
@@ -66,7 +66,7 @@ def latent_geometry_settings(settings: Mapping[str, Any] | None = None) -> dict[
     for key in ('max_train_samples', 'max_validation_samples', 'diagnostic_max_samples',
                 'spatial_stride', 'resamples', 'distance_pairs', 'plot_max_samples'):
         v = result[key]
-        if v is None and key.startswith('max_'):
+        if v is None and (key.startswith('max_') or key == 'plot_max_samples'):
             continue
         minimum = 0 if key == 'resamples' else 4 if key in ('max_train_samples', 'max_validation_samples', 'diagnostic_max_samples') else 1
         if isinstance(v, bool) or not isinstance(v, int) or v < minimum:

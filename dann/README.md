@@ -1015,6 +1015,8 @@ python -m dann.latent_geometry --config dann/config.yaml --checkpoint /path/to/m
 python -m dann.latent_geometry --config dann/config.yaml --checkpoint /path/to/model/best.pt --smoke-test
 # Diagnose higher-dimensional neighborhoods before spending time on layouts:
 python -m dann.latent_geometry --config dann/config.yaml --checkpoint /path/to/model/best.pt --diagnostics-only
+# Reuse a completed experiment without inference, sampling, or UMAP fitting:
+python -m dann.latent_geometry --config dann/config.yaml --render-only /path/to/experiment --output /path/to/new-empty-directory
 ```
 
 `analysis.latent_geometry` controls this CLI only. It does not enable extra
@@ -1029,6 +1031,26 @@ is retained. Lesion and valid-CD8 eligibility is applied after inference, with
 separate flags for non-lesion exclusion and invalid CD8, plus the specific
 insufficient-non-tumor-area or normalized-ratio-above-one reason. Mixed tumor–stroma
 pixels remain eligible. The saved 90/10 split is not changed.
+
+`--render-only EXPERIMENT_DIR` requires a separate, new or empty `--output`
+directory. It copies CSV, NPZ and JSON artifacts byte-for-byte, including saved
+coordinates and initialization exceptions, then renders the CD8 figures. It
+never runs inference, samples predictions, or fits UMAP. The working YAML controls
+figure styling and the optional display cap; saved numerical settings stay
+unchanged. `render_provenance.json` records effective display settings, source
+checksums and the generated figure paths.
+
+Rendering reads the experiment's checksummed CD8 parameter export when present.
+For older experiments it reads `umap/tables/latent_umap.csv` (or the legacy flat
+location) from the checkpoint run's standard `analysis/` directory. Override that
+location with `--analysis-dir`. This fallback requires the original checkpoint,
+`umap/settings.json`, `target_transform.json`, and `latent/latent_run.json` with a
+matching recorded prediction-table checksum. It verifies checkpoint/source/split
+identity, target semantics, unique row IDs, observed CD8 and batch identities,
+then joins predictions to eligible validation rows. Saved standard-analysis means
+are reused; any numerical difference in presence probabilities from the geometry
+inference is recorded in parameter provenance. Missing, inconsistent or incomplete
+inputs fail before rendering. Historical outputs are preserved.
 
 The initial discovery comparison includes raw cosine, globally centered cosine,
 raw Euclidean, feature-standardized Euclidean, 16/32/99%-variance PCA, and
@@ -1098,12 +1120,27 @@ Artifacts include:
 - `calibration.csv`, `reliability.csv`, `distribution_metrics.json`: full eligible
   validation presence/exceedance calibration and positive-branch PIT/coverage,
   computed once because geometry cannot change checkpoint calibration.
-- Each arm's `representation.npz`, neighbor arrays, UMAP coordinates, static PNG
-  and offline HTML viewer; `layout_stability.csv` measures neighborhood agreement
-  across layout seeds and preservation of higher-dimensional neighbors. The plot
-  cap affects display only. Representation and coordinate tables retain all
-  eligible validation rows, with source IDs and spatial coordinates in the
-  observation table.
+- Each arm's `representation.npz`, neighbor arrays, UMAP coordinates and settings;
+  `layout_stability.csv` measures neighborhood agreement across layout seeds and
+  preservation of higher-dimensional neighbors. Representation and coordinate
+  tables retain all eligible validation rows, with source IDs and spatial
+  coordinates in the observation table.
+- `cd8_parameters.csv` and `cd8_parameters.json`: row-aligned observed `Density_CD8`,
+  `pi` (zero probability), `presence_probability`, `mu`, `sigma`, `sampled_mean`,
+  `slide` and `row_id`, with target semantics, sampling settings and checksums.
+  CD8 is selected by target name. Seeded sampled means use `density_mc_samples`
+  and `density_mc_seed`, are computed once, and are reused across every layout.
+- The only figures are `cd8_umap_parameters/<geometry>.png`: observed CD8 logit,
+  logit of sampled predicted mean, and slide identity above presence probability,
+  mu, and sigma. They use the existing six-panel renderer at 300 DPI, with the
+  configured point size, density colormap and percentile limits. Observed zeros
+  and zero sampled means are gray. Identical display rows keep color limits and
+  slide colors consistent across geometries. Multiple neighbor/seed combinations
+  use `cd8_umap_parameters/umap_k<N>_seed<S>/<geometry>.png`.
+  `plot_max_samples: null` displays all eligible validation rows; positive caps
+  affect figures only. No HTML viewers, comparison reports, comparison figures,
+  or other visualizations are generated. `--diagnostics-only` writes numerical
+  artifacts only, including the CD8 parameter table.
 - `slide_observed_summary.csv` uses all eligible validation rows before diagnostic
   downsampling. Connected components and 2D islands are not assigned biological
   state labels. Any later state proportions must use full eligible rows.

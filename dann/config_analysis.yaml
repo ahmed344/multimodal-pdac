@@ -25,7 +25,7 @@ analysis:
     resamples: 3  # Slide and spatial-block subsampling without replacement.
     resample_fraction: 0.8
     distance_pairs: 20000  # Seeded distinct training pairs for RMS block-distance scaling.
-    plot_max_samples: 12000  # Display only; representation/coordinate exports retain every eligible row.
+    plot_max_samples: null  # All eligible validation rows; an explicit positive cap affects figures only.
     technical_columns: []  # Optional numeric obs columns for diagnostic correlations, never feature weights.
     layouts: true  # UMAP fits training rows and transforms validation with frozen settings.
   features:

@@ -162,10 +162,20 @@ def test_settings_reject_invalid_experiment_contracts(bad):
         latent_geometry_settings(bad)
 
 
-def test_end_to_end_numerics_and_training_only_layout_fit(tmp_path, monkeypatch):
+@pytest.mark.parametrize('layouts', [True, False])
+def test_end_to_end_numerics_and_training_only_layout_fit(tmp_path, monkeypatch, layouts):
     import umap
+    from dann import ziln
     arrays, frames = fixture_frames()
     calls = []
+    samples, renders = [], []
+    original_sample = ziln.sampled_density_mean
+    def sample(*args, **kwargs):
+        samples.append(1)
+        return original_sample(*args, **kwargs)
+    def render(coordinates, parameters, path, *args):
+        renders.append((parameters, path))
+    monkeypatch.setattr(ziln, 'sampled_density_mean', sample)
     class FakeUMAP:
         def __init__(self, **kwargs):
             assert kwargs['min_dist'] == .3 and kwargs['n_neighbors'] == 5
@@ -177,18 +187,26 @@ def test_end_to_end_numerics_and_training_only_layout_fit(tmp_path, monkeypatch)
             assert len(x) == len(frames['validation'])
             return x[:, :2]
     monkeypatch.setattr(umap, 'UMAP', FakeUMAP)
-    monkeypatch.setattr('dann.latent_geometry.render_layout', lambda *args: None)
+    monkeypatch.setattr('dann.latent_geometry.render_layout', render)
     settings = latent_geometry_settings(dict(geometries=['raw_euclidean'], guided_geometry='raw_euclidean',
-        cd8_weights=[0., .1], n_neighbors=[5], seeds=[1, 2], diagnostic_max_samples=32, resamples=1))
+        cd8_weights=[0., .1], n_neighbors=[5], seeds=[1, 2], diagnostic_max_samples=32, resamples=1, layouts=layouts))
     thresholds = g.training_thresholds(frames['train'].Density_CD8.to_numpy(), settings['threshold_quantiles'], 1e-6)
     summary = run_experiments(arrays, frames, thresholds, settings, tmp_path,
         ['Density_CD8', 'Density_Tumor', 'Density_Collagen', 'Density_Stroma'], 1e-6)
-    assert len(calls) == 4  # Two seeds for discovery and nonzero guidance; zero reuses exactly.
+    assert len(samples) == 1
+    assert len(calls) == (4 if layouts else 0)  # Zero guidance reuses the discovery layout.
+    assert len(renders) == (6 if layouts else 0)
+    assert all(table is renders[0][0] for table, _ in renders)
     assert len(summary['completed_arms']) == 3
     np.testing.assert_array_equal(np.load(tmp_path/'raw_euclidean/representation.npz')['values'],
                                   np.load(tmp_path/'cd8_weight_0p0/representation.npz')['values'])
-    pd.testing.assert_frame_equal(pd.read_csv(tmp_path/'raw_euclidean/umap_k5_seed1/coordinates.csv'),
-                                 pd.read_csv(tmp_path/'cd8_weight_0p0/umap_k5_seed1/coordinates.csv'))
+    if layouts:
+        pd.testing.assert_frame_equal(pd.read_csv(tmp_path/'raw_euclidean/umap_k5_seed1/coordinates.csv'),
+                                     pd.read_csv(tmp_path/'cd8_weight_0p0/umap_k5_seed1/coordinates.csv'))
+        assert all(path.parent.name in ('umap_k5_seed1', 'umap_k5_seed2') for _, path in renders)
+    else:
+        assert all(p.suffix in ('.csv', '.json', '.npz') for p in tmp_path.rglob('*') if p.is_file())
+    assert len(pd.read_csv(tmp_path/'cd8_parameters.csv')) == len(frames['validation'])
     assert (tmp_path/'heldout_probes.csv').exists()
     assert pd.read_csv(tmp_path/'calibration.csv').query("slide == 'all'").rows.eq(48).all()
     assert (tmp_path/'preprocessing.npz').exists()

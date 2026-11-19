@@ -22,6 +22,7 @@ from anndata.io import read_elem
 from dann.analysis_execution import StageCache, digest_file, fingerprint, load_checkpoint_snapshot
 from dann.config import latent_geometry_settings
 from dann import geometry as g
+from dann.geometry_render import cd8_parameter_table, figure_path, render_experiment, render_layout, write_parameters
 from dann.spatial_execution import InferenceProgress
 
 
@@ -119,6 +120,7 @@ def extract_checkpoint(config: dict, checkpoint: dict, checkpoint_path: Path, ch
     from torch.utils.data import DataLoader
     from dann.analyze import extract_latent_predictions, load_model
     from dann.checkpoints import validate_checkpoint, validate_training_data_contract
+    from dann.targets import target_contract
     from dann.config import execution_settings, resolve_device
     from dann.data_loader import create_data_bundle, load_anndata_metadata, sparse_collate, stratified_cap_indices
     from dann.tiles import row_identity, tile_collate
@@ -209,6 +211,7 @@ def extract_checkpoint(config: dict, checkpoint: dict, checkpoint_path: Path, ch
     pd.concat(audits).to_csv(output/'eligibility.csv', index=False)
     provenance = dict(checkpoint=str(checkpoint_path.resolve()), checkpoint_sha256=checkpoint_hash,
         checkpoint_epoch=int(checkpoint['epoch'])+1, sources=sources, source_identity=fingerprint(identity),
+        target_transform=target_contract(config), logit_epsilon=config['loss']['logit_epsilon'],
         source_code_sha256=source_code, versions=versions,
         saved_split_counts={k: len(v) for k, v in splits.items()},
         population_eligibility=population_eligibility,
@@ -220,50 +223,21 @@ def extract_checkpoint(config: dict, checkpoint: dict, checkpoint_path: Path, ch
     return arrays, frames, threshold_info, provenance
 
 
-def render_layout(coordinates: np.ndarray, frame: pd.DataFrame, probabilities: np.ndarray,
-                  output: Path, title: str, cap: int, seed: int, thresholds: list[float]) -> None:
-    """Save static panels and an offline color-selectable viewer with row identities."""
-    from matplotlib import pyplot as plt
-    import plotly.graph_objects as go
-    from dann.html_display import write_plotly
-    selected = np.sort(np.random.default_rng(seed).choice(len(frame), min(cap, len(frame)), replace=False))
-    xy, part = coordinates[selected], frame.iloc[selected]
-    slides, names = pd.factorize(part.slide, sort=True)
-    colors = {'Slide (category code)': slides, 'Observed CD8': part.Density_CD8.to_numpy(),
-              'Predicted CD8 presence': probabilities[selected, 0]}
-    for j, threshold in enumerate(thresholds, 1):
-        colors[f'Predicted P(CD8 > {threshold:.8g}) · t{j}'] = probabilities[selected, j]
-    for name in ('Density_Tumor', 'Density_Collagen', 'Density_Stroma'):
-        if name in part:
-            colors[name] = part[name].to_numpy()
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4), constrained_layout=True)
-    try:
-        for axis, (name, values) in zip(axes, colors.items()):
-            scatter = axis.scatter(xy[:, 0], xy[:, 1], c=values, s=2, cmap='turbo', rasterized=True)
-            axis.set_title(name, fontsize=9)
-            axis.set_xticks([])
-            axis.set_yticks([])
-            fig.colorbar(scatter, ax=axis, shrink=.7)
-        fig.suptitle(title, fontsize=10)
-        fig.savefig(output/'layout.png', dpi=150)
-    finally:
-        plt.close(fig)
-    figure = go.Figure(go.Scattergl(x=xy[:, 0], y=xy[:, 1], mode='markers',
-        text=[f'Row {r} · {s}' for r, s in zip(part.row_id, part.slide)],
-        hovertemplate='%{text}<extra></extra>', marker=dict(size=3, color=slides, colorscale='Turbo', showscale=True)))
-    buttons = [dict(label=name, method='restyle', args=[{'marker.color': [values.tolist()],
-               'marker.colorbar.title.text': name}]) for name, values in colors.items()]
-    figure.update_layout(title=title+f' · displaying {len(selected):,}/{len(frame):,} held-out rows',
-                         template='plotly_white', height=800, updatemenus=[dict(buttons=buttons)])
-    write_plotly(figure, output/'layout.html')
-    _write_json(output/'slide_colors.json', dict(enumerate(names.tolist())))
-
-
 def run_experiments(arrays: Mapping[str, dict], frames: Mapping[str, pd.DataFrame],
                     threshold_info: dict, settings: dict, output: Path,
-                    target_columns: list[str], epsilon: float) -> dict:
+                    target_columns: list[str], epsilon: float,
+                    analysis: Mapping[str, Any] | None = None) -> dict:
     """Fit training transforms once, compare fixed rows, and publish separate views."""
+    analysis = dict(analysis or {})
     train_frame, valid_frame = frames['train'], frames['validation']
+    parameters = cd8_parameter_table(arrays['validation'], valid_frame, target_columns, analysis)
+    provenance_path = output/'provenance.json'
+    provenance = json.loads(provenance_path.read_text()) if provenance_path.is_file() else {}
+    write_parameters(output, parameters, dict(checkpoint_sha256=provenance.get('checkpoint_sha256'),
+        target_transform=provenance.get('target_transform'), logit_epsilon=epsilon,
+        geometry_provenance_sha256=digest_file(provenance_path) if provenance_path.is_file() else None,
+        sampling=dict(method='seeded hurdle draws over eligible validation rows in saved row order',
+                      samples=analysis.get('density_mc_samples', 1000), seed=analysis.get('density_mc_seed', 20260719))))
     train, valid = arrays['train']['latent'], arrays['validation']['latent']
     if min(len(train), len(valid)) < 4:
         raise ValueError('At least four eligible rows per split are required.')
@@ -280,7 +254,7 @@ def run_experiments(arrays: Mapping[str, dict], frames: Mapping[str, pd.DataFram
         table = frame.copy()
         for j in range(probabilities[split].shape[1]):
             table['cd8_presence' if j == 0 else f'cd8_exceedance_{j}'] = probabilities[split][:, j]
-        table.to_csv(output/f'{split}_observations.csv', index=False)
+        table.to_csv(output/f'{split}_observations.csv', index=False, float_format='%.17g')
     calibration, reliability = g.calibration_tables(valid_frame, probabilities['validation'], thresholds)
     calibration.to_csv(output/'calibration.csv', index=False)
     reliability.to_csv(output/'reliability.csv', index=False)
@@ -362,9 +336,9 @@ def run_experiments(arrays: Mapping[str, dict], frames: Mapping[str, pd.DataFram
                     spread=1., n_components=2, fit_split='train', fit_rows=len(training), transform_rows=len(validation),
                     reused_from=reference if reference is not None else None))
                 pd.DataFrame(dict(row_id=valid_frame.row_id, umap_1=coordinates[:, 0], umap_2=coordinates[:, 1])).to_csv(layout_folder/'coordinates.csv', index=False)
-                render_layout(coordinates, valid_frame, probabilities['validation'], layout_folder,
-                    f'{"Discovery" if view == "discovery" else "CD8-guided"}: {name} · k={k} · seed={layout_seed}',
-                    settings['plot_max_samples'], seed, thresholds)
+                png = figure_path(output, name, k, layout_seed,
+                    len(settings['n_neighbors'])*len(settings['seeds']) > 1)
+                render_layout(coordinates, parameters, png, analysis, epsilon, settings['plot_max_samples'], seed)
                 ids, _ = g.neighbors(coordinates[rows], k, 'euclidean')
                 higher_ids, _ = g.neighbors(validation[rows], k, metric)
                 stability.append(dict(arm=name, neighbors=k, seed=layout_seed,
@@ -429,10 +403,23 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, default=Path('dann/config.yaml'))
     parser.add_argument('--checkpoint', type=Path)
+    parser.add_argument('--render-only', type=Path, metavar='EXPERIMENT_DIR',
+                        help='Copy numerical artifacts and render saved coordinates; never infer or fit UMAP.')
+    parser.add_argument('--analysis-dir', type=Path,
+                        help='Standard-analysis directory for older experiments without exported CD8 parameters.')
     parser.add_argument('--output', type=Path, help='New output directory; existing nonempty directories are rejected.')
     parser.add_argument('--smoke-test', action='store_true', help='Cap inference to 256 training / 192 validation rows and diagnostic panels to 160.')
     parser.add_argument('--diagnostics-only', action='store_true', help='Skip UMAP fits and rendering.')
     args = parser.parse_args(argv)
+    if args.render_only:
+        if args.output is None or args.checkpoint or args.smoke_test or args.diagnostics_only:
+            parser.error('--render-only requires --output and cannot combine with --checkpoint, --smoke-test, or --diagnostics-only.')
+        runtime = load_config(args.config)
+        render_experiment(args.render_only, args.output, runtime['analysis'], analysis_dir=args.analysis_dir)
+        print(f'CD8 figures and numerical artifacts saved to {args.output.resolve()}', flush=True)
+        return 0
+    if args.analysis_dir:
+        parser.error('--analysis-dir requires --render-only.')
     runtime = load_config(args.config)
     path = args.checkpoint or Path(runtime['analysis'].get('checkpoint')
                                    or Path(runtime['training']['output_dir'])/'best.pt')
@@ -466,7 +453,8 @@ def main(argv: list[str] | None = None) -> int:
         arrays, frames, thresholds, provenance = extract_checkpoint(config, checkpoint, path, digest, output, progress)
         provenance['smoke_test'] = args.smoke_test
         _write_json(output/'provenance.json', provenance)
-        run_experiments(arrays, frames, thresholds, settings, output, config['data']['target_columns'], config['loss']['logit_epsilon'])
+        run_experiments(arrays, frames, thresholds, settings, output, config['data']['target_columns'],
+                        config['loss']['logit_epsilon'], config['analysis'])
     print(f'Geometry experiments saved to {output}', flush=True)
     return 0
 
