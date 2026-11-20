@@ -27,6 +27,7 @@ def test_retained_cohort_complete_workflow(tmp_path):
     config['model']['heads']['he']['enabled'] = False  # This workflow tests biology-only exports.
     config['results'].update(root=str(tmp_path / 'runs'), run_name='retained_synthetic')
     config['model']['latent_dim'] = 4
+    config['model']['spectral_encoder']['type'] = 'deep_sets'
     config['model']['spectral_encoder']['deep_sets'].update(embedding_dim=4, peak_hidden_dims=[8], peak_output_dim=8)
     config['model']['aggregation']['mlp']['hidden_dims'] = [8]
     for head in config['model']['heads'].values():

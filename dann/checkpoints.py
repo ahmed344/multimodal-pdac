@@ -3,20 +3,23 @@ import copy
 from typing import Any, Mapping
 
 from dann.model_components.layers_gatv2 import GATV2_DEFAULTS, GRAPH_SEMANTICS, gatv2_settings, graph_reach
-from dann.config import component_settings, execution_settings
+from dann.config import component_settings, execution_settings, set_transformer_semantics
+from dann.model_components.set_transformer import SetTransformerEncoder
 from dann.deep_cca import cca_contract
 from dann.model_components.attention_pooling import ATTENTION_SEMANTICS
 from dann.model_components.aggregation_convnext import CONVNEXT_SEMANTICS, convnext_reach
 
 
-ARCHITECTURE_VERSION = 11
+ARCHITECTURE_VERSION = 12
 
 
 def architecture_contract(config: Mapping[str, Any]) -> dict[str, Any]:
     """Describe selected architecture and numerical settings, independent of run paths."""
     settings = component_settings(config['model'])
     selected = {'spectral_encoder': settings['spectral_encoder']}
-    if settings['spectral_encoder']['deep_sets']['pooling'] == 'attention':
+    if selected['spectral_encoder']['type'] == 'set_transformer':
+        selected['spectral_encoder']['semantics'] = set_transformer_semantics(selected['spectral_encoder']['set_transformer'])
+    elif selected['spectral_encoder']['deep_sets']['pooling'] == 'attention':
         selected['spectral_encoder']['attention_semantics'] = copy.deepcopy(ATTENTION_SEMANTICS)
     for name, group in [('aggregation', settings['aggregation']), *settings['heads'].items()]:
         selected[name] = {'type': group['type'], group['type']: group[group['type']]}
@@ -56,16 +59,20 @@ def checkpoint_config(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
     version = saved['version'] if saved is not None else 2
     if version not in range(2, ARCHITECTURE_VERSION + 1):
         raise ValueError('Unsupported checkpoint architecture version.')
+    selector = config['model'].get('spectral_encoder', {'type': 'deep_sets'})
+    deep_sets = selector['type'] == 'deep_sets'
+    if not deep_sets and version < 12:
+        raise ValueError('Set Transformer requires architecture version 12 and fresh training.')
     if version < 11 and (config['model'].get('aggregation', {}).get('type') == 'convnext'
             or config['model'].get('spectral_encoder', {}).get('deep_sets', {}).get('pooling') == 'attention'):
         raise ValueError('Attention pooling and ConvNeXt require architecture version 11 and fresh training.')
     if version < 10 and cca_contract(config) is not None:
         raise ValueError('Deep CCA requires architecture version 10 and fresh training.')
-    if version >= 8 and not {'pooling', 'normalization', 'normalization_epsilon'} <= set(
+    if deep_sets and version >= 8 and not {'pooling', 'normalization', 'normalization_epsilon'} <= set(
             saved.get('components', {}).get('spectral_encoder', {}).get('deep_sets', {})):
         raise ValueError('Version 8 checkpoint architecture requires explicit pooling, normalization and normalization_epsilon.')
-    if 'spectral_encoder' in config['model']:
-        spectral = config['model']['spectral_encoder']['deep_sets']
+    if deep_sets and 'spectral_encoder' in config['model']:
+        spectral = selector['deep_sets']
         if version < 8:
             spectral.update(pooling='occurrence_mlp', normalization='count', normalization_epsilon=1.0e-8)
         elif not {'pooling', 'normalization', 'normalization_epsilon'} <= spectral.keys():
@@ -193,12 +200,25 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
         if (getattr(model, 'he_cca', None) is not None) != (cca_contract(config) is not None):
             raise ValueError('Model CCA objective is incompatible with checkpoint.')
         from dann.model_components.layers import NormalizedResidual
-        spectral = requested['components']['spectral_encoder']['deep_sets']
-        if any(getattr(model.encoder, key) != spectral[key] for key in
-               ('pool_centering', 'peak_mlp_residual', 'pooling', 'normalization', 'normalization_epsilon')):
-            raise ValueError('Model spectral centering/residual settings are incompatible.')
-        if model.encoder.attention_settings != spectral.get('attention'):
-            raise ValueError('Model spectral attention settings are incompatible.')
+        selector = requested['components']['spectral_encoder']
+        encoder = model.encoder
+        if isinstance(encoder, SetTransformerEncoder) != (selector['type'] == 'set_transformer'):
+            raise ValueError('Model spectral encoder type is incompatible with checkpoint.')
+        if selector['type'] == 'set_transformer':
+            active = dict(block_type=encoder.block_type, d_model=encoder.d_model, num_heads=encoder.num_heads,
+                          num_blocks=len(encoder.blocks), num_seeds=encoder.num_seeds,
+                          embedding_dim=encoder.embedding.embedding_dim)
+            if encoder.block_type == 'isab':
+                active['num_inducing_points'] = encoder.num_inducing_points
+            if active != selector['set_transformer'] or encoder.num_peaks != requested['numerics']['num_peaks']:
+                raise ValueError('Model Set Transformer settings are incompatible with checkpoint.')
+        else:
+            spectral = requested['components']['spectral_encoder']['deep_sets']
+            if any(getattr(model.encoder, key) != spectral[key] for key in
+                   ('pool_centering', 'peak_mlp_residual', 'pooling', 'normalization', 'normalization_epsilon')):
+                raise ValueError('Model spectral centering/residual settings are incompatible.')
+            if model.encoder.attention_settings != spectral.get('attention'):
+                raise ValueError('Model spectral attention settings are incompatible.')
         for name, module in [('aggregation', model.encoder.aggregation_mlp),
                              ('biology', model.biology_predictor),
                              ('discriminator', model.batch_discriminator),
@@ -233,7 +253,7 @@ def validate_checkpoint(checkpoint: Mapping[str, Any], config: Mapping[str, Any]
             elif hasattr(module, 'residual') or getattr(module, 'radius', 0):
                 raise ValueError(f'Model {name} spatial component is incompatible with an MLP checkpoint.')
             else:
-                width = (spectral['peak_output_dim'] if name == 'aggregation' else requested['numerics']['latent_dim'])
+                width = (encoder.output_dim if name == 'aggregation' else requested['numerics']['latent_dim'])
                 widths = group['mlp']['hidden_dims']
                 expected = (sum(a == b for a, b in zip([width] + widths, widths))
                             if group['mlp']['residual'] else 0)

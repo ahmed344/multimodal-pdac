@@ -5,7 +5,7 @@ representation. MSI stays sparse, either backed or resident in RAM, until the sp
 pools learned peak responses. Aggregation and the prediction
 heads can independently use MLPs, local spatial CNNs, or residual GATv2 attention.
 Aggregation also supports a masked ConvNeXt feature pyramid. The main configuration
-selects this pyramid with sparse attention pooling and exports 256-dimensional latents.
+uses a Set Transformer within each pixel and a pointwise MLP to export 128-dimensional latents.
 
 The four biology targets each use a structural-zero hurdle with three parameters:
 zero probability `pi`, positive logit mean `mu`, and positive logit standard
@@ -55,12 +55,74 @@ the combined settings without includes, so they remain usable without the source
 files. Training still runs the enabled `post_training` stages, and `--smoke-test`
 still disables them. Edit those switches in `config_analysis.yaml`.
 
-## Spectral pooling
+## Set Transformer spectral encoder
+
+The main experiment tests whether interactions among detected peaks within one pixel improve
+stromal representations and CD8 predictive distributions. Set `model.spectral_encoder.type` to
+`set_transformer` or `deep_sets`. Each reads its own sibling settings block. Aggregation and
+prediction heads have independent selectors. The main YAML selects SAB-128 with the same
+90/10 study split, intensity transform, objectives, and pointwise MLPs as the comparison.
+
+For a pixel with `N` positive bins, the MSI input adapter sums duplicate entries **after**
+the loader's intensity transform. It appends each scalar intensity to an 8-D learned embedding
+of its aligned bin ID and maps the nine features to width `D` with one affine layer. Each head
+projects Q, K, and V to width `D / num_heads` and uses `softmax(Q Kᵀ / √D) V`. Concatenated
+heads pass through a learned output projection. The blocks follow equations 3–16 in
+[Lee et al., Set Transformer (ICML 2019), §§2.2 and 3.1–3.3](https://proceedings.mlr.press/v97/lee19d/lee19d.pdf).
+
+```text
+H         = LayerNorm(A + Multihead(A, B, B))
+MAB(A, B) = LayerNorm(H + rFF(H))
+SAB(X)    = MAB(X, X)
+ISAB(X)   = MAB(X, MAB(I, X))
+PMA(Z)    = MAB(S, rFF_in(Z))
+decoded   = rFF_out(SAB(PMA(Z)))
+```
+
+Each rFF is an independent row-wise linear–ReLU–linear network of widths `D → 2D → D`.
+Each ISAB owns its inducing rows and both MABs. Attention is bidirectional and local to a
+pixel. The spectral encoder uses zero dropout and omits positional encoding.
+The default shape trace is `N×9 → N×32 → two SABs at N×32 → PMA at 4×32 → seed SAB
+and rFF at 4×32 → flatten to 128`. Flattening in fixed seed order adapts the paper's
+multi-row output to DANN. The pooled width is `num_seeds × d_model`. The pointwise
+aggregation MLP maps those features to the separately configured `model.latent_dim`.
+
+| Per-head scores per pixel | Count |
+| --- | ---: |
+| One peak SAB | N² |
+| One ISAB with m inducing rows, both directions | 2Nm |
+| PMA with four seeds | 4N |
+| Decoder SAB on four seeds | 16 |
+
+Microbatches group complete spectra of similar lengths and mask padding in both encoding and PMA.
+The peak budget and a cap of 2²⁴ scores per attention call across heads bound padded work.
+Long queries can run in slices against the full set of keys and values. Empty and zero-only
+pixels receive exact zero pooled vectors. Evaluation caches store the flattened seed outputs.
+
+Apply the following edits to the main YAML for each run. All four use `embedding_dim: 8`,
+`num_blocks: 2`, `num_heads: 4`, and `num_seeds: 4`. The three encoder settings in the
+table belong under `model.spectral_encoder.set_transformer`.
+
+| `results.run_name` | `block_type` | `d_model` | `num_inducing_points` | `model.latent_dim` |
+| --- | --- | ---: | ---: | ---: |
+| `set_transformer_sab_128` (main) | sab | 32 | 16 (unused) | 128 |
+| `set_transformer_sab_64` | sab | 16 | 16 (unused) | 64 |
+| `set_transformer_isab_128` | isab | 32 | 16 | 128 |
+| `set_transformer_isab_64` | isab | 16 | 16 | 64 |
+
+The 64-D variants use four heads of width 4, rFF hidden width 32, and pooled width 64.
+For 128-D runs the corresponding widths are 8, 64, and 128. Run the selected configuration
+with `python -m dann.train --config dann/config.yaml --smoke-test` for a capped check.
+Checkpoint architecture version 12 records the active tokenizer, attention and decoder
+semantics, dimensions, and block settings. Historical Deep Sets checkpoints retain their
+original interpretation. Changing the active spectral architecture requires fresh training.
+
+## Deep Sets spectral pooling
 
 `model.spectral_encoder.deep_sets` selects `pooling: attention` with
 `normalization: softmax`, `pooling: occurrence_mlp` with `normalization: count`
 (the historical omitted-field default), or `pooling: intensity_weighted_dictionary`
-with `normalization: l1` or `l2`. The main configuration selects attention.
+with `normalization: l1` or `l2`. The main YAML configures its Deep Sets option with occurrence pooling.
 Changing pooling, its dimensions, normalization, centering, or the normalization
 floor requires fresh training.
 
@@ -70,7 +132,7 @@ applies the token MLP. Each learned query scores the token as
 `query @ key / sqrt(key_dim) + log(I)` and softmax-normalizes within its spectrum.
 The weighted value summaries are concatenated and linearly projected to
 `peak_output_dim`. The defaults use eight queries, 128-dimensional tokens,
-32-dimensional keys, and 64-dimensional values. The main experiment instead uses
+32-dimensional keys, and 64-dimensional values. The earlier attention/ConvNeXt experiment used
 four queries, token/key/value widths 64/16/32, a 16-dimensional peak embedding,
 two 64-wide token hidden layers, and a 256-wide pooled output.
 This is learned-query pooling, without pairwise self-attention between peaks.
@@ -120,7 +182,7 @@ plots and do not summarize its intensity-dependent attention weights.
 `model.aggregation.type: convnext` enables the hierarchy in
 [`model_components/aggregation_convnext.py`](model_components/aggregation_convnext.py).
 It is an aggregation option; prediction-head selectors retain their existing choices.
-The main settings are:
+The earlier ConvNeXt experiment used the following settings.
 
 ```yaml
 model:
@@ -148,7 +210,7 @@ center spectrum. The resulting full-resolution vector is the **exported latent**
 and is also the input to biology, CCA, and alignment objectives.
 
 For odd kernel width `k` and stage depths `d_i`, the conservative input radius is
-`floor(k/2) * sum(d_i * 2**i) + 2**(number_of_stages-1) - 1`. The main radius is
+`floor(k/2) * sum(d_i * 2**i) + 2**(number_of_stages-1) - 1`. This configuration has a radius of
 10 grid pixels. Spatial head radii add to this as before. Tile input origins are
 rounded down to a global grid multiple of `2**(number_of_stages-1)` (four here),
 including at negative coordinates. The footprint reserves up to three additional
@@ -379,19 +441,16 @@ There are three groups and five selectors, all in `dann/config.yaml`:
 
 | Group | Selector | Choices | Default |
 |---|---|---|---|
-| Spectral processing | `model.spectral_encoder.type` | `deep_sets` | `deep_sets` |
-| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2`, `convnext` | `convnext` |
+| Spectral processing | `model.spectral_encoder.type` | `deep_sets`, `set_transformer` | `set_transformer` |
+| Latent aggregation | `model.aggregation.type` | `mlp`, `cnn`, `gatv2`, `convnext` | `mlp` |
 | Prediction heads | `model.heads.biology.type` | `mlp`, `cnn`, `gatv2` | `mlp` |
 | Optional discriminator | `model.heads.discriminator.type` | `mlp`, `cnn`, `gatv2` | `mlp` (disabled) |
 | Optional H&E head | `model.heads.he.type` | `mlp` for CCA; `mlp`, `cnn`, `gatv2` for raw MSE | `mlp` (CCA enabled) |
 
 All aggregation/head combinations are supported. Selectable neural modules
 live in `dann/model_components/`; `dann/model.py` composes them. The main spectral
-stage uses 16-dimensional learned peak embeddings and attention pooling, described
-above, to produce 256 features per pixel. Empty spectra pool to zero.
-The selectable aggregation produces the **exported 256-dimensional latent**.
-The biology MLP uses `[256, 256]` hidden widths. The alternative MLP aggregation
-uses `[512, 512]`; discriminator and raw-MSE MLP heads use `[256, 128, 64]`.
+stage produces 128 features per pixel. The pointwise MLP exports a 128-dimensional
+latent and both the aggregation and biology MLPs use `[128, 128]` hidden widths.
 CCA uses separate projectors described below.
 The shared ZILN transformation, weighted four-target objective,
 and optional class-weighted batch cross-entropy retain their definitions.
@@ -900,11 +959,11 @@ Resume retains saved architecture and the existing runtime override whitelist.
 
 All prediction consumers should use `model(batch)`. Calling `encode()` and then
 the biology head loses the spatial halo when a CNN or GATv2 head is selected. Peak-embedding
-analysis remains available for every combination through the Deep Sets dictionary.
+analysis remains available for every combination through the selected spectral encoder’s raw peak-ID embeddings.
 
 ## Result routing
 
-`results.root`, the four selectors, and `results.run_name` (checked-in `residual-gatv2-aggregation`) derive:
+`results.root`, the selected components, and `results.run_name` determine the following directory layout.
 
 ```text
 data/PDAC/Results/dann/<combination>/<run_name>/
@@ -915,7 +974,7 @@ data/PDAC/Results/dann/<combination>/<run_name>/
 ```
 
 The default run is
-`deep_sets__agg-gatv2__bio-cnn__disc-cnn/residual-gatv2-aggregation/`. Smoke artifacts
+`set_transformer__agg-mlp__bio-mlp__disc-none__he-mlp/set_transformer_sab_128/`. Smoke artifacts
 insert `smoke/` after the run name. Training, analysis, inference, heatmaps, and
 latent variance use this root; no separate architecture YAML files are required.
 For a smoke checkpoint, pass its `model/resolved_config.yaml` to downstream CLIs.
@@ -3210,7 +3269,7 @@ and completed updates. Enabled-warmup resumes reject missing or inconsistent sta
 Existing epoch-only resume restrictions still apply to partial-epoch checkpoints.
 
 Stabilization settings were introduced in architecture contract version 7;
-Version 8 added explicit spectral pooling and normalization; current checkpoints use version 11.
+Version 8 added explicit spectral pooling and normalization; current checkpoints use version 12.
 Versions 2–7 reconstruct their historical MLP and pooling behavior. Changing
 pooling, normalization, centering, or residual semantics is
 incompatible with loading those weights as a new architecture; start a fresh fit.

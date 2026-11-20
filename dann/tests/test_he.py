@@ -10,7 +10,7 @@ import pyarrow.parquet as pq
 import pytest
 import torch
 
-from dann.checkpoints import architecture_contract, validate_checkpoint
+from dann.checkpoints import ARCHITECTURE_VERSION, architecture_contract, validate_checkpoint
 from dann.config import execution_settings, resolve_execution
 from dann.data_loader import create_data_bundle
 from dann.execution import evaluation_groups, build_validation_features, validation_execution
@@ -138,7 +138,7 @@ def test_checkpoint_roundtrip_disabled_legacy_and_incompatibilities(he_config, t
     c = he_config
     path = checkpoint(c, tmp_path)
     payload = torch.load(path, weights_only=False)
-    assert payload['architecture']['version'] == 11
+    assert payload['architecture']['version'] == ARCHITECTURE_VERSION
     model = AdversarialLatentFusion.from_config(c, 2, 4)
     optimizer = torch.optim.AdamW(model.parameters())
     load_training_checkpoint(path, model, optimizer, torch.device('cpu'), c)

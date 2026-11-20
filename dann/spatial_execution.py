@@ -144,15 +144,20 @@ def check_feature_budget(model: torch.nn.Module, rows: int, device: torch.device
     encoder = model.encoder
     element_size = encoder.embedding.weight.element_size()
     required = rows * encoder.output_dim * element_size
-    hidden = max(m.out_features for m in encoder.peak_mlp.modules() if isinstance(m, torch.nn.Linear))
     peaks = settings.get('validation_peak_budget') or model.peak_budget
-    # Inference retains weighted embeddings plus the current MLP input/output;
-    # reserve a further hidden-width temporary for normalization/activation.
-    workspace = peaks * (2 * encoder.embedding.embedding_dim + 3 * hidden) * element_size
-    if encoder.pooling == 'attention':
-        attention = encoder.attention_settings
-        workspace += peaks * (3 * attention['num_queries'] + attention['key_dim']
-                              + 2 * attention['value_dim']) * element_size
+    from dann.model_components.set_transformer import SetTransformerEncoder
+    if isinstance(encoder, SetTransformerEncoder):
+        cache_rows = min(rows, settings.get('feature_cache_rows', rows))
+        workspace = encoder.workspace_bytes(cache_rows, peaks, element_size)
+    else:
+        hidden = max(m.out_features for m in encoder.peak_mlp.modules() if isinstance(m, torch.nn.Linear))
+        # Inference retains weighted embeddings plus the current MLP input/output;
+        # reserve a further hidden-width temporary for normalization/activation.
+        workspace = peaks * (2 * encoder.embedding.embedding_dim + 3 * hidden) * element_size
+        if encoder.pooling == 'attention':
+            attention = encoder.attention_settings
+            workspace += peaks * (3 * attention['num_queries'] + attention['key_dim']
+                                  + 2 * attention['value_dim']) * element_size
     if device.type == 'cuda':
         allocated = torch.cuda.memory_allocated(device)
         if allocated + required + workspace > settings['vram_budget_gib'] * 2**30:

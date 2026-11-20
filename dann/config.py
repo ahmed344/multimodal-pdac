@@ -435,6 +435,35 @@ def seed_everything(seed: int, deterministic: bool = False) -> None:
     torch.use_deterministic_algorithms(deterministic, warn_only=True)
 
 
+def set_transformer_semantics(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """Fixed operations and derived dimensions required to interpret trained weights."""
+    width = settings['d_model']
+    return dict(tokenizer='peak_id_embedding_concat_loader_intensity_affine',
+                duplicates='sum_transformed_then_keep_positive', attention_scale='1/sqrt(d_model)',
+                normalization='post_attention_residual_then_post_rff_residual', dropout=0.0,
+                positional_encoding=False, rff_activation='relu', rff_hidden_dim=2 * width,
+                head_dim=width // settings['num_heads'], decoder='pma_rff_in_seed_sab_rff_out',
+                readout='flatten_in_seed_order', pooled_dim=settings['num_seeds'] * width)
+
+
+def _set_transformer_settings(raw: Mapping[str, Any]) -> dict[str, Any]:
+    settings = dict(block_type='sab', embedding_dim=8, d_model=32, num_blocks=2,
+                    num_heads=4, num_seeds=4, num_inducing_points=16)
+    if not isinstance(raw, Mapping) or raw.keys() - settings.keys():
+        raise ValueError('Invalid model.spectral_encoder.set_transformer settings.')
+    settings.update(raw)
+    if settings['block_type'] not in ('sab', 'isab'):
+        raise ValueError('set_transformer.block_type must be sab or isab.')
+    if settings['block_type'] == 'sab':
+        settings.pop('num_inducing_points')
+    for name, value in settings.items():
+        if name != 'block_type' and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise ValueError(f'set_transformer.{name} must be a positive integer.')
+    if settings['d_model'] % settings['num_heads']:
+        raise ValueError('set_transformer.d_model must be divisible by num_heads.')
+    return settings
+
+
 def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
     """Resolve flat legacy architecture as all-MLP, or validate explicit selectors."""
     if "spectral_encoder" not in model:
@@ -451,8 +480,12 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
         if flat:
             raise ValueError(f"Cannot mix legacy flat and component settings: {sorted(flat)}")
         settings = copy.deepcopy({key: model[key] for key in ("spectral_encoder", "aggregation", "heads")})
-    if settings["spectral_encoder"]["type"] != "deep_sets":
-        raise ValueError("model.spectral_encoder.type must be deep_sets.")
+    selector = settings["spectral_encoder"]
+    kind = selector.get("type") if isinstance(selector, Mapping) else None
+    if kind not in ("deep_sets", "set_transformer") or not isinstance(selector.get(kind), Mapping):
+        raise ValueError("model.spectral_encoder requires type deep_sets or set_transformer and its settings block.")
+    spectral = selector[kind]
+    settings["spectral_encoder"] = {"type": kind, kind: spectral}
     if set(settings["heads"]) - {"biology", "discriminator", "he"} or not {"biology", "discriminator"} <= set(settings["heads"]):
         raise ValueError("model.heads requires biology and discriminator, with optional he.")
     disc = settings["heads"]["discriminator"]
@@ -480,24 +513,27 @@ def component_settings(model: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("model.heads.he.output_dim must be a positive integer.")
     else:
         settings["heads"].pop("he", None)
-    spectral = settings["spectral_encoder"]["deep_sets"]
-    spectral.setdefault("peak_mlp_residual", False)
-    spectral.setdefault("pool_centering", "none")
-    spectral.setdefault("pooling", "occurrence_mlp")
-    spectral.setdefault("normalization", "count")
-    spectral.setdefault("normalization_epsilon", 1.0e-8)
-    if not isinstance(spectral["peak_mlp_residual"], bool):
-        raise ValueError("peak_mlp_residual must be boolean.")
-    from dann.model_components.deep_sets import validate_pooling
-    validate_pooling(*(spectral[key] for key in
-                       ("pooling", "normalization", "pool_centering", "normalization_epsilon")))
-    if spectral['pooling'] == 'attention':
-        from dann.model_components.attention_pooling import attention_settings
-        spectral['attention'] = attention_settings(spectral.get('attention'))
+    if kind == "set_transformer":
+        settings["spectral_encoder"][kind] = _set_transformer_settings(spectral)
+        spectral_dims = []
     else:
-        spectral.pop('attention', None)
-    positive = [model["latent_dim"], model["num_peaks"], spectral["embedding_dim"],
-                spectral["peak_output_dim"], *spectral["peak_hidden_dims"],
+        spectral.setdefault("peak_mlp_residual", False)
+        spectral.setdefault("pool_centering", "none")
+        spectral.setdefault("pooling", "occurrence_mlp")
+        spectral.setdefault("normalization", "count")
+        spectral.setdefault("normalization_epsilon", 1.0e-8)
+        if not isinstance(spectral["peak_mlp_residual"], bool):
+            raise ValueError("peak_mlp_residual must be boolean.")
+        from dann.model_components.deep_sets import validate_pooling
+        validate_pooling(*(spectral[key] for key in
+                           ("pooling", "normalization", "pool_centering", "normalization_epsilon")))
+        if spectral['pooling'] == 'attention':
+            from dann.model_components.attention_pooling import attention_settings
+            spectral['attention'] = attention_settings(spectral.get('attention'))
+        else:
+            spectral.pop('attention', None)
+        spectral_dims = [spectral["embedding_dim"], spectral["peak_output_dim"], *spectral["peak_hidden_dims"]]
+    positive = [model["latent_dim"], model["num_peaks"], *spectral_dims,
                 model.get("spectral_peak_budget", 65536), model.get("inference_peak_chunk_size", 262144),
                 model.get("gatv2_tile_budget", 8)]
     for name, group in [("aggregation", settings["aggregation"]),
@@ -550,7 +586,8 @@ def execution_settings(config: Mapping[str, Any]) -> dict[str, Any]:
             radii.append(convnext_reach(group['convnext']))
     result = {"mode": "spatial" if any(radii) else "pixel", "halo": radii[0] + max(radii[1:]),
             "latent_radius": radii[0], "biology_radius": radii[0] + radii[1],
-            "combination": "deep_sets__agg-{}__bio-{}__disc-{}".format(*(g["type"] for g in groups[:3]))}
+            "combination": "{}__agg-{}__bio-{}__disc-{}".format(settings["spectral_encoder"]["type"],
+                                                                   *(g["type"] for g in groups[:3]))}
     if "discriminator" not in settings["heads"]:
         result["combination"] = result["combination"].replace("disc-mlp", "disc-none")
     if len(groups) == 4:
@@ -598,6 +635,11 @@ def resolve_execution(config: dict[str, Any]) -> dict[str, Any]:
             if name == 'aggregation' and 'convnext' in resolved:
                 group['convnext'] = resolved['convnext']
     execution = execution_settings(config)
+    active_encoder = settings["spectral_encoder"]
+    if active_encoder["type"] == "set_transformer":
+        active = active_encoder["set_transformer"]
+        config["model"]["spectral_encoder"]["set_transformer"].update(active)
+        execution["spectral_encoder"] = {**active_encoder, "semantics": set_transformer_semantics(active)}
     training = config["training"]
     interval = training.setdefault('progress_interval_seconds', 30.)
     if (isinstance(interval, bool) or not isinstance(interval, (int, float))

@@ -46,6 +46,7 @@ def spatial_config(tmp_path):
     config['training']['early_stopping_metric'] = 'supervised_objective'
     config['training']['warmup']['epochs'] = 0
     config['training']['head_initialization']['enabled'] = False
+    config['model']['spectral_encoder']['type'] = 'deep_sets'
     config['model']['spectral_encoder']['deep_sets'].update(
         peak_mlp_residual=False, pool_centering='none', pooling='occurrence_mlp', normalization='count')
     for group in [config['model']['aggregation'], *config['model']['heads'].values()]:

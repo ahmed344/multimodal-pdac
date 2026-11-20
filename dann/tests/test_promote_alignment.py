@@ -26,6 +26,7 @@ def study(tmp_path):
     for name, weights in promotion.RUNS.items():
         config = load_config(Path('dann/config.yaml'))
         # These fixtures represent the frozen historical, unconditional study.
+        config['model']['spectral_encoder']['type'] = 'deep_sets'
         config['model']['spectral_encoder']['deep_sets'].update(
             pooling='occurrence_mlp', normalization='count')
         config['loss']['batch_alignment'].pop('conditioning', None)
@@ -192,6 +193,7 @@ def test_results_checkpoint_routing_and_validation(selected):
     config = load_config(Path('dann/config.yaml'))
     config['model']['heads']['he']['enabled'] = False  # Legacy biology-only checkpoint.
     config['model']['aggregation']['type'] = 'mlp'
+    config['model']['spectral_encoder']['type'] = 'deep_sets'
     config['model']['spectral_encoder']['deep_sets'].update(
         pooling='occurrence_mlp', normalization='count')
     config['results'].pop('analysis_checkpoint')

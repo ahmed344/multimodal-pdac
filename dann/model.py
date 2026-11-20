@@ -6,6 +6,7 @@ from torch import nn
 from torch.nn import functional as F
 from dann.model_components.layers import build_activation, build_mlp
 from dann.model_components.deep_sets import DeepSetsEncoder
+from dann.model_components.set_transformer import SetTransformerEncoder
 from dann.model_components.aggregation_mlp import MLPAggregation
 from dann.model_components.aggregation_cnn import CNNAggregation
 from dann.model_components.aggregation_convnext import ConvNeXtAggregation
@@ -119,7 +120,7 @@ class GradientReversal(nn.Module):
 
 
 class AdversarialLatentFusion(nn.Module):
-    """Deep Sets, selectable aggregation, and independently selected prediction heads."""
+    """Sparse spectral encoding, latent aggregation, and independently selected heads."""
     def __init__(self, encoder, biology_predictor, batch_discriminator, he_predictor=None):
         super().__init__()
         self.encoder = encoder
@@ -141,21 +142,30 @@ class AdversarialLatentFusion(nn.Module):
         settings = component_settings(values)
         common = {"activation": values["activation"], "dropout": float(values["dropout"]),
                   "use_layer_norm": bool(values["use_layer_norm"])}
-        spectral = settings["spectral_encoder"]["deep_sets"]
-        encoder = IntensityWeightedPeakEncoder(
-            int(values["num_peaks"]), **spectral,
-            aggregation_hidden_dims=settings["aggregation"]["mlp"]["hidden_dims"],
-            latent_dim=values["latent_dim"],
-            aggregation_residual=settings["aggregation"]["mlp"]["residual"],
-            inference_peak_chunk_size=values.get("inference_peak_chunk_size", 262144), **common)
+        kind = settings["spectral_encoder"]["type"]
+        spectral = settings["spectral_encoder"][kind]
+        if kind == "set_transformer":
+            encoder = SetTransformerEncoder(values["num_peaks"], **spectral,
+                                            peak_budget=values.get("spectral_peak_budget", 65536))
+            if settings["aggregation"]["type"] == "mlp":
+                mlp = settings["aggregation"]["mlp"]
+                encoder.aggregation_mlp = MLPAggregation(
+                    encoder.output_dim, mlp["hidden_dims"], values["latent_dim"], residual=mlp["residual"], **common)
+        else:
+            encoder = IntensityWeightedPeakEncoder(
+                int(values["num_peaks"]), **spectral,
+                aggregation_hidden_dims=settings["aggregation"]["mlp"]["hidden_dims"],
+                latent_dim=values["latent_dim"],
+                aggregation_residual=settings["aggregation"]["mlp"]["residual"],
+                inference_peak_chunk_size=values.get("inference_peak_chunk_size", 262144), **common)
         if settings["aggregation"]["type"] == "cnn":
-            encoder.aggregation_mlp = CNNAggregation(spectral["peak_output_dim"],
+            encoder.aggregation_mlp = CNNAggregation(encoder.output_dim,
                 values["latent_dim"], **settings["aggregation"]["cnn"])
         elif settings["aggregation"]["type"] == "gatv2":
-            encoder.aggregation_mlp = AggregationGATv2(spectral["peak_output_dim"],
+            encoder.aggregation_mlp = AggregationGATv2(encoder.output_dim,
                 values["latent_dim"], **settings["aggregation"]["gatv2"])
         elif settings["aggregation"]["type"] == "convnext":
-            encoder.aggregation_mlp = ConvNeXtAggregation(spectral["peak_output_dim"],
+            encoder.aggregation_mlp = ConvNeXtAggregation(encoder.output_dim,
                 values["latent_dim"], **settings["aggregation"]["convnext"])
         bio = settings["heads"]["biology"]
         disc = settings["heads"].get("discriminator")
@@ -250,9 +260,10 @@ class AdversarialLatentFusion(nn.Module):
             return self._select(self._latent_map(batch), batch)
         args = [batch[key] for key in
                 ("peak_indices", "intensities", "sample_indices", "peak_counts")]
-        if getattr(self, "pixel_spectral_microbatching", False):
+        microbatch = getattr(self, "pixel_spectral_microbatching", False)
+        if microbatch or isinstance(self.encoder, SetTransformerEncoder):
             pooled = self.encoder.microbatched(*args, peak_budget=self.peak_budget,
-                checkpointing=self.checkpointing, chunks=batch.get('spectral_chunks'))
+                checkpointing=microbatch and self.checkpointing, chunks=batch.get('spectral_chunks'))
             return self.encoder.aggregation_mlp(pooled)
         return self.encoder(*args)
 

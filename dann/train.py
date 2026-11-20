@@ -155,6 +155,12 @@ def resume_training_config(saved_config: Mapping[str, Any], requested_config: Ma
     for name, group in saved_components.items():
         requested_group = requested_components.get(name, {})
         if name == 'spectral_encoder':
+            if group['type'] != requested_group.get('type'):
+                raise ValueError('Changed spectral encoder type requires fresh training.')
+            if group['type'] == 'set_transformer':
+                if group != requested_group:
+                    raise ValueError('Changed Set Transformer architecture requires fresh training.')
+                continue
             keys = ('pool_centering', 'peak_mlp_residual', 'pooling', 'normalization', 'normalization_epsilon')
             if any(group['deep_sets'][key] != requested_group.get('deep_sets', {}).get(key) for key in keys):
                 raise ValueError('Incompatible spectral pooling, normalization, centering or MLP residual settings on resume; use saved settings or fresh training.')

@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from dann.analyze import load_model
-from dann.checkpoints import architecture_contract, checkpoint_config, validate_checkpoint
+from dann.checkpoints import ARCHITECTURE_VERSION, architecture_contract, checkpoint_config, validate_checkpoint
 from dann.config import component_settings, execution_settings, resolve_execution
 from dann.data_loader import create_data_bundle
 from dann.model import AdversarialLatentFusion
@@ -172,7 +172,7 @@ def test_checkpoint_predictions_resume_and_analysis(spatial_config, tmp_path, ki
         path = tmp_path / 'checkpoint.pt'
         save_checkpoint(path, model, optimizer, 0, config, bundle, 1.)
         payload = torch.load(path, weights_only=False)
-        assert payload['architecture']['version'] == 11
+        assert payload['architecture']['version'] == ARCHITECTURE_VERSION
         payload['architecture']['version'] = 4  # Exercise the historical v4 contract.
         for name, enabled in zip(COMPONENTS, flags):
             assert component_group(payload['config'], name)['cnn']['residual'] is enabled

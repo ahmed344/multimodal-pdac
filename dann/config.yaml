@@ -31,17 +31,18 @@ results:
   # Subdirectories: model/, analysis/, analysis/spatial/, and analysis/latent_variance/.
   # Smoke runs insert smoke/ after run_name; CLI checkpoint/output overrides remain available.
   root: /workspaces/multimodal-pdac/data/PDAC/Results/dann  # Common results root for every combination.
-  run_name: "occurrence_mlp_emb8_mlp128*128_latent128_bio128*128_fast"
+  run_name: "set_transformer_sab_128"
 
 model:
   num_peaks: 5023  # Number of aligned m/z bins in both MSI files.
   latent_dim: 128  # Aggregation output width; this is the exported latent before either head.
 
-  # 1. Scale each peak embedding by intensity and pass it through the per-peak MLP.
-  #    Average by peak count and subtract the zero-input response. Empty spectra pool to zero.
+  # 1. Encode each sparse pixel spectrum independently.
   spectral_encoder:
-    type: deep_sets  # Supported spectral encoder: deep_sets.
+    type: set_transformer  # Choices: deep_sets, set_transformer.
     deep_sets:
+      # Scale each peak embedding by intensity and pass it through the per-peak MLP.
+      # Average by peak count and subtract the zero-input response. Empty spectra pool to zero.
       pooling: occurrence_mlp  # attention, occurrence_mlp, or intensity_weighted_dictionary; requires fresh training.
       normalization: count  # attention: softmax; occurrence_mlp: count; dictionary: l1 or l2.
       normalization_epsilon: 1.0e-8  # Positive row-norm floor for dictionary pooling.
@@ -55,6 +56,15 @@ model:
         token_dim: 64  # Output width of the per-peak token MLP.
         key_dim: 16  # Query/key dot-product width.
         value_dim: 32  # Each summary's width before concatenation and projection.
+
+    set_transformer:
+      block_type: sab  # Choices: sab, isab.
+      embedding_dim: 8
+      d_model: 32
+      num_blocks: 2
+      num_heads: 4
+      num_seeds: 4
+      num_inducing_points: 16  # Used by ISAB.
 
   # 2. Latent aggregation: masked ConvNeXt pyramid, pointwise MLP, local CNN, or GATv2.
   aggregation:

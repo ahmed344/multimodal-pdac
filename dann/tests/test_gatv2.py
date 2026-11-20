@@ -10,7 +10,7 @@ import pytest
 import torch
 import yaml
 
-from dann.checkpoints import architecture_contract, checkpoint_config, validate_checkpoint
+from dann.checkpoints import ARCHITECTURE_VERSION, architecture_contract, checkpoint_config, validate_checkpoint
 from dann.config import resolve_execution
 from dann.model import AdversarialLatentFusion
 from dann.model_components.aggregation_gatv2 import AggregationGATv2
@@ -217,7 +217,7 @@ def test_end_to_end_gatv2_workflow(spatial_config, tmp_path):
     resolve_execution(c)
     path = train_model(c)
     payload = torch.load(path, weights_only=False)
-    assert payload['architecture']['version'] == 11
+    assert payload['architecture']['version'] == ARCHITECTURE_VERSION
     assert payload['software_versions']['torch_geometric']
     c['training'].update(epochs=2, resume_checkpoint=str(Path(c['training']['output_dir'])/'latest.pt'))
     train_model(c)
